@@ -19,7 +19,12 @@ jobs:
         distribution: 'temurin'
         java-version: '21'
 
-    - name: Preparar Estrutura do Projeto e Gerar gradle-wrapper.jar Oficial
+    - name: Set up Gradle 8.13 (Compativel com AGP 8.12.1)
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.13'
+
+    - name: Preparar Estrutura do Projeto
       run: |
         set -e
         # 1. Caso o repositorio tenha um arquivo .zip enviado diretamente, extrai automaticamente
@@ -30,7 +35,7 @@ jobs:
           fi
         fi
 
-        # 2. Caso os arquivos estejam dentro da subpasta xbox-cloud-Solution-Android-tv-main, move para a raiz
+        # 2. Caso os arquivos estejam dentro de subpasta, move para a raiz
         if [ ! -f "settings.gradle.kts" ]; then
           SUBDIR=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1 | xargs dirname 2>/dev/null || true)
           if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
@@ -39,24 +44,12 @@ jobs:
           fi
         fi
 
-        # 3. Remover trava de JVM local e configurar memoria do Gradle
+        # 3. Remover trava de JVM local e configurar memoria
         rm -f gradle/gradle-daemon-jvm.properties
         echo "" >> gradle.properties
         echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
 
-        # 4. Gerar o gradle-wrapper.jar oficial com MANIFEST.MF completo usando a versao do projeto
-        rm -f gradle/wrapper/gradle-wrapper.jar
-        GRADLE_VER=$(sed -n 's/.*gradle-\([0-9.]*\)-.*/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n 1)
-        if [ -n "$GRADLE_VER" ]; then
-          echo "Gerando Gradle Wrapper oficial para a versao $GRADLE_VER..."
-          gradle wrapper --gradle-version "$GRADLE_VER"
-        else
-          echo "Gerando Gradle Wrapper padrao..."
-          gradle wrapper
-        fi
-        chmod +x gradlew
-
-        # 5. Aceitar licencas do Android SDK
+        # 4. Aceitar licencas do Android SDK
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
     - name: Otimizar Recursos e Traduzir Menus XML para PT-BR
@@ -142,9 +135,9 @@ jobs:
                 f.write(man)
         PYEOF
 
-    - name: Compilar APK
+    - name: Compilar APK com Gradle 8.13
       run: |
-        ./gradlew assembleRelease -x lint -x test || ./gradlew assembleDebug -x lint -x test
+        gradle assembleRelease -x lint -x test --no-configuration-cache || gradle assembleDebug -x lint -x test --no-configuration-cache
 
     - name: Assinar e Gerar APKs Ultra-Leves (32-bit TV, 64-bit e Universal sem x86)
       run: |
