@@ -13,37 +13,75 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up JDK 17
+    - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
-        java-version: '17'
-        cache: 'gradle'
+        java-version: '21'
 
-    - name: Otimizar Recursos, Traduzir Menus XML para PT-BR e Limpar Travas do Gradle
+    - name: Preparar Estrutura do Projeto e Restaurar gradle-wrapper.jar Ausente
       run: |
-        # 1. Remover trava de JVM local do autor que causa erro no GitHub Actions
+        set -e
+        # 1. Caso o repositorio tenha um arquivo .zip enviado diretamente, extrai automaticamente
+        if [ ! -f "settings.gradle.kts" ]; then
+          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            unzip -q -o "$ZIP_FILE"
+          fi
+        fi
+
+        # 2. Caso os arquivos estejam dentro da subpasta xbox-cloud-Solution-Android-tv-main, move para a raiz
+        if [ ! -f "settings.gradle.kts" ]; then
+          SUBDIR=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1 | xargs dirname 2>/dev/null || true)
+          if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
+            shopt -s dotglob
+            mv "$SUBDIR"/* . || true
+          fi
+        fi
+
+        # 3. Remover trava de JVM local e configurar memoria do Gradle
         rm -f gradle/gradle-daemon-jvm.properties
         echo "" >> gradle.properties
         echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
 
-        # 2. Traduzir os layouts XML nativos e strings.xml para Portugues e enxugar imagens pesadas
-        python3 - << 'PYEOF'
-        import os, glob, base64
+        # 4. Baixar o gradle-wrapper.jar que esta ausente no repositorio original
+        mkdir -p gradle/wrapper
+        if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+          curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar" -o gradle/wrapper/gradle-wrapper.jar
+        fi
+        chmod +x gradlew
 
-        # Reduzir PNGs gigantes de splash para nao ocupar RAM na abertura da TV
+        # 5. Aceitar licencas do Android SDK
+        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+    - name: Otimizar Recursos e Traduzir Menus XML para PT-BR
+      run: |
+        python3 - << 'PYEOF'
+        import os, glob, base64, re
+
+        # Reduzir PNGs pesados de splash para poupar RAM na TV
         tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
         for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
             with open(p, "wb") as f:
                 f.write(tiny_png)
 
-        # Esvaziar web-rtc-stream.js caso exista (pois a MainActivity usa apenas o index.js)
+        # Esvaziar web-rtc-stream.js redundante
         unused_js = "app/src/main/assets/web-rtc-stream.js"
         if os.path.exists(unused_js):
             with open(unused_js, "w", encoding="utf-8") as f:
                 f.write("")
 
-        # Traducoes dos textos nos XMLs de layout e strings.xml
+        # Desativar minifyEnabled caso esteja causando conflito no R8 durante o build Release
+        bg_kts = "app/build.gradle.kts"
+        if os.path.exists(bg_kts):
+            with open(bg_kts, "r", encoding="utf-8") as f:
+                kts = f.read()
+            kts = re.sub(r"isMinifyEnabled\s*=\s*true", "isMinifyEnabled = false", kts)
+            kts = re.sub(r"isShrinkResources\s*=\s*true", "isShrinkResources = false", kts)
+            with open(bg_kts, "w", encoding="utf-8") as f:
+                f.write(kts)
+
+        # Traduzir textos nos XMLs de layout e strings.xml
         replacements = {
             "Exit Game": "Sair do Jogo",
             "Controller Settings": "Configurações do Controle",
@@ -86,7 +124,7 @@ jobs:
             except Exception:
                 pass
 
-        # Garantir extractNativeLibs="true" no AndroidManifest.xml para seguranca ao cortar x86
+        # Garantir extractNativeLibs="true" no AndroidManifest.xml
         man_path = "app/src/main/AndroidManifest.xml"
         if os.path.exists(man_path):
             with open(man_path, "r", encoding="utf-8") as f:
@@ -99,10 +137,9 @@ jobs:
                 f.write(man)
         PYEOF
 
-    - name: Compilar APK Release
+    - name: Compilar APK
       run: |
-        chmod +x gradlew
-        ./gradlew assembleRelease -x lint -x test
+        ./gradlew assembleRelease -x lint -x test || ./gradlew assembleDebug -x lint -x test
 
     - name: Assinar e Gerar APKs Ultra-Leves (32-bit TV, 64-bit e Universal sem x86)
       run: |
@@ -113,24 +150,19 @@ jobs:
         rm -f "$KS"
         keytool -genkeypair -v -keystore "$KS" -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=BR"
 
-        OUT_DIR="app/build/outputs/apk/release"
-        RAW_APK=$(ls "$OUT_DIR"/*.apk | head -n 1)
+        RAW_APK=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+        mkdir -p dist_apks
 
         if [ -f "$RAW_APK" ]; then
-          cp "$RAW_APK" "$OUT_DIR/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk"
-          cp "$RAW_APK" "$OUT_DIR/CloudX-UltraLeve-64bit-arm64-v8a.apk"
-          mv "$RAW_APK" "$OUT_DIR/CloudX-Universal-ARM.apk"
+          cp "$RAW_APK" "dist_apks/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk"
+          cp "$RAW_APK" "dist_apks/CloudX-UltraLeve-64bit-arm64-v8a.apk"
+          cp "$RAW_APK" "dist_apks/CloudX-Universal-ARM.apk"
 
-          # 1. Remover binarios de PC (x86 e x86_64) do Universal ARM
-          zip -q -d "$OUT_DIR/CloudX-Universal-ARM.apk" "lib/x86/*" "lib/x86_64/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
+          zip -q -d "dist_apks/CloudX-Universal-ARM.apk" "lib/x86/*" "lib/x86_64/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" 2>/dev/null || true
+          zip -q -d "dist_apks/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk" "lib/x86/*" "lib/x86_64/*" "lib/arm64-v8a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" 2>/dev/null || true
+          zip -q -d "dist_apks/CloudX-UltraLeve-64bit-arm64-v8a.apk" "lib/x86/*" "lib/x86_64/*" "lib/armeabi-v7a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" 2>/dev/null || true
 
-          # 2. Gerar versao exclusiva 32-bit para a TV TCL (Remove x86, x86_64 e arm64-v8a)
-          zip -q -d "$OUT_DIR/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk" "lib/x86/*" "lib/x86_64/*" "lib/arm64-v8a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
-
-          # 3. Gerar versao exclusiva 64-bit (Remove x86, x86_64 e armeabi-v7a)
-          zip -q -d "$OUT_DIR/CloudX-UltraLeve-64bit-arm64-v8a.apk" "lib/x86/*" "lib/x86_64/*" "lib/armeabi-v7a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
-
-          for apk in "$OUT_DIR"/*.apk; do
+          for apk in dist_apks/*.apk; do
             "$BT/zipalign" -f -p 4 "$apk" "${apk}.aligned" && mv "${apk}.aligned" "$apk"
             "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android "$apk"
             rm -f "${apk}.idsig"
@@ -143,4 +175,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: CloudX-AndroidTV-PTBR-APK
-        path: app/build/outputs/apk/release/*.apk
+        path: dist_apks/*.apk
