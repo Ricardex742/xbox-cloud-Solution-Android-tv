@@ -27,7 +27,6 @@ jobs:
     - name: Preparar Estrutura do Projeto
       run: |
         set -e
-        # 1. Caso o repositorio tenha um arquivo .zip enviado diretamente, extrai automaticamente
         if [ ! -f "settings.gradle.kts" ]; then
           ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
           if [ -n "$ZIP_FILE" ]; then
@@ -35,7 +34,6 @@ jobs:
           fi
         fi
 
-        # 2. Caso os arquivos estejam dentro de subpasta, move para a raiz
         if [ ! -f "settings.gradle.kts" ]; then
           SUBDIR=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1 | xargs dirname 2>/dev/null || true)
           if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
@@ -44,32 +42,30 @@ jobs:
           fi
         fi
 
-        # 3. Remover trava de JVM local e configurar memoria
         rm -f gradle/gradle-daemon-jvm.properties
         echo "" >> gradle.properties
         echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
 
-        # 4. Aceitar licencas do Android SDK
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Otimizar Recursos e Traduzir Menus XML para PT-BR
+    - name: Forcar Idioma PT-BR no Site/App e Aplicar Otimizacoes de Desempenho
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
 
-        # Reduzir PNGs pesados de splash para poupar RAM na TV
+        # 1. Reduzir PNGs pesados de splash para poupar RAM na TV
         tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
         for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
             with open(p, "wb") as f:
                 f.write(tiny_png)
 
-        # Esvaziar web-rtc-stream.js redundante
+        # 2. Esvaziar web-rtc-stream.js redundante
         unused_js = "app/src/main/assets/web-rtc-stream.js"
         if os.path.exists(unused_js):
             with open(unused_js, "w", encoding="utf-8") as f:
                 f.write("")
 
-        # Evitar bloqueios de R8/Minify durante o build Release
+        # 3. Desativar bloqueios de R8/Minify no build.gradle.kts
         bg_kts = "app/build.gradle.kts"
         if os.path.exists(bg_kts):
             with open(bg_kts, "r", encoding="utf-8") as f:
@@ -79,11 +75,104 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # Traduzir textos nos XMLs de layout e strings.xml
+        # 4. Forcar PT-BR, regiao Brasil e redirecionamento anti-Frances no index.js
+        idx_path = "app/src/main/assets/index.js"
+        if os.path.exists(idx_path):
+            with open(idx_path, "r", encoding="utf-8") as f:
+                js = f.read()
+
+            # Substituir qualquer URL fr-FR ou en-US por pt-BR
+            js = js.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
+            js = js.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
+            js = js.replace("|| 'es'", "|| 'br'")
+            js = js.replace("|| '1080p'", "|| '1080'")
+
+            # Otimizar canvas oculto de 1920x1080@60fps para 2x2@1fps
+            js = js.replace("canvas.width = 1920;", "canvas.width = 2;")
+            js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
+            js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
+            js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
+            js = js.replace("}, 3000);", "}, 300);")
+
+            # Injetar verificador imediato que expulsa o site de /fr-FR/ para /pt-BR/
+            pt_redirect = """
+        (function forcePtBrLocale() {
+            try {
+                if (window.location && window.location.pathname && /^\\/(fr-fr|en-us|es-es|fr)\\b/i.test(window.location.pathname)) {
+                    var newUrl = window.location.href.replace(/\\/(fr-fr|en-us|es-es|fr)(?=\\/|$)/i, '/pt-BR');
+                    window.location.replace(newUrl);
+                }
+            } catch (e) {}
+        })();
+        """
+            if "forcePtBrLocale" not in js:
+                js = pt_redirect + "\n" + js
+
+            with open(idx_path, "w", encoding="utf-8") as f:
+                f.write(js)
+
+        # 5. Forcar PT-BR, regiao 'br', filtro de Toast e redirecionamento na MainActivity.java
+        main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
+        if os.path.exists(main_java):
+            with open(main_java, "r", encoding="utf-8") as f:
+                mj = f.read()
+
+            # Substituir fr-FR por pt-BR em todo o ficheiro
+            mj = mj.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
+            mj = mj.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
+            mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, "1080")')
+
+            # Se a WebView tentar abrir em fr-FR (por cookie antigo), redireciona imediatamente para pt-BR
+            hook_target = "super.onPageStarted(view, url, favicon);"
+            redirect_hook = """super.onPageStarted(view, url, favicon);
+                if (url != null && (url.contains("/fr-FR") || url.contains("/fr-fr"))) {
+                    view.stopLoading();
+                    view.loadUrl(url.replace("/fr-FR", "/pt-BR").replace("/fr-fr", "/pt-BR"));
+                    return;
+                }"""
+            if "url.contains(\"/fr-FR\")" not in mj and hook_target in mj:
+                mj = mj.replace(hook_target, redirect_hook, 1)
+
+            # Evitar spam na UI Thread ao mover os analogicos
+            old_toast = """    public void showCustomToast(final String message) {
+        runOnUiThread(() -> {
+            if(message.isEmpty() || !debug && message.startsWith("[debug]")){return;}"""
+            new_toast = """    public void showCustomToast(final String message) {
+        if (message == null || message.isEmpty() || (!debug && message.startsWith("[debug]"))) { return; }
+        runOnUiThread(() -> {"""
+            mj = mj.replace(old_toast, new_toast)
+
+            # Adicionar opcoes de Bitrate ideais para a TV (8 Mbps e 12 Mbps)
+            mj = mj.replace(
+                "Integer[] bitrateValues = {0, 5, 10, 15, 20, 30, 40, 50};",
+                "Integer[] bitrateValues = {0, 5, 8, 10, 12, 15, 20, 30, 40, 50};"
+            )
+            mj = mj.replace(
+                'String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};',
+                'String[] bitrateLabels = {"Automático", "5 Mbps", "8 Mbps", "10 Mbps", "12 Mbps (Ideal TV)", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};'
+            )
+
+            with open(main_java, "w", encoding="utf-8") as f:
+                f.write(mj)
+
+        # 6. Otimizar perfis H.264 para baixa latencia no WebRtcReceiver.java
+        rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
+        if os.path.exists(rtc_java):
+            with open(rtc_java, "r", encoding="utf-8") as f:
+                rj = f.read()
+            rj = rj.replace(".setEnableInternalTracer(true)", ".setEnableInternalTracer(false)")
+            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 1;')
+            rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
+            rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
+            with open(rtc_java, "w", encoding="utf-8") as f:
+                f.write(rj)
+
+        # 7. Traduzir textos nos XMLs de layout e strings.xml
         replacements = {
             "Exit Game": "Sair do Jogo",
-            "Controller Settings": "Configurações do Controle",
-            "App Settings": "Configurações do App (Vídeo/Região)",
+            "Controller Settings": "Configurações do Comando",
+            "App Settings": "Configurações da App (Vídeo/Região)",
             "Reload Xbox": "Recarregar Catálogo Xbox",
             "Show in game performance": "Mostrar Desempenho no Jogo",
             "Disable in game performance": "Ocultar Desempenho no Jogo",
@@ -122,7 +211,7 @@ jobs:
             except Exception:
                 pass
 
-        # Garantir extractNativeLibs="true" no AndroidManifest.xml
+        # 8. Garantir extractNativeLibs="true" no AndroidManifest.xml
         man_path = "app/src/main/AndroidManifest.xml"
         if os.path.exists(man_path):
             with open(man_path, "r", encoding="utf-8") as f:
