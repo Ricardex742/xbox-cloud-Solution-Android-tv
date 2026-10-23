@@ -1,0 +1,146 @@
+name: Build CloudX Android TV APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        cache: 'gradle'
+
+    - name: Otimizar Recursos, Traduzir Menus XML para PT-BR e Limpar Travas do Gradle
+      run: |
+        # 1. Remover trava de JVM local do autor que causa erro no GitHub Actions
+        rm -f gradle/gradle-daemon-jvm.properties
+        echo "" >> gradle.properties
+        echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
+
+        # 2. Traduzir os layouts XML nativos e strings.xml para Portugues e enxugar imagens pesadas
+        python3 - << 'PYEOF'
+        import os, glob, base64
+
+        # Reduzir PNGs gigantes de splash para nao ocupar RAM na abertura da TV
+        tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
+            with open(p, "wb") as f:
+                f.write(tiny_png)
+
+        # Esvaziar web-rtc-stream.js caso exista (pois a MainActivity usa apenas o index.js)
+        unused_js = "app/src/main/assets/web-rtc-stream.js"
+        if os.path.exists(unused_js):
+            with open(unused_js, "w", encoding="utf-8") as f:
+                f.write("")
+
+        # Traducoes dos textos nos XMLs de layout e strings.xml
+        replacements = {
+            "Exit Game": "Sair do Jogo",
+            "Controller Settings": "Configurações do Controle",
+            "App Settings": "Configurações do App (Vídeo/Região)",
+            "Reload Xbox": "Recarregar Catálogo Xbox",
+            "Show in game performance": "Mostrar Desempenho no Jogo",
+            "Disable in game performance": "Ocultar Desempenho no Jogo",
+            "Open Nexus": "Botão Xbox (Guia Nexus)",
+            "Open Xbox Menu": "Botão Xbox (Guia Nexus)",
+            "Microphone: Disabled": "Microfone: Desativado",
+            "Microphone: Enabled": "Microfone: Ativado",
+            "Close": "Fechar",
+            "Cancel": "Cancelar",
+            "Apply": "Aplicar",
+            "Submit": "Confirmar",
+            "Start Testing": "Testar Analógicos",
+            "Stop Testing": "Parar Teste",
+            "Use Unreliable Input": "Modo de Baixa Latência (Unreliable Input)",
+            "Unreliable Input (Low Latency)": "Modo de Baixa Latência (Unreliable Input)",
+            "Target Region": "Região do Servidor",
+            "Target Resolution": "Resolução Alvo",
+            "Target Bitrate": "Taxa de Bits (Bitrate Alvo)",
+            "User-Agent": "Perfil de Dispositivo (User-Agent)",
+            "Don't show again": "Não mostrar novamente",
+            "Got it": "Entendi"
+        }
+
+        xml_files = glob.glob("app/src/main/res/layout/*.xml") + glob.glob("app/src/main/res/values/*.xml")
+        for xml_path in xml_files:
+            try:
+                with open(xml_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                orig = content
+                for en_txt, pt_txt in replacements.items():
+                    content = content.replace(f'"{en_txt}"', f'"{pt_txt}"')
+                    content = content.replace(f'>{en_txt}<', f'>{pt_txt}<')
+                if content != orig:
+                    with open(xml_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+            except Exception:
+                pass
+
+        # Garantir extractNativeLibs="true" no AndroidManifest.xml para seguranca ao cortar x86
+        man_path = "app/src/main/AndroidManifest.xml"
+        if os.path.exists(man_path):
+            with open(man_path, "r", encoding="utf-8") as f:
+                man = f.read()
+            if 'android:extractNativeLibs="false"' in man:
+                man = man.replace('android:extractNativeLibs="false"', 'android:extractNativeLibs="true"')
+            elif 'android:extractNativeLibs' not in man:
+                man = man.replace('<application', '<application android:extractNativeLibs="true"')
+            with open(man_path, "w", encoding="utf-8") as f:
+                f.write(man)
+        PYEOF
+
+    - name: Compilar APK Release
+      run: |
+        chmod +x gradlew
+        ./gradlew assembleRelease -x lint -x test
+
+    - name: Assinar e Gerar APKs Ultra-Leves (32-bit TV, 64-bit e Universal sem x86)
+      run: |
+        set +e
+        BT_DIR=$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+        BT="$ANDROID_HOME/build-tools/$BT_DIR"
+        KS="/tmp/cloudx.keystore"
+        rm -f "$KS"
+        keytool -genkeypair -v -keystore "$KS" -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=BR"
+
+        OUT_DIR="app/build/outputs/apk/release"
+        RAW_APK=$(ls "$OUT_DIR"/*.apk | head -n 1)
+
+        if [ -f "$RAW_APK" ]; then
+          cp "$RAW_APK" "$OUT_DIR/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk"
+          cp "$RAW_APK" "$OUT_DIR/CloudX-UltraLeve-64bit-arm64-v8a.apk"
+          mv "$RAW_APK" "$OUT_DIR/CloudX-Universal-ARM.apk"
+
+          # 1. Remover binarios de PC (x86 e x86_64) do Universal ARM
+          zip -q -d "$OUT_DIR/CloudX-Universal-ARM.apk" "lib/x86/*" "lib/x86_64/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
+
+          # 2. Gerar versao exclusiva 32-bit para a TV TCL (Remove x86, x86_64 e arm64-v8a)
+          zip -q -d "$OUT_DIR/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk" "lib/x86/*" "lib/x86_64/*" "lib/arm64-v8a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
+
+          # 3. Gerar versao exclusiva 64-bit (Remove x86, x86_64 e armeabi-v7a)
+          zip -q -d "$OUT_DIR/CloudX-UltraLeve-64bit-arm64-v8a.apk" "lib/x86/*" "lib/x86_64/*" "lib/armeabi-v7a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
+
+          for apk in "$OUT_DIR"/*.apk; do
+            "$BT/zipalign" -f -p 4 "$apk" "${apk}.aligned" && mv "${apk}.aligned" "$apk"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android "$apk"
+            rm -f "${apk}.idsig"
+            echo "APK Pronto: $(basename "$apk") -> $(du -h "$apk" | cut -f1)"
+          done
+        fi
+        exit 0
+
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: CloudX-AndroidTV-PTBR-APK
+        path: app/build/outputs/apk/release/*.apk
