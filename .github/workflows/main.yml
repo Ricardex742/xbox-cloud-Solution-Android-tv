@@ -19,7 +19,7 @@ jobs:
         distribution: 'temurin'
         java-version: '21'
 
-    - name: Preparar Estrutura do Projeto e Restaurar gradle-wrapper.jar Ausente
+    - name: Preparar Estrutura do Projeto e Gerar gradle-wrapper.jar Oficial
       run: |
         set -e
         # 1. Caso o repositorio tenha um arquivo .zip enviado diretamente, extrai automaticamente
@@ -44,10 +44,15 @@ jobs:
         echo "" >> gradle.properties
         echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
 
-        # 4. Baixar o gradle-wrapper.jar que esta ausente no repositorio original
-        mkdir -p gradle/wrapper
-        if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-          curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar" -o gradle/wrapper/gradle-wrapper.jar
+        # 4. Gerar o gradle-wrapper.jar oficial com MANIFEST.MF completo usando a versao do projeto
+        rm -f gradle/wrapper/gradle-wrapper.jar
+        GRADLE_VER=$(sed -n 's/.*gradle-\([0-9.]*\)-.*/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n 1)
+        if [ -n "$GRADLE_VER" ]; then
+          echo "Gerando Gradle Wrapper oficial para a versao $GRADLE_VER..."
+          gradle wrapper --gradle-version "$GRADLE_VER"
+        else
+          echo "Gerando Gradle Wrapper padrao..."
+          gradle wrapper
         fi
         chmod +x gradlew
 
@@ -71,7 +76,7 @@ jobs:
             with open(unused_js, "w", encoding="utf-8") as f:
                 f.write("")
 
-        # Desativar minifyEnabled caso esteja causando conflito no R8 durante o build Release
+        # Evitar bloqueios de R8/Minify durante o build Release
         bg_kts = "app/build.gradle.kts"
         if os.path.exists(bg_kts):
             with open(bg_kts, "r", encoding="utf-8") as f:
