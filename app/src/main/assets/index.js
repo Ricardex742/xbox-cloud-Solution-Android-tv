@@ -1,6 +1,5 @@
 "use strict";
 
-
 // Bridge for Native Android WebRTC
 window.handleAnswer = function(sdp) {
     console.log("[BxC] handleAnswer from Java, sdp length: " + (sdp ? sdp.length : 0));
@@ -38,7 +37,6 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, sdp) {
 };
 
 window.handleDataChannelMessage = function(label, binaryData, textData, isBinary) {
-    console.log("[BxC] handleDataChannelMessage: " + label + " (binary: " + isBinary + ")");
     const dc = window.proxyDataChannels && window.proxyDataChannels[label];
     if (dc) {
         let data;
@@ -48,26 +46,24 @@ window.handleDataChannelMessage = function(label, binaryData, textData, isBinary
             data = textData;
         }
 
-        console.warn("[BxC] recivin data from channel " + label + ", data: " + data);
-        if(label=='message'&&data.includes('HandshakeAck')){
-        async function CXkeepalive(){
-
-                                                            let CXtoken =  window.BX_EXPOSED.streamSession.gsToken;
-                                                            let CXsessionPath=window.BX_EXPOSED.streamSession.sessionPath;
-                                                            let CXendPoint=window.BX_EXPOSED.streamSession.domainName;
-                                                            if(CXtoken.length&&CXtoken.length>0&&CXsessionPath.length&&CXsessionPath.length>0&&CXendPoint.length&&CXendPoint.length>0)
-                                                           {
-                                                            let CXurl=CXendPoint+'/'+CXsessionPath+'/keepalive';
-                                                            console.log("[BxC] Keepalive URL:", CXurl,' token: ',CXtoken);
-                                                             if (window.AndroidBridge && window.AndroidBridge.keepalive) {
-                                                                            window.AndroidBridge.keepalive(CXurl,CXtoken);
-                                                                        }
-                                                                        return;}
-                                                                        return setTimeout(CXkeepalive,10);
-                                                           }
-                                                       setTimeout(CXkeepalive,10);
+        if (label === 'message' && typeof data === 'string' && data.includes('HandshakeAck')) {
+            async function CXkeepalive() {
+                let CXtoken = window.BX_EXPOSED.streamSession.gsToken;
+                let CXsessionPath = window.BX_EXPOSED.streamSession.sessionPath;
+                let CXendPoint = window.BX_EXPOSED.streamSession.domainName;
+                if (CXtoken && CXtoken.length > 0 && CXsessionPath && CXsessionPath.length > 0 && CXendPoint && CXendPoint.length > 0) {
+                    let CXurl = CXendPoint + '/' + CXsessionPath + '/keepalive';
+                    console.log("[BxC] Keepalive URL:", CXurl);
+                    if (window.AndroidBridge && window.AndroidBridge.keepalive) {
+                        window.AndroidBridge.keepalive(CXurl, CXtoken);
+                    }
+                    return;
+                }
+                return setTimeout(CXkeepalive, 50);
+            }
+            setTimeout(CXkeepalive, 50);
         }
-        // Create a real MessageEvent so the app can access .data
+
         const event = new MessageEvent('message', {
             data: data,
             origin: window.location.origin
@@ -92,7 +88,7 @@ window.handleIceConnectionState = function(state) {
     if (window.peer) {
         window.peer.iceConnectionState = state.toLowerCase();
         if (window.peer.oniceconnectionstatechange) window.peer.oniceconnectionstatechange();
-        if (window.peer._listeners['iceconnectionstatechange']) {
+        if (window.peer._listeners && window.peer._listeners['iceconnectionstatechange']) {
             window.peer._listeners['iceconnectionstatechange'].forEach(l => l());
         }
     }
@@ -101,19 +97,20 @@ window.handleIceConnectionState = function(state) {
 window.setControllerSettings = function(deadzone, sensitivity) {
     setPref("controller.deadzone", deadzone);
     setPref("controller.sensitivity", sensitivity);
-}
+};
 
 window.setUseUnreliableInput = function(enabled) {
     window.BX_USE_UNRELIABLE_INPUT = enabled;
     BxLogger.info("Settings", "Updated UseUnreliableInput to:", enabled);
-}
+};
+
 window.setPref = function lsSet(key, value) {
     localStorage.setItem(key, value);
 };
 
-window.getPref=function lsget(key){
-return localStorage.getItem(key);
-}
+window.getPref = function lsget(key) {
+    return localStorage.getItem(key);
+};
 
 const BypassServerIps = {
     us: "143.244.47.65",
@@ -151,40 +148,38 @@ function deepClone(obj) {
 }
 
 function getTargetRegion() {
-    // Priority: window global > localStorage > default (us)
-    return window.BX_TARGET_REGION || localStorage.getItem('BX_TARGET_REGION') || 'es';
+    // Padrao configurado para Brasil (br -> brazilsouth)
+    return window.BX_TARGET_REGION || localStorage.getItem('BX_TARGET_REGION') || 'br';
 }
 
 function getTargetResolution() {
-    // Priority: window global > localStorage > default (1080p)
-    return window.BX_TARGET_RES || localStorage.getItem('BX_TARGET_RES') || '1080p';
+    // Padrao configurado para 1080
+    return window.BX_TARGET_RES || localStorage.getItem('BX_TARGET_RES') || '1080';
 }
 
 function getTargetBitrate() {
-    // Priority: window global > localStorage > default (0 - Auto)
     return window.BX_TARGET_BITRATE || parseInt(localStorage.getItem('BX_TARGET_BITRATE')) || 0;
 }
 
 function getOsNameFromResolution(resolution) {
-    let osName;
     switch (resolution) {
         case "1080HQ":
-            osName = "tizen";
-            break;
+        case "1440":
+            return "tizen";
         case "1080":
-            osName = "windows";
-            break;
+        case "1080p":
+            return "windows";
         case "720":
-            osName = "android";
-            break;
+        case "720p":
+        case "720HQ":
+            return "android";
         default:
-            osName = "tizen";
-            break;
+            return "windows";
     }
-    return osName;
 }
 
-function generateMsDeviceInfo(osName) {
+function generateMsDeviceInfo(osName, resolution) {
+    const isQhd = (resolution === "1440");
     return {
         appInfo: {
             env: {
@@ -201,7 +196,10 @@ function generateMsDeviceInfo(osName) {
             hw: { make: "Microsoft", model: "unknown", sdktype: "web" },
             browser: { browserName: "chrome", browserVersion: "140.0.3485.54" },
             displayInfo: {
-                dimensions: { widthInPixels: 4096, heightInPixels: 2160 },
+                dimensions: {
+                    widthInPixels: isQhd ? 2560 : 1920,
+                    heightInPixels: isQhd ? 1440 : 1080
+                },
                 pixelDensity: { dpiX: 1, dpiY: 1 }
             }
         }
@@ -212,13 +210,12 @@ const BxExposed = {
     modifyPreloadedState: (state) => {
         try {
             state = deepClone(state);
-            // Bypass region restriction check in preloaded state
             if (state.xcloud && state.xcloud.authentication) {
                 const xCloud = state.xcloud.authentication.authStatusByStrategy.XCloud;
                 if (xCloud && xCloud.type === 3 && xCloud.error.type === "UnsupportedMarketError") {
-                    BxLogger.info("PreloadState", "Unsupported region detected, forcing bypass via redirect");
+                    BxLogger.info("PreloadState", "Unsupported region detected, redirecting to pt-BR");
                     window.stop();
-                    window.location.href = "https://www.xbox.com/en-US/play";
+                    window.location.href = "https://www.xbox.com/pt-BR/play";
                 }
             }
         } catch (e) {
@@ -231,12 +228,9 @@ const BxExposed = {
         titleInfo = deepClone(titleInfo);
         if (titleInfo && titleInfo.details) {
             let supportedInputTypes = titleInfo.details.supportedInputTypes || [];
-
-            // Ensure Controller is in supported input types to enable Play button
             if (!supportedInputTypes.includes("Controller")) {
                 supportedInputTypes.push("Controller");
             }
-
             titleInfo.details.supportedInputTypes = supportedInputTypes;
             BxLogger.info("TitleInfo", "Modified title info for:", titleInfo.titleId);
         }
@@ -254,11 +248,13 @@ window.BX_EXPOSED.streamSession = {
 class XcloudInterceptor {
     static async handleLogin(request, init) {
         const region = getTargetRegion();
-        const ip = BypassServerIps[region] || BypassServerIps.us;
+        const ip = BypassServerIps[region];
 
-        BxLogger.info("XcloudInterceptor", "Using bypass IP for login:", region, "->", ip);
-
-        request.headers.set("X-Forwarded-For", ip);
+        // Se a regiao for 'br', usa a rota direta brasileira sem cabecalho IP falso
+        if (ip && region !== 'br') {
+            BxLogger.info("XcloudInterceptor", "Using bypass IP for login:", region, "->", ip);
+            request.headers.set("X-Forwarded-For", ip);
+        }
 
         let response;
         try {
@@ -270,12 +266,10 @@ class XcloudInterceptor {
 
         if (response.status === 200) {
             const obj = await response.clone().json();
-
             const targetServerRegion = ServerRegionMap[region];
 
             if (targetServerRegion && obj.offeringSettings && obj.offeringSettings.regions) {
                 BxLogger.info("XcloudInterceptor", "Forcing streaming region to:", targetServerRegion);
-
                 const filteredRegions = obj.offeringSettings.regions.filter(r => r.name.toLowerCase().includes(targetServerRegion));
                 if (filteredRegions.length > 0) {
                     filteredRegions[0].isDefault = true;
@@ -292,21 +286,18 @@ class XcloudInterceptor {
     static async handlePlay(request, init) {
         const res = getTargetResolution();
         const osName = getOsNameFromResolution(res);
-        const deviceInfo = generateMsDeviceInfo(osName);
+        const deviceInfo = generateMsDeviceInfo(osName, res);
 
         BxLogger.info("XcloudInterceptor", "Patching play request for resolution:", res, "-> OS:", osName);
 
-        // Inject hardware spoofing header
         request.headers.set("x-ms-device-info", JSON.stringify(deviceInfo));
 
         let finalRequest = request;
-        // Modify body to include spoofed OS name
         try {
             const body = await request.clone().json();
             if (body.settings) {
                 body.settings.osName = osName;
             }
-            // Create a new request with the modified body
             finalRequest = new Request(request, {
                 body: JSON.stringify(body)
             });
@@ -316,7 +307,6 @@ class XcloudInterceptor {
 
         const response = await NATIVE_FETCH(finalRequest, init);
 
-        // Capture session info
         try {
             if (response.status >= 200 && response.status < 300) {
                 const respBody = await response.clone().json();
@@ -324,7 +314,6 @@ class XcloudInterceptor {
                     window.BX_EXPOSED.streamSession.sessionPath = respBody.sessionPath;
                 }
                 const url = typeof request === "string" ? request : request.url;
-                // Use URL origin to avoid carrying over query parameters or path segments
                 window.BX_EXPOSED.streamSession.domainName = new URL(url).origin;
                 BxLogger.info("streamSession", "Captured sessionPath and domainName:", window.BX_EXPOSED.streamSession);
             }
@@ -336,7 +325,6 @@ class XcloudInterceptor {
     }
 
     static async handleConfiguration(request, init) {
-        // Extract token from Authorization header
         const authHeader = request.headers.get("Authorization");
         if (authHeader && authHeader.startsWith("Bearer ")) {
             window.BX_EXPOSED.streamSession.gsToken = authHeader.substring(7);
@@ -352,7 +340,6 @@ class XcloudInterceptor {
             let overrides = JSON.parse(obj.clientStreamingConfigOverrides || "{}") || {};
 
             overrides.inputConfiguration = overrides.inputConfiguration || {};
-            // Force unreliable input channel (unreliableinput) if enabled
             const useUnreliable = window.BX_USE_UNRELIABLE_INPUT !== false;
             overrides.inputConfiguration.useUnreliableInput = useUnreliable;
             overrides.inputConfiguration.enableVibration = true;
@@ -361,14 +348,11 @@ class XcloudInterceptor {
 
             BxLogger.info("XcloudInterceptor", "Forcing input configuration - unreliableinput:", useUnreliable);
 
-            // Reconstruct response
-            const modifiedResponse = new Response(JSON.stringify(obj), {
+            return new Response(JSON.stringify(obj), {
                 status: response.status,
                 statusText: response.statusText,
                 headers: response.headers
             });
-
-            return modifiedResponse;
         } catch (e) {
             BxLogger.error("XcloudInterceptor", "Configuration modification failed", e);
         }
@@ -404,7 +388,6 @@ function interceptHttpRequests() {
     };
 }
 
-// Configuration Cache for Renegotiation Fix
 window._lastFullConfig = null;
 
 function patchWebSocket() {
@@ -417,29 +400,22 @@ function patchWebSocket() {
             if (typeof data === 'string') {
                 try {
                     const msg = JSON.parse(data);
-
-                    // 1. Capture full configuration from 'offer'
                     if (msg.messageType === 'offer' && msg.configuration) {
-                        // Check if this is a sparse renegotiation config (e.g. from ChatStreamManager)
                         if (msg.configuration.isMediaStreamsChatRenegotiation && window._lastFullConfig) {
                             console.log("[BxC] Sparse renegotiation detected, merging with cached config");
                             msg.configuration = Object.assign({}, window._lastFullConfig, msg.configuration);
                             data = JSON.stringify(msg);
                         } else {
-                            // Cache the full config for future use
                             window._lastFullConfig = msg.configuration;
                         }
                     }
-                } catch (e) {
-                    // Not JSON or parse error, ignore
-                }
+                } catch (e) {}
             }
             return originalSend.apply(this, arguments);
         };
 
         return ws;
     };
-    // Preserve prototype chain
     window.WebSocket.prototype = OriginalWebSocket.prototype;
     Object.assign(window.WebSocket, OriginalWebSocket);
 }
@@ -487,11 +463,9 @@ class Patcher {
                 }
             }
 
-            // 3. Disable Pause on Window Blur
             if (funcStr.includes("},this.onFocusChanged=")) {
                 const searchIdx = funcStr.indexOf("},this.onFocusChanged=");
                 const bracketIndex = funcStr.indexOf("=>{", searchIdx) + 3;
-                // Find variable name before index
                 let start = searchIdx - 1;
                 while (funcStr[start] && (/[a-zA-Z0-9_$]/.test(funcStr[start]))) start--;
                 const varName = funcStr.substring(start + 1, searchIdx);
@@ -529,7 +503,6 @@ function patchSdpBitrate(sdp, videoBitrate) {
         }
 
         if (inVideoSection && line.startsWith('c=IN')) {
-            // Inject b=AS line after connection info in video section
             newLines.push('b=AS:' + videoBitrate);
         }
     }
@@ -552,27 +525,26 @@ function patchSdpFps(sdp, fps) {
 
 function patchRtcPeerConnection() {
     let OrgRTCPeerConnection = window.RTCPeerConnection;
-window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
-    if (!window.peer) return;
 
-    // If candidateStr is null/empty, WebRTC treats it as the end of candidates
-    let candidateObj = candidateStr ? { sdpMid: sdpMid, sdpMLineIndex: sdpMLineIndex, candidate: candidateStr } : null;
+    window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
+        if (!window.peer) return;
+        let candidateObj = candidateStr ? { sdpMid: sdpMid, sdpMLineIndex: sdpMLineIndex, candidate: candidateStr } : null;
+        let event = new Event('icecandidate');
+        event.candidate = candidateObj;
 
-    let event = new Event('icecandidate');
-    event.candidate = candidateObj;
+        if (window.peer.onicecandidate) window.peer.onicecandidate(event);
+        if (window.peer._listeners && window.peer._listeners['icecandidate']) {
+            window.peer._listeners['icecandidate'].forEach(l => l(event));
+        }
+    };
 
-    if (window.peer.onicecandidate) window.peer.onicecandidate(event);
-    if (window.peer._listeners && window.peer._listeners['icecandidate']) {
-        window.peer._listeners['icecandidate'].forEach(l => l(event));
-    }
-};
-    // Base64 Helpers
     window.bxToBase64 = function(buffer) {
         let binary = '';
         let bytes = new Uint8Array(buffer);
         for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
         return window.btoa(binary);
     };
+
     window.bxToArrayBuffer = function(base64) {
         let binary = window.atob(base64);
         let bytes = new Uint8Array(binary.length);
@@ -580,36 +552,30 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
         return bytes.buffer;
     };
 
-
     window.simulateOnTrack = function(kind, id) {
-        console.log("[BxC] Simulating ontrack for " + kind);
+        console.log("[BxC] Simulating lightweight ontrack for " + kind);
 
         let stream;
         let track;
 
         if (kind === 'video') {
+            // OTIMIZADO: Canvas minimo de 2x2 a 1 FPS (Zero uso de GPU/RAM em segundo plano na TV)
             const canvas = document.createElement('canvas');
-            canvas.width = 1920;
-            canvas.height = 1080;
+            canvas.width = 2;
+            canvas.height = 2;
             const ctx = canvas.getContext('2d');
             ctx.fillStyle = 'black';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillRect(0, 0, 2, 2);
 
-            ctx.fillStyle = 'white';
-            ctx.font = '30px Arial';
-            ctx.fillText('Native Bridge Active', 50, 50);
-
-            stream = canvas.captureStream(60);
+            stream = canvas.captureStream(1);
             track = stream.getVideoTracks()[0];
         } else {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const destination = audioCtx.createMediaStreamDestination();
+            stream = destination.stream;
+            track = stream.getAudioTracks()[0];
+        }
 
-                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                const destination = audioCtx.createMediaStreamDestination();
-                stream = destination.stream;
-                track = stream.getAudioTracks()[0];
-            }
-
-        // Construct a real-like Track event
         let event = new Event('track');
         event.track = track;
         event.streams = [stream];
@@ -628,23 +594,22 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
         let newLines = [];
         let skipExtmap = [
             'urn:ietf:params:rtp-hdrext:toffset',
-                        'urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id',
-                        'urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id',
-                        'http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00',
+            'urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id',
+            'urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id',
+            'http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00',
             'http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01'
         ];
 
         for (let line of lines) {
             let skip = false;
             if (line.startsWith('a=extmap:')) {
-                 for (let ext of skipExtmap) {
-                                      if (line.includes(ext)) {
-                                          skip = true;
-                                          break;
-                                      }
-                                  }
+                for (let ext of skipExtmap) {
+                    if (line.includes(ext)) {
+                        skip = true;
+                        break;
+                    }
+                }
             }
-
             if (!skip) newLines.push(line);
         }
         return newLines.join('\r\n');
@@ -668,7 +633,7 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             _transceivers: [],
 
             createDataChannel: function(label, options) {
-                console.log("[BxC] Proxy createDataChannel: " + label + " options: " + JSON.stringify(options));
+                console.log("[BxC] Proxy createDataChannel: " + label);
                 if (window.AndroidBridge) {
                     window.AndroidBridge.onDataChannelCreate(label);
                 }
@@ -684,29 +649,36 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
                     onopen: null,
                     onclose: null,
 
-                   send: function(data) {
-                                           if(label=='input'||label=='unreliableinput'||label=='reliableinput')return;
-                                           if (window.AndroidBridge) {
-                                               if(label=='message'&&!data.includes('Handshake')){return;}
-                                               let base64;
-                                               let isBinary = typeof data !== 'string';
-                                               if (isBinary) {
-
-                                                       window.AndroidBridge.onDataChannelSend(label, new Uint8Array(data), null, true);
-                                                       return;
-
-                                               } else {
-                                               if(label=='control'&&data.includes('resolutionAlias')){
-                                               let overridesData=JSON.parse(data);
-                                               overridesData.resolutionAlias=window.BX_TARGET_RES;
-                                               data=JSON.stringify(overridesData);
-                                               }
-                                               console.log('sending data from channel'+label+': '+data);
-                                               base64 = window.btoa(unescape(encodeURIComponent(data)));
-                                               window.AndroidBridge.onDataChannelSend(label, null, base64, false);
-
-                                           }}
-                                       },
+                    send: function(data) {
+                        if (label === 'input' || label === 'unreliableinput' || label === 'reliableinput') return;
+                        if (window.AndroidBridge) {
+                            if (label === 'message' && typeof data === 'string' && !data.includes('Handshake')) {
+                                return;
+                            }
+                            let isBinary = typeof data !== 'string';
+                            if (isBinary) {
+                                window.AndroidBridge.onDataChannelSend(label, new Uint8Array(data), null, true);
+                                return;
+                            } else {
+                                if (label === 'control' && data.includes('resolutionAlias')) {
+                                    try {
+                                        let overridesData = JSON.parse(data);
+                                        let targetRes = getTargetResolution();
+                                        if (targetRes === "720" || targetRes === "720HQ") {
+                                            overridesData.resolutionAlias = "720p";
+                                        } else if (targetRes === "1080" || targetRes === "1080HQ") {
+                                            overridesData.resolutionAlias = "1080p";
+                                        } else if (targetRes === "1440") {
+                                            overridesData.resolutionAlias = "1440p";
+                                        }
+                                        data = JSON.stringify(overridesData);
+                                    } catch (e) {}
+                                }
+                                let base64 = window.btoa(unescape(encodeURIComponent(data)));
+                                window.AndroidBridge.onDataChannelSend(label, null, base64, false);
+                            }
+                        }
+                    },
                     close: function() {
                         console.log("[BxC] Proxy DataChannel close: " + label);
                     },
@@ -737,7 +709,6 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             },
 
             addTransceiver: function(trackOrKind, init) {
-                console.log("[BxC] Proxy addTransceiver: " + trackOrKind);
                 if (window.AndroidBridge) {
                     window.AndroidBridge.onAddTransceiver(trackOrKind, init ? (init.direction || "recvonly") : "recvonly");
                 }
@@ -747,14 +718,13 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
                     sender: { track: (typeof trackOrKind !== 'string' ? trackOrKind : null) },
                     receiver: { track: { kind: (typeof trackOrKind === 'string' ? trackOrKind : trackOrKind.kind), stop: () => {} } },
                     stop: () => {},
-                    setCodecPreferences: function(codecs) { console.log("[BxC] Proxy setCodecPreferences"); }
+                    setCodecPreferences: function(codecs) {}
                 };
                 this._transceivers.push(transceiver);
                 return transceiver;
             },
 
             addTrack: function(track, ...streams) {
-                console.log("[BxC] Proxy addTrack: " + track.kind);
                 return { track: track };
             },
 
@@ -763,7 +733,6 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             getSenders: function() { return (this._transceivers || []).map(t => t.sender); },
 
             setRemoteDescription: function(description) {
-                console.log("[BxC] Proxy setRemoteDescription: " + description.type);
                 this.remoteDescription = description;
                 if (description && window.AndroidBridge) {
                     if (description.type === 'offer') {
@@ -776,7 +745,6 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             },
 
             createAnswer: function() {
-                console.log("[BxC] Proxy createAnswer");
                 return new Promise((resolve) => {
                     window.pendingAnswerResolver = (answer) => {
                         this.localDescription = answer;
@@ -786,51 +754,43 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             },
 
             createOffer: function() {
-                            console.log("[BxC] Proxy createOffer requested");
-                            return new Promise((resolve) => {
-                                window.pendingOfferResolver = (offer) => {
-                                    const bitrateMbps = getTargetBitrate();
-                                    if (bitrateMbps > 0) {
-                                        try {
-                                            // Convert Mbps to Kbps for SDP (b=AS line)
-                                            const bitrateKbps = bitrateMbps * 1000;
-                                            offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);
-                                            BxLogger.info("Patcher", "Applied bitrate patch:", bitrateMbps + " Mbps");
-                                        } catch (e) {
-                                            BxLogger.error("Patcher", "Bitrate patch failed", e);
-                                        }
-                                    }
+                return new Promise((resolve) => {
+                    window.pendingOfferResolver = (offer) => {
+                        const bitrateMbps = getTargetBitrate();
+                        if (bitrateMbps > 0) {
+                            try {
+                                const bitrateKbps = bitrateMbps * 1000;
+                                offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);
+                                BxLogger.info("Patcher", "Applied bitrate patch:", bitrateMbps + " Mbps");
+                            } catch (e) {
+                                BxLogger.error("Patcher", "Bitrate patch failed", e);
+                            }
+                        }
 
-                                    offer.sdp = patchSdpFps(offer.sdp, 60);
-                                    this.localDescription = offer;
-                                    console.log("[BxC] Sending offer to server, length: " + offer.sdp.length);
-                                    resolve(offer);
-                                };
-                                if (window.AndroidBridge) {
-                                    window.AndroidBridge.onOfferRequested();
-                                }
-                            });
-                        },
+                        offer.sdp = patchSdpFps(offer.sdp, 60);
+                        this.localDescription = offer;
+                        resolve(offer);
+                    };
+                    if (window.AndroidBridge) {
+                        window.AndroidBridge.onOfferRequested();
+                    }
+                });
+            },
 
-           setLocalDescription: function(description) {
-               console.log("[BxC] Proxy setLocalDescription: " + (description ? description.type : "null"));
-               this.localDescription = description;
+            setLocalDescription: function(description) {
+                this.localDescription = description;
+                this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable';
 
-               // 1. Update the internal state
-               this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable';
+                let event = new Event('signalingstatechange');
+                if (this.onsignalingstatechange) this.onsignalingstatechange(event);
+                if (this._listeners && this._listeners['signalingstatechange']) {
+                    this._listeners['signalingstatechange'].forEach(l => l(event));
+                }
 
-               // 2. Fire the state change event
-               let event = new Event('signalingstatechange');
-               if (this.onsignalingstatechange) this.onsignalingstatechange(event);
-               if (this._listeners && this._listeners['signalingstatechange']) {
-                   this._listeners['signalingstatechange'].forEach(l => l(event));
-               }
-
-               return Promise.resolve();
-           },
+                return Promise.resolve();
+            },
 
             setConfiguration: function(config) {
-                console.log("[BxC] Proxy setConfiguration", JSON.stringify(config));
                 this.config = config;
                 if (window.AndroidBridge && config) {
                     window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config));
@@ -838,7 +798,6 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             },
 
             addIceCandidate: function(candidate) {
-                console.log("[BxC] Proxy addIceCandidate");
                 if (candidate && window.AndroidBridge) {
                     window.AndroidBridge.onIceCandidateReceived(candidate.sdpMid, candidate.sdpMLineIndex, candidate.candidate || candidate.sdp || "");
                 }
@@ -856,7 +815,6 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
             },
 
             close: function() {
-                console.log("[BxC] Proxy close");
                 if (window.AndroidBridge) {
                     window.AndroidBridge.onPeerConnectionClose();
                 }
@@ -873,42 +831,38 @@ window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
     }
 }
 
-
-window.addEventListener("load", (e) => {
-window.setTimeout(() => {
-patchRtcPeerConnection();
-if (document.body.classList.contains("legacyBackground"))
-{ window.stop(), window.location.reload(!0);}
-}, 3000);
-InitBc();
+window.addEventListener("load", () => {
+    window.setTimeout(() => {
+        patchRtcPeerConnection();
+        if (document.body && document.body.classList.contains("legacyBackground")) {
+            window.stop();
+            window.location.reload(true);
+        }
+    }, 300);
+    InitBc();
 });
 
-function InitBc(){
-window.worker=null;
-window.d=null;
-window.canvas=null;
-window.firstBoost=false;
-window.forKeyboard=false;
+function InitBc() {
+    window.worker = null;
+    window.d = null;
+    window.canvas = null;
+    window.firstBoost = false;
+    window.forKeyboard = false;
 
-window.handleIceGatheringState = function(state) {
-    console.log("[BxC] ICE Gathering State changed to: " + state);
-    if (window.peer) {
-        // Update the proxy state
-        window.peer.iceGatheringState = state;
-
-        // Dispatch the standard WebRTC event
-        let event = new Event('icegatheringstatechange');
-        if (window.peer.onicegatheringstatechange) window.peer.onicegatheringstatechange(event);
-        if (window.peer._listeners && window.peer._listeners['icegatheringstatechange']) {
-            window.peer._listeners['icegatheringstatechange'].forEach(l => l(event));
+    window.handleIceGatheringState = function(state) {
+        if (window.peer) {
+            window.peer.iceGatheringState = state;
+            let event = new Event('icegatheringstatechange');
+            if (window.peer.onicegatheringstatechange) window.peer.onicegatheringstatechange(event);
+            if (window.peer._listeners && window.peer._listeners['icegatheringstatechange']) {
+                window.peer._listeners['icegatheringstatechange'].forEach(l => l(event));
+            }
         }
-    }
-};
-
-};
+    };
+}
 
 function main() {
-    BxLogger.info("Init", "Loading lightweight xCloud bypass...");
+    BxLogger.info("Init", "Loading lightweight xCloud bypass (PT-BR Optimized)...");
     interceptHttpRequests();
     patchWebSocket();
     Patcher.init();
