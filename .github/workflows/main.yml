@@ -48,7 +48,7 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Injetar Sistema Anti-Congelamento, Idioma PT-BR e Estabilizador de 20 Mbps
+    - name: Aplicar Pedido Automatico de Keyframe (IDR), H264 Baseline e Traducao Completa
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
@@ -75,7 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js: PT-BR, geometria 1920x1080 e rampa dinamica de Bitrate no SDP
+        # 4. Otimizar index.js: Manter TWCC, controle de rampa SDP e PT-BR
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -97,12 +97,14 @@ jobs:
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
             js = js.replace("}, 3000);", "}, 300);")
 
+            # Nao remover a extensao transport-wide-cc (TWCC), pois ela evita que o servidor afogue o buffer da TV
+            js = js.replace("'http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01'", "'__keep_twcc__'")
+
             new_sdp_fn = "\n".join([
                 "function patchSdpBitrate(sdp, videoBitrate) {",
-                "    if (!videoBitrate) return sdp;",
-                "    let safeMax = Math.min(videoBitrate, 22000);",
+                "    let safeMax = (videoBitrate && videoBitrate > 0) ? Math.min(videoBitrate, 20000) : 15000;",
                 "    let startBr = Math.min(safeMax, 10000);",
-                "    let minBr = 3000;",
+                "    let minBr = 4000;",
                 "    let lines = sdp.split('\\r\\n');",
                 "    let newLines = [];",
                 "    let inVideoSection = false;",
@@ -112,11 +114,14 @@ jobs:
                 "        } else if (line.startsWith('m=')) {",
                 "            inVideoSection = false;",
                 "        }",
-                "        if (inVideoSection && line.startsWith('a=fmtp:') && !line.includes('x-google-max-bitrate')) {",
-                "            line += ';x-google-max-bitrate=' + safeMax + ';x-google-min-bitrate=' + minBr + ';x-google-start-bitrate=' + startBr;",
+                "        if (inVideoSection && line.startsWith('a=fmtp:')) {",
+                "            line = line.replace(/profile-level-id=6400[0-9a-fA-F]{2}/g, 'profile-level-id=42e01f');",
+                "            if (!line.includes('x-google-max-bitrate')) {",
+                "                line += ';x-google-max-bitrate=' + safeMax + ';x-google-min-bitrate=' + minBr + ';x-google-start-bitrate=' + startBr;",
+                "            }",
                 "        }",
                 "        newLines.push(line);",
-                "        if (inVideoSection && line.startsWith('c=IN')) {",
+                "        if (inVideoSection && line.startsWith('c=IN') && videoBitrate > 0) {",
                 "            newLines.push('b=AS:' + safeMax);",
                 "        }",
                 "    }",
@@ -124,13 +129,19 @@ jobs:
                 "}"
             ])
 
-            if "function patchSdpBitrate" in js and "x-google-max-bitrate" not in js:
+            if "function patchSdpBitrate" in js:
                 js = re.sub(
                     r"function patchSdpBitrate\(sdp,\s*videoBitrate\)\s*\{[\s\S]*?return newLines\.join\('\\r\\n'\);\s*\}",
                     lambda _: new_sdp_fn,
                     js,
                     count=1
                 )
+
+            # Garantir que patchSdpBitrate rode mesmo quando bitrate for Auto (para trocar 6400 -> 42e01f)
+            js = js.replace(
+                "if (bitrateMbps > 0) {\n                            try {\n                                const bitrateKbps = bitrateMbps * 1000;\n                                offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);",
+                "if (true) {\n                            try {\n                                const bitrateKbps = bitrateMbps * 1000;\n                                offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);"
+            )
 
             pt_redirect = "\n".join([
                 "(function forcePtBrLocale() {",
@@ -148,7 +159,7 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Atualizar MainActivity.java: Reset automatico de superficie no congelamento + PT-BR
+        # 5. Atualizar MainActivity.java: Remover setEnableHardwareScaler(true) que recria a Surface e traduzir botoes
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -159,6 +170,17 @@ jobs:
             mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
             mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
             mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
+
+            # Evitar que o SurfaceViewRenderer chame setFixedSize() no meio do jogo e trave o EglRenderer
+            mj = mj.replace("surfaceView.setEnableHardwareScaler(true);", "surfaceView.setEnableHardwareScaler(false);")
+
+            # Traduzir textos dinamicos em Java vistos no video aos 00:15
+            mj = mj.replace('"Disable in game performance"', '"Ocultar Desempenho no Jogo"')
+            mj = mj.replace('"Show in game performance"', '"Mostrar Desempenho no Jogo"')
+            mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
+            mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
+            mj = mj.replace('"Microphone enabled"', '"Microfone ativado"')
+            mj = mj.replace('"Microphone muted"', '"Microfone silenciado"')
 
             hook_target = "super.onPageStarted(view, url, favicon);"
             redirect_hook = "\n".join([
@@ -171,25 +193,6 @@ jobs:
             ])
             if 'url.contains("/fr-FR")' not in mj and hook_target in mj:
                 mj = mj.replace(hook_target, redirect_hook, 1)
-
-            track_hook_target = "public void onTrackReceived(String kind, String id) {"
-            track_hook_replacement = "\n".join([
-                "public void onTrackReceived(String kind, String id) {",
-                "            if (\"reset_surface\".equals(kind)) {",
-                "                runOnUiThread(() -> {",
-                "                    if (isStreaming && streamingService != null && surfaceView != null) {",
-                "                        Log.w(TAG, \"Executando destravamento automatico da Surface de video...\");",
-                "                        try {",
-                "                            streamingService.clearRenderSurface();",
-                "                            surfaceView.postDelayed(MainActivity.this::pushSurfaceIfReady, 60);",
-                "                        } catch (RemoteException ignored) {}",
-                "                    }",
-                "                });",
-                "                return;",
-                "            }"
-            ])
-            if '"reset_surface".equals(kind)' not in mj and track_hook_target in mj:
-                mj = mj.replace(track_hook_target, track_hook_replacement, 1)
 
             old_toast = "\n".join([
                 "    public void showCustomToast(final String message) {",
@@ -215,7 +218,7 @@ jobs:
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 6. Injetar Watchdog Anti-Congelamento de quadros no WebRtcReceiver.java
+        # 6. Atualizar WebRtcReceiver.java: Preferencia H264 Baseline no addTransceiver + Pedido de Keyframe (IDR) sem desconectar a Surface
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
@@ -226,72 +229,76 @@ jobs:
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
 
-            watchdog_fields = "\n".join([
+            # Aplicar setVideoCodecPreferences ANTES do createOffer (dentro do addTransceiver)
+            old_add_trans = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
+            new_add_trans = "\n".join([
+                "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));",
+                "        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO && transceiver != null) {",
+                "            setVideoCodecPreferences(transceiver);",
+                "        }"
+            ])
+            if "setVideoCodecPreferences(transceiver);" in rj and "mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO && transceiver != null" not in rj:
+                rj = rj.replace(old_add_trans, new_add_trans, 1)
+
+            # Watchdog NAO-DESTRUTIVO: Pede Keyframe IDR ao servidor pelo canal 'control' a cada 1s sem quadros (NUNCA remove o sink!)
+            kf_watchdog_code = "\n".join([
                 "    private VideoTrack remoteVideoTrack;",
-                "    private volatile long lastFrameRenderedMs = 0L;",
-                "    private boolean watchdogActive = false;",
-                "    private final android.os.Handler watchdogHandler = new android.os.Handler(android.os.Looper.getMainLooper());",
-                "    private final org.webrtc.VideoSink frameWatchdogSink = frame -> {",
-                "        lastFrameRenderedMs = android.os.SystemClock.elapsedRealtime();",
+                "    private volatile long lastFrameTimestampMs = 0L;",
+                "    private boolean kfWatchdogRunning = false;",
+                "    private final android.os.Handler kfHandler = new android.os.Handler(android.os.Looper.getMainLooper());",
+                "    private final org.webrtc.VideoSink passiveFrameCounter = frame -> {",
+                "        lastFrameTimestampMs = android.os.SystemClock.elapsedRealtime();",
                 "    };",
-                "    private final Runnable videoFreezeWatchdog = new Runnable() {",
+                "    private void requestServerKeyframe() {",
+                "        try {",
+                "            DataChannel ctrl = dataChannels.get(\"control\");",
+                "            if (ctrl != null && ctrl.state() == DataChannel.State.OPEN) {",
+                "                String msgTrue = \"{\\\"message\\\":\\\"videoKeyframeRequested\\\",\\\"ifrRequested\\\":true}\";",
+                "                ctrl.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(msgTrue.getBytes(java.nio.charset.StandardCharsets.UTF_8)), false));",
+                "                Log.w(TAG, \"Keyframe IDR solicitado ao servidor xCloud pelo canal control!\");",
+                "            }",
+                "        } catch (Throwable ignored) {}",
+                "    }",
+                "    private final Runnable keyframeWatchdogTask = new Runnable() {",
                 "        @Override",
                 "        public void run() {",
                 "            if (isReleased || remoteVideoTrack == null) {",
-                "                watchdogActive = false;",
+                "                kfWatchdogRunning = false;",
                 "                return;",
                 "            }",
                 "            long now = android.os.SystemClock.elapsedRealtime();",
-                "            if (lastFrameRenderedMs > 0L && (now - lastFrameRenderedMs) > 2200L) {",
-                "                Log.w(TAG, \"Watchdog: Congelamento de video detectado (>2.2s)! Reiniciando fila do MediaCodec...\");",
-                "                lastFrameRenderedMs = now + 2000L;",
-                "                try {",
-                "                    remoteVideoTrack.setEnabled(false);",
-                "                    if (pendingRenderTarget != null) {",
-                "                        remoteVideoTrack.removeSink(pendingRenderTarget);",
-                "                    }",
-                "                    if (signalingListener != null) {",
-                "                        signalingListener.onTrackReceived(\"reset_surface\", \"0\");",
-                "                    }",
-                "                    watchdogHandler.postDelayed(() -> {",
-                "                        try {",
-                "                            if (remoteVideoTrack != null) {",
-                "                                remoteVideoTrack.setEnabled(true);",
-                "                                if (pendingRenderTarget != null) {",
-                "                                    remoteVideoTrack.addSink(pendingRenderTarget);",
-                "                                }",
-                "                            }",
-                "                        } catch (Throwable ignored) {}",
-                "                    }, 100);",
-                "                } catch (Throwable ignored) {}",
+                "            if (lastFrameTimestampMs > 0L && (now - lastFrameTimestampMs) > 950L) {",
+                "                requestServerKeyframe();",
                 "            }",
-                "            watchdogHandler.postDelayed(this, 1200);",
+                "            kfHandler.postDelayed(this, 800);",
                 "        }",
                 "    };",
-                "    private void startFreezeWatchdog() {",
-                "        lastFrameRenderedMs = android.os.SystemClock.elapsedRealtime();",
-                "        if (!watchdogActive) {",
-                "            watchdogActive = true;",
-                "            watchdogHandler.removeCallbacks(videoFreezeWatchdog);",
-                "            watchdogHandler.postDelayed(videoFreezeWatchdog, 3000);",
+                "    private void startKeyframeWatchdog() {",
+                "        lastFrameTimestampMs = android.os.SystemClock.elapsedRealtime();",
+                "        if (!kfWatchdogRunning) {",
+                "            kfWatchdogRunning = true;",
+                "            kfHandler.removeCallbacks(keyframeWatchdogTask);",
+                "            kfHandler.postDelayed(keyframeWatchdogTask, 1500);",
                 "        }",
                 "    }"
             ])
 
-            if "videoFreezeWatchdog" not in rj:
-                rj = rj.replace("    private VideoTrack remoteVideoTrack;", watchdog_fields, 1)
+            if "keyframeWatchdogTask" not in rj:
+                rj = rj.replace("    private VideoTrack remoteVideoTrack;", kf_watchdog_code, 1)
                 rj = rj.replace(
                     "remoteVideoTrack = (VideoTrack) track;",
-                    "remoteVideoTrack = (VideoTrack) track;\n                        remoteVideoTrack.addSink(frameWatchdogSink);\n                        startFreezeWatchdog();",
+                    "remoteVideoTrack = (VideoTrack) track;\n                        remoteVideoTrack.addSink(passiveFrameCounter);\n                        startKeyframeWatchdog();",
                     1
                 )
 
             with open(rtc_java, "w", encoding="utf-8") as f:
                 f.write(rj)
 
-        # 7. Traduzir textos nos XMLs de layout e strings.xml
+        # 7. Traduzir todos os textos nos XMLs de layout e strings.xml (incluindo os vistos aos 00:15 do video)
         replacements = {
+            "Exit the game": "Sair do Jogo",
             "Exit Game": "Sair do Jogo",
+            "Gamepad Settings": "Configurações do Controle",
             "Controller Settings": "Configurações do Controle",
             "App Settings": "Configurações do App (Vídeo/Região)",
             "Reload Xbox": "Recarregar Catálogo Xbox",
@@ -301,6 +308,7 @@ jobs:
             "Open Xbox Menu": "Botão Xbox (Guia Nexus)",
             "Microphone: Disabled": "Microfone: Desativado",
             "Microphone: Enabled": "Microfone: Ativado",
+            "Close Menu": "Fechar Menu",
             "Close": "Fechar",
             "Cancel": "Cancelar",
             "Apply": "Aplicar",
