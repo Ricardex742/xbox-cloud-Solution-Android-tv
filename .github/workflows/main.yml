@@ -19,7 +19,7 @@ jobs:
         distribution: 'temurin'
         java-version: '21'
 
-    - name: Set up Gradle 8.13 (Compativel com AGP 8.12.1)
+    - name: Set up Gradle 8.13
       uses: gradle/actions/setup-gradle@v4
       with:
         gradle-version: '8.13'
@@ -48,12 +48,12 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Aplicar Pedido Automatico de Keyframe (IDR), H264 Baseline e Traducao Completa
+    - name: Liberar 1080HQ a 20 Mbps Reais com Codec H.264 Baseline (Anti-Congelamento)
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
 
-        # 1. Reduzir PNGs pesados de splash para poupar RAM na TV
+        # 1. Reduzir PNGs pesados de splash
         tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
         for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
             with open(p, "wb") as f:
@@ -75,7 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js: Manter TWCC, controle de rampa SDP e PT-BR
+        # 4. Otimizar index.js: Manter 1080HQ (Tizen) e 20 Mbps reais + Forcar Baseline 42e01f (sem CABAC)
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -86,62 +86,53 @@ jobs:
             js = js.replace("|| 'es'", "|| 'br'")
             js = js.replace("|| '1080p'", "|| '1080HQ'")
 
+            # Manter geometria 1920x1080 limpa para a TV
             js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
             js = js.replace("heightInPixels: 2160", "heightInPixels: 1080")
-            js = js.replace("widthInPixels: isQhd ? 2560 : 1920", "widthInPixels: 1920")
-            js = js.replace("heightInPixels: isQhd ? 1440 : 1080", "heightInPixels: 1080")
 
+            # Canvas oculto minimo 2x2 a 1 FPS
             js = js.replace("canvas.width = 1920;", "canvas.width = 2;")
             js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
             js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
             js = js.replace("}, 3000);", "}, 300);")
 
-            # Nao remover a extensao transport-wide-cc (TWCC), pois ela evita que o servidor afogue o buffer da TV
-            js = js.replace("'http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01'", "'__keep_twcc__'")
-
-            new_sdp_fn = "\n".join([
-                "function patchSdpBitrate(sdp, videoBitrate) {",
-                "    let safeMax = (videoBitrate && videoBitrate > 0) ? Math.min(videoBitrate, 20000) : 15000;",
-                "    let startBr = Math.min(safeMax, 10000);",
-                "    let minBr = 4000;",
+            # Forca Baseline 42e01f (decodificacao rapida CAVLC) mantendo ate 20 Mbps (20000 kbps) reais
+            sdp_stabilizer = "\n".join([
+                "function forceLowLatencyBaselineSdp(sdp, maxKbps) {",
+                "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 20000;",
+                "    let startKbps = Math.min(capKbps, 12000);",
+                "    let minKbps = 4000;",
                 "    let lines = sdp.split('\\r\\n');",
-                "    let newLines = [];",
-                "    let inVideoSection = false;",
-                "    for (let line of lines) {",
-                "        if (line.startsWith('m=video')) {",
-                "            inVideoSection = true;",
-                "        } else if (line.startsWith('m=')) {",
-                "            inVideoSection = false;",
-                "        }",
-                "        if (inVideoSection && line.startsWith('a=fmtp:')) {",
-                "            line = line.replace(/profile-level-id=6400[0-9a-fA-F]{2}/g, 'profile-level-id=42e01f');",
+                "    let out = [];",
+                "    let inVideo = false;",
+                "    for (let i = 0; i < lines.length; i++) {",
+                "        let line = lines[i];",
+                "        if (line.startsWith('m=video')) inVideo = true;",
+                "        else if (line.startsWith('m=')) inVideo = false;",
+                "        if (inVideo && line.startsWith('a=fmtp:')) {",
+                "            line = line.replace(/profile-level-id=64[0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
+                "            line = line.replace(/profile-level-id=4[dD][0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
                 "            if (!line.includes('x-google-max-bitrate')) {",
-                "                line += ';x-google-max-bitrate=' + safeMax + ';x-google-min-bitrate=' + minBr + ';x-google-start-bitrate=' + startBr;",
+                "                line += ';x-google-max-bitrate=' + capKbps + ';x-google-min-bitrate=' + minKbps + ';x-google-start-bitrate=' + startKbps;",
                 "            }",
                 "        }",
-                "        newLines.push(line);",
-                "        if (inVideoSection && line.startsWith('c=IN') && videoBitrate > 0) {",
-                "            newLines.push('b=AS:' + safeMax);",
+                "        out.push(line);",
+                "        if (inVideo && line.startsWith('c=IN')) {",
+                "            out.push('b=AS:' + capKbps);",
                 "        }",
                 "    }",
-                "    return newLines.join('\\r\\n');",
+                "    return out.join('\\r\\n');",
                 "}"
             ])
 
-            if "function patchSdpBitrate" in js:
-                js = re.sub(
-                    r"function patchSdpBitrate\(sdp,\s*videoBitrate\)\s*\{[\s\S]*?return newLines\.join\('\\r\\n'\);\s*\}",
-                    lambda _: new_sdp_fn,
-                    js,
-                    count=1
+            if "forceLowLatencyBaselineSdp" not in js:
+                js = js + "\n" + sdp_stabilizer
+                js = js.replace(
+                    "offer.sdp = patchSdpFps(offer.sdp, 60);",
+                    "offer.sdp = patchSdpFps(offer.sdp, 60);\n                        offer.sdp = forceLowLatencyBaselineSdp(offer.sdp, getTargetBitrate() * 1000);"
                 )
-
-            # Garantir que patchSdpBitrate rode mesmo quando bitrate for Auto (para trocar 6400 -> 42e01f)
-            js = js.replace(
-                "if (bitrateMbps > 0) {\n                            try {\n                                const bitrateKbps = bitrateMbps * 1000;\n                                offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);",
-                "if (true) {\n                            try {\n                                const bitrateKbps = bitrateMbps * 1000;\n                                offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);"
-            )
+                js = js.replace("offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);", "// bitrate aplicado em forceLowLatencyBaselineSdp")
 
             pt_redirect = "\n".join([
                 "(function forcePtBrLocale() {",
@@ -159,7 +150,7 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Atualizar MainActivity.java: Remover setEnableHardwareScaler(true) que recria a Surface e traduzir botoes
+        # 5. Atualizar MainActivity.java: Padrao 1080HQ @ 20 Mbps + Traducao completa do STREAMING MENU
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -170,17 +161,12 @@ jobs:
             mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
             mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
             mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
+            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, 20)')
 
-            # Evitar que o SurfaceViewRenderer chame setFixedSize() no meio do jogo e trave o EglRenderer
-            mj = mj.replace("surfaceView.setEnableHardwareScaler(true);", "surfaceView.setEnableHardwareScaler(false);")
-
-            # Traduzir textos dinamicos em Java vistos no video aos 00:15
-            mj = mj.replace('"Disable in game performance"', '"Ocultar Desempenho no Jogo"')
-            mj = mj.replace('"Show in game performance"', '"Mostrar Desempenho no Jogo"')
+            mj = mj.replace('"Disable in game performance"', '"Ocultar desempenho no jogo"')
+            mj = mj.replace('"Show in game performance"', '"Mostrar desempenho no jogo"')
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
-            mj = mj.replace('"Microphone enabled"', '"Microfone ativado"')
-            mj = mj.replace('"Microphone muted"', '"Microfone silenciado"')
 
             hook_target = "super.onPageStarted(view, url, favicon);"
             redirect_hook = "\n".join([
@@ -208,98 +194,47 @@ jobs:
 
             mj = mj.replace(
                 "Integer[] bitrateValues = {0, 5, 10, 15, 20, 30, 40, 50};",
-                "Integer[] bitrateValues = {0, 5, 8, 10, 12, 15, 20, 30, 40, 50};"
+                "Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};"
             )
             mj = mj.replace(
                 'String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};',
-                'String[] bitrateLabels = {"Automático", "5 Mbps", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps (Recomendado)", "20 Mbps (Máx TV)", "30 Mbps", "40 Mbps", "50 Mbps"};'
+                'String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps ( Qualidade Máxima )"};'
             )
 
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 6. Atualizar WebRtcReceiver.java: Preferencia H264 Baseline no addTransceiver + Pedido de Keyframe (IDR) sem desconectar a Surface
+        # 6. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer (dentro de addTransceiver)
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
                 rj = f.read()
 
             rj = rj.replace(".setEnableInternalTracer(true)", ".setEnableInternalTracer(false)")
-            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 1;')
+            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 0;')
+            rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 1;')
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
 
-            # Aplicar setVideoCodecPreferences ANTES do createOffer (dentro do addTransceiver)
-            old_add_trans = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
-            new_add_trans = "\n".join([
+            transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
+            transceiver_fix = "\n".join([
                 "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));",
-                "        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO && transceiver != null) {",
+                "        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {",
                 "            setVideoCodecPreferences(transceiver);",
                 "        }"
             ])
-            if "setVideoCodecPreferences(transceiver);" in rj and "mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO && transceiver != null" not in rj:
-                rj = rj.replace(old_add_trans, new_add_trans, 1)
-
-            # Watchdog NAO-DESTRUTIVO: Pede Keyframe IDR ao servidor pelo canal 'control' a cada 1s sem quadros (NUNCA remove o sink!)
-            kf_watchdog_code = "\n".join([
-                "    private VideoTrack remoteVideoTrack;",
-                "    private volatile long lastFrameTimestampMs = 0L;",
-                "    private boolean kfWatchdogRunning = false;",
-                "    private final android.os.Handler kfHandler = new android.os.Handler(android.os.Looper.getMainLooper());",
-                "    private final org.webrtc.VideoSink passiveFrameCounter = frame -> {",
-                "        lastFrameTimestampMs = android.os.SystemClock.elapsedRealtime();",
-                "    };",
-                "    private void requestServerKeyframe() {",
-                "        try {",
-                "            DataChannel ctrl = dataChannels.get(\"control\");",
-                "            if (ctrl != null && ctrl.state() == DataChannel.State.OPEN) {",
-                "                String msgTrue = \"{\\\"message\\\":\\\"videoKeyframeRequested\\\",\\\"ifrRequested\\\":true}\";",
-                "                ctrl.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(msgTrue.getBytes(java.nio.charset.StandardCharsets.UTF_8)), false));",
-                "                Log.w(TAG, \"Keyframe IDR solicitado ao servidor xCloud pelo canal control!\");",
-                "            }",
-                "        } catch (Throwable ignored) {}",
-                "    }",
-                "    private final Runnable keyframeWatchdogTask = new Runnable() {",
-                "        @Override",
-                "        public void run() {",
-                "            if (isReleased || remoteVideoTrack == null) {",
-                "                kfWatchdogRunning = false;",
-                "                return;",
-                "            }",
-                "            long now = android.os.SystemClock.elapsedRealtime();",
-                "            if (lastFrameTimestampMs > 0L && (now - lastFrameTimestampMs) > 950L) {",
-                "                requestServerKeyframe();",
-                "            }",
-                "            kfHandler.postDelayed(this, 800);",
-                "        }",
-                "    };",
-                "    private void startKeyframeWatchdog() {",
-                "        lastFrameTimestampMs = android.os.SystemClock.elapsedRealtime();",
-                "        if (!kfWatchdogRunning) {",
-                "            kfWatchdogRunning = true;",
-                "            kfHandler.removeCallbacks(keyframeWatchdogTask);",
-                "            kfHandler.postDelayed(keyframeWatchdogTask, 1500);",
-                "        }",
-                "    }"
-            ])
-
-            if "keyframeWatchdogTask" not in rj:
-                rj = rj.replace("    private VideoTrack remoteVideoTrack;", kf_watchdog_code, 1)
-                rj = rj.replace(
-                    "remoteVideoTrack = (VideoTrack) track;",
-                    "remoteVideoTrack = (VideoTrack) track;\n                        remoteVideoTrack.addSink(passiveFrameCounter);\n                        startKeyframeWatchdog();",
-                    1
-                )
+            if "if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)" not in rj and transceiver_target in rj:
+                rj = rj.replace(transceiver_target, transceiver_fix, 1)
 
             with open(rtc_java, "w", encoding="utf-8") as f:
                 f.write(rj)
 
-        # 7. Traduzir todos os textos nos XMLs de layout e strings.xml (incluindo os vistos aos 00:15 do video)
+        # 7. Traduzir todos os botoes dos layouts XML
         replacements = {
-            "Exit the game": "Sair do Jogo",
             "Exit Game": "Sair do Jogo",
-            "Gamepad Settings": "Configurações do Controle",
+            "Exit the game": "Sair do Jogo",
             "Controller Settings": "Configurações do Controle",
+            "Gamepad Settings": "Configurações do Controle",
             "App Settings": "Configurações do App (Vídeo/Região)",
             "Reload Xbox": "Recarregar Catálogo Xbox",
             "Show in game performance": "Mostrar Desempenho no Jogo",
