@@ -48,7 +48,7 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Corrigir Carregamento Infinito do Fortnite + Manter 60 FPS Estaveis
+    - name: Ativar Handshake Forcado do Controle + Retorno ao Catalogo Inicial + Fortnite 60 FPS
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
@@ -75,7 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js: Desbloquear canal 'message' para o Fortnite + Manter 1080HQ/20Mbps Baseline
+        # 4. Otimizar index.js: Garantir Handshake do Controle (gamepadChanged: wasAdded=true) + Fortnite Fix + 1080HQ/20Mbps
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -86,12 +86,48 @@ jobs:
             js = js.replace("|| 'es'", "|| 'br'")
             js = js.replace("|| '1080p'", "|| '1080HQ'")
 
-            # CORRECAO FORTNITE 1: Remover o bloqueio de mensagens no canal 'message' apos o Handshake
+            # Liberar canal 'message' para o Fortnite nao travar na barra branca
             js = re.sub(
                 r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
-                "// Canal message desbloqueado para autenticacao completa do Fortnite",
+                "// Canal message liberado para conclusao de carregamento do Fortnite",
                 js
             )
+
+            # Impedir que a WebView envie 'wasAdded: false' no canal 'control' (que desconectava o controle no jogo)
+            control_guard = "\n".join([
+                "if (label === 'control' && typeof data === 'string') {",
+                "                                    if (data.includes('gamepadChanged') && data.includes('false')) {",
+                "                                        data = data.replace(/\"wasAdded\"\\s*:\\s*false/g, '\"wasAdded\":true');",
+                "                                    }",
+                "                                }",
+                "                                if (label === 'control' && data.includes('resolutionAlias'))"
+            ])
+            if "data.includes('gamepadChanged')" not in js:
+                js = js.replace("if (label === 'control' && data.includes('resolutionAlias'))", control_guard, 1)
+
+            # Enviar 'gamepadChanged: wasAdded=true' automaticamente quando o canal 'control' abrir e apos o HandshakeAck
+            gamepad_connect_helper = "\n".join([
+                "window.sendNativeGamepadConnected = function() {",
+                "    try {",
+                "        if (window.AndroidBridge && window.AndroidBridge.onDataChannelSend) {",
+                "            var msg = JSON.stringify({ message: 'gamepadChanged', gamepadIndex: 0, wasAdded: true });",
+                "            var b64 = window.btoa(unescape(encodeURIComponent(msg)));",
+                "            window.AndroidBridge.onDataChannelSend('control', null, b64, false);",
+                "            console.log('[BxC] Sent native gamepadChanged (wasAdded: true) to Xbox server');",
+                "        }",
+                "    } catch (e) {}",
+                "};"
+            ])
+            if "sendNativeGamepadConnected" not in js:
+                js = gamepad_connect_helper + "\n" + js
+                js = js.replace(
+                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();",
+                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();\n        if (label === 'control' && dc.readyState === 'open') { setTimeout(window.sendNativeGamepadConnected, 200); setTimeout(window.sendNativeGamepadConnected, 1500); setTimeout(window.sendNativeGamepadConnected, 3500); }"
+                )
+                js = js.replace(
+                    "setTimeout(CXkeepalive, 50);",
+                    "setTimeout(CXkeepalive, 50);\n            setTimeout(window.sendNativeGamepadConnected, 500);\n            setTimeout(window.sendNativeGamepadConnected, 2500);"
+                )
 
             # Manter geometria 1920x1080 limpa para a TV
             js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
@@ -156,7 +192,10 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Atualizar MainActivity.java: Impedir que o closeWebview ("Experience boosting...") destrua a sessao do Fortnite
+        # 5. Atualizar MainActivity.java:
+        #    - Auto-preparar o controle GameSir logo no 1o frame
+        #    - Adiar closeWebview em 14s (Fortnite carrega sem travar e depois a WebView fecha para nao interferir no controle)
+        #    - Ao clicar em "Sair do Jogo", recarregar SEMPRE a pagina inicial do catalogo (https://www.xbox.com/pt-BR/play)
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -174,30 +213,99 @@ jobs:
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
 
-            # CORRECAO FORTNITE 2: Nao destruir a WebView durante o "Experience boosting..." para manter o canal 'message' vivo
-            safe_close_webview = "\n".join([
+            # Auto-detectar e preparar o controle fisico assim que o primeiro frame do jogo renderizar
+            first_frame_target = "setStreamingState(true);"
+            first_frame_replacement = "\n".join([
+                "setStreamingState(true);",
+                "                setNativeGamepadEnabled(true);",
+                "                try {",
+                "                    int[] devIds = InputDevice.getDeviceIds();",
+                "                    for (int devId : devIds) {",
+                "                        InputDevice dev = InputDevice.getDevice(devId);",
+                "                        if (dev != null && ((dev.getSources() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD || (dev.getSources() & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)) {",
+                "                            if (gamepadListener != null) gamepadListener.prepare(dev);",
+                "                            if (controllerLe != null) controllerLe.detectAxisLayout(dev);",
+                "                            break;",
+                "                        }",
+                "                    }",
+                "                } catch (Throwable ignored) {}"
+            ])
+            if "InputDevice.getDeviceIds()" not in mj and first_frame_target in mj:
+                mj = mj.replace(first_frame_target, first_frame_replacement, 1)
+
+            # Fechamento inteligente da WebView 14s apos o "Experience boosting..."
+            delayed_close_webview = "\n".join([
                 "    public void closeWebview() {",
                 "        runOnUiThread(() -> {",
                 "            if (webView != null) {",
                 "                webView.setVisibility(View.INVISIBLE);",
-                "                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
-                "                    getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
-                "                }",
                 "            }",
+                "            if (surfaceView != null) {",
+                "                surfaceView.setFocusable(true);",
+                "                surfaceView.setFocusableInTouchMode(true);",
+                "                surfaceView.requestFocus();",
+                "            }",
+                "            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
+                "                getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
+                "            }",
+                "            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {",
+                "                if (!isStreaming) return;",
+                "                if (webView != null) {",
+                "                    webViewState = null;",
+                "                    rootLayout.removeView(webView);",
+                "                    webView.stopLoading();",
+                "                    webView.loadUrl(\"about:blank\");",
+                "                    webView.onPause();",
+                "                    webView.pauseTimers();",
+                "                    webView.destroy();",
+                "                    webView = null;",
+                "                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
+                "                        getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
+                "                    }",
+                "                }",
+                "            }, 14000);",
                 "        });",
                 "    }"
             ])
             mj = re.sub(
                 r"public\s+void\s+closeWebview\s*\(\s*\)\s*\{[\s\S]*?webView\s*=\s*null;[\s\S]*?\}\s*\)\s*;\s*\}",
-                lambda _: safe_close_webview,
+                lambda _: delayed_close_webview,
                 mj,
                 count=1
             )
 
-            # Caso o usuario mude o User-Agent nas configuracoes, recarrega a WebView corretamente
-            mj = mj.replace(
-                "closeWebview();\n                        showWebview();",
-                "webView.reload();"
+            # Garantir que showWebview() SEMPRE abra a pagina inicial do catalogo (nunca a tela preta de /launch/)
+            home_show_webview = "\n".join([
+                "    public void showWebview() {",
+                "        if (audioManager != null) {",
+                "            audioManager.setMode(AudioManager.MODE_NORMAL);",
+                "        }",
+                "        runOnUiThread(() -> {",
+                "            if (webView == null) {",
+                "                initWebView();",
+                "                rootLayout.addView(webView, 1);",
+                "                webView.loadUrl(\"https://www.xbox.com/pt-BR/play\");",
+                "            } else {",
+                "                String curUrl = webView.getUrl();",
+                "                if (curUrl == null || curUrl.contains(\"/launch/\") || curUrl.equals(\"about:blank\")) {",
+                "                    webView.loadUrl(\"https://www.xbox.com/pt-BR/play\");",
+                "                }",
+                "            }",
+                "            webView.setVisibility(View.VISIBLE);",
+                "            webView.resumeTimers();",
+                "            webView.onResume();",
+                "            webView.requestFocus();",
+                "            if (performanceDialog != null) {",
+                "                performanceDialog.dismiss();",
+                "            }",
+                "        });",
+                "    }"
+            ])
+            mj = re.sub(
+                r"public\s+void\s+showWebview\s*\(\s*\)\s*\{[\s\S]*?performanceDialog\.dismiss\(\);\s*\}\s*\}\);\s*\}",
+                lambda _: home_show_webview,
+                mj,
+                count=1
             )
 
             hook_target = "super.onPageStarted(view, url, favicon);"
