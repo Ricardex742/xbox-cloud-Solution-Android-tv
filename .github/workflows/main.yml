@@ -48,7 +48,7 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Liberar 1080HQ a 20 Mbps Reais com Codec H.264 Baseline (Anti-Congelamento)
+    - name: Corrigir Carregamento Infinito do Fortnite + Manter 60 FPS Estaveis
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
@@ -75,7 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js: Manter 1080HQ (Tizen) e 20 Mbps reais + Forcar Baseline 42e01f (sem CABAC)
+        # 4. Otimizar index.js: Desbloquear canal 'message' para o Fortnite + Manter 1080HQ/20Mbps Baseline
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -85,6 +85,13 @@ jobs:
             js = js.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
             js = js.replace("|| 'es'", "|| 'br'")
             js = js.replace("|| '1080p'", "|| '1080HQ'")
+
+            # CORRECAO FORTNITE 1: Remover o bloqueio de mensagens no canal 'message' apos o Handshake
+            js = re.sub(
+                r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
+                "// Canal message desbloqueado para autenticacao completa do Fortnite",
+                js
+            )
 
             # Manter geometria 1920x1080 limpa para a TV
             js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
@@ -97,7 +104,6 @@ jobs:
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
             js = js.replace("}, 3000);", "}, 300);")
 
-            # Forca Baseline 42e01f (decodificacao rapida CAVLC) mantendo ate 20 Mbps (20000 kbps) reais
             sdp_stabilizer = "\n".join([
                 "function forceLowLatencyBaselineSdp(sdp, maxKbps) {",
                 "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 20000;",
@@ -150,7 +156,7 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Atualizar MainActivity.java: Padrao 1080HQ @ 20 Mbps + Traducao completa do STREAMING MENU
+        # 5. Atualizar MainActivity.java: Impedir que o closeWebview ("Experience boosting...") destrua a sessao do Fortnite
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -167,6 +173,32 @@ jobs:
             mj = mj.replace('"Show in game performance"', '"Mostrar desempenho no jogo"')
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
+
+            # CORRECAO FORTNITE 2: Nao destruir a WebView durante o "Experience boosting..." para manter o canal 'message' vivo
+            safe_close_webview = "\n".join([
+                "    public void closeWebview() {",
+                "        runOnUiThread(() -> {",
+                "            if (webView != null) {",
+                "                webView.setVisibility(View.INVISIBLE);",
+                "                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
+                "                    getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
+                "                }",
+                "            }",
+                "        });",
+                "    }"
+            ])
+            mj = re.sub(
+                r"public\s+void\s+closeWebview\s*\(\s*\)\s*\{[\s\S]*?webView\s*=\s*null;[\s\S]*?\}\s*\)\s*;\s*\}",
+                lambda _: safe_close_webview,
+                mj,
+                count=1
+            )
+
+            # Caso o usuario mude o User-Agent nas configuracoes, recarrega a WebView corretamente
+            mj = mj.replace(
+                "closeWebview();\n                        showWebview();",
+                "webView.reload();"
+            )
 
             hook_target = "super.onPageStarted(view, url, favicon);"
             redirect_hook = "\n".join([
@@ -198,13 +230,13 @@ jobs:
             )
             mj = mj.replace(
                 'String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};',
-                'String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps ( Qualidade Máxima )"};'
+                'String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Qualidade Máxima)"};'
             )
 
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 6. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer (dentro de addTransceiver)
+        # 6. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
