@@ -48,7 +48,7 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Ativar Handshake Forcado do Controle + Retorno ao Catalogo Inicial + Fortnite 60 FPS
+    - name: Ativar Controle Dual-Channel (input + unreliableinput) e Restaurar Foco da WebView
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
@@ -75,7 +75,10 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js: Garantir Handshake do Controle (gamepadChanged: wasAdded=true) + Fortnite Fix + 1080HQ/20Mbps
+        # 4. Otimizar index.js:
+        #    - Desbloquear 'reliableinput' e 'message' para que o servidor valide o controle
+        #    - Enviar 'gamepadChanged: wasAdded=true'
+        #    - Manter 1080HQ / 20 Mbps com H.264 Baseline (42e01f)
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -86,14 +89,20 @@ jobs:
             js = js.replace("|| 'es'", "|| 'br'")
             js = js.replace("|| '1080p'", "|| '1080HQ'")
 
-            # Liberar canal 'message' para o Fortnite nao travar na barra branca
+            # CORRECAO CRITICA 1: Desbloquear 'reliableinput' no send do DataChannel para não travar o protocolo V2 do controle
+            js = js.replace(
+                "if (label === 'input' || label === 'unreliableinput' || label === 'reliableinput') return;",
+                "if (label === 'input' || label === 'unreliableinput') return;"
+            )
+
+            # Liberar canal 'message' para o Fortnite passar da tela de carregamento
             js = re.sub(
                 r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
-                "// Canal message liberado para conclusao de carregamento do Fortnite",
+                "// Canal message liberado",
                 js
             )
 
-            # Impedir que a WebView envie 'wasAdded: false' no canal 'control' (que desconectava o controle no jogo)
+            # Impedir que a WebView desconecte o controle enviando wasAdded: false
             control_guard = "\n".join([
                 "if (label === 'control' && typeof data === 'string') {",
                 "                                    if (data.includes('gamepadChanged') && data.includes('false')) {",
@@ -105,7 +114,7 @@ jobs:
             if "data.includes('gamepadChanged')" not in js:
                 js = js.replace("if (label === 'control' && data.includes('resolutionAlias'))", control_guard, 1)
 
-            # Enviar 'gamepadChanged: wasAdded=true' automaticamente quando o canal 'control' abrir e apos o HandshakeAck
+            # Anunciar controle conectado no canal 'control'
             gamepad_connect_helper = "\n".join([
                 "window.sendNativeGamepadConnected = function() {",
                 "    try {",
@@ -113,7 +122,6 @@ jobs:
                 "            var msg = JSON.stringify({ message: 'gamepadChanged', gamepadIndex: 0, wasAdded: true });",
                 "            var b64 = window.btoa(unescape(encodeURIComponent(msg)));",
                 "            window.AndroidBridge.onDataChannelSend('control', null, b64, false);",
-                "            console.log('[BxC] Sent native gamepadChanged (wasAdded: true) to Xbox server');",
                 "        }",
                 "    } catch (e) {}",
                 "};"
@@ -122,18 +130,16 @@ jobs:
                 js = gamepad_connect_helper + "\n" + js
                 js = js.replace(
                     "if (dc.onopen && dc.readyState === 'open') dc.onopen();",
-                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();\n        if (label === 'control' && dc.readyState === 'open') { setTimeout(window.sendNativeGamepadConnected, 200); setTimeout(window.sendNativeGamepadConnected, 1500); setTimeout(window.sendNativeGamepadConnected, 3500); }"
+                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();\n        if (label === 'control' && dc.readyState === 'open') { setTimeout(window.sendNativeGamepadConnected, 200); setTimeout(window.sendNativeGamepadConnected, 1500); }"
                 )
                 js = js.replace(
                     "setTimeout(CXkeepalive, 50);",
                     "setTimeout(CXkeepalive, 50);\n            setTimeout(window.sendNativeGamepadConnected, 500);\n            setTimeout(window.sendNativeGamepadConnected, 2500);"
                 )
 
-            # Manter geometria 1920x1080 limpa para a TV
             js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
             js = js.replace("heightInPixels: 2160", "heightInPixels: 1080")
 
-            # Canvas oculto minimo 2x2 a 1 FPS
             js = js.replace("canvas.width = 1920;", "canvas.width = 2;")
             js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
             js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
@@ -193,9 +199,9 @@ jobs:
                 f.write(js)
 
         # 5. Atualizar MainActivity.java:
-        #    - Auto-preparar o controle GameSir logo no 1o frame
-        #    - Adiar closeWebview em 14s (Fortnite carrega sem travar e depois a WebView fecha para nao interferir no controle)
-        #    - Ao clicar em "Sair do Jogo", recarregar SEMPRE a pagina inicial do catalogo (https://www.xbox.com/pt-BR/play)
+        #    - Alimentar AMBOS os canais (gamepadListener + controllerLe) simultaneamente durante o jogo
+        #    - Nunca chamar pauseTimers() na WebView e nunca tornar a surfaceView focavel (evita perder o controle no site ao sair do jogo)
+        #    - Devolver o foco explicitamente para a WebView em setWebviewVisible() e showWebview()
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -213,11 +219,77 @@ jobs:
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
 
-            # Auto-detectar e preparar o controle fisico assim que o primeiro frame do jogo renderizar
+            # CORRECAO CRITICA 2: Remover a trava de activeInputChannel nos callbacks de envio para enviar em qualquer canal que esteja OPEN
+            mj = mj.replace(
+                'if (isStreaming && streamingService != null && "unreliableinput".equals(activeInputChannel))',
+                'if (isStreaming && streamingService != null)'
+            )
+            mj = mj.replace(
+                'if (isStreaming && streamingService != null && "input".equals(activeInputChannel))',
+                'if (isStreaming && streamingService != null)'
+            )
+
+            # CORRECAO CRITICA 3: Alimentar TANTO o gamepadListener QUANTO o controllerLe em cada movimento e aperto de botao
+            dual_motion_block = "\n".join([
+                "if (isStreaming) {",
+                "                    boolean handled = false;",
+                "                    if (gamepadListener != null) {",
+                "                        String prepMsg = gamepadListener.prepare(event.getDevice());",
+                "                        if (prepMsg != null && !prepMsg.isEmpty()) showCustomToast(prepMsg);",
+                "                        if (gamepadListener.onGenericMotion(event)) handled = true;",
+                "                    }",
+                "                    if (controllerLe != null) {",
+                "                        controllerLe.detectAxisLayout(event.getDevice());",
+                "                        if (controllerLe.onGenericMotion(event)) handled = true;",
+                "                    }",
+                "                    if (handled) return true;",
+                "                }"
+            ])
+            mj = re.sub(
+                r"if\s*\(isStreaming\)\s*\{\s*if\s*\(\"unreliableinput\"\.equals\(activeInputChannel\)\s*&&\s*gamepadListener\s*!=\s*null\)\s*\{[\s\S]*?if\s*\(controllerLe\.onGenericMotion\(event\)\)\s*return\s+true;\s*\}\s*\}",
+                lambda _: dual_motion_block,
+                mj,
+                count=1
+            )
+
+            dual_key_block = "\n".join([
+                "if (isStreaming) {",
+                "                    boolean handled = false;",
+                "                    if (gamepadListener != null) {",
+                "                        String prepMsg = gamepadListener.prepare(event.getDevice());",
+                "                        if (prepMsg != null && !prepMsg.isEmpty()) showCustomToast(prepMsg);",
+                "                        if (event.getAction() == KeyEvent.ACTION_DOWN) {",
+                "                            if (gamepadListener.onKeyDown(event.getKeyCode(), event)) handled = true;",
+                "                        } else if (event.getAction() == KeyEvent.ACTION_UP) {",
+                "                            if (gamepadListener.onKeyUp(event.getKeyCode(), event)) handled = true;",
+                "                        }",
+                "                    }",
+                "                    if (controllerLe != null) {",
+                "                        controllerLe.detectAxisLayout(event.getDevice());",
+                "                        if (event.getAction() == KeyEvent.ACTION_DOWN) {",
+                "                            if (controllerLe.onKeyDown(event.getKeyCode(), event)) handled = true;",
+                "                        } else if (event.getAction() == KeyEvent.ACTION_UP) {",
+                "                            if (controllerLe.onKeyUp(event.getKeyCode(), event)) handled = true;",
+                "                        }",
+                "                    }",
+                "                    if (handled) return true;",
+                "                }"
+            ])
+            mj = re.sub(
+                r"if\s*\(isStreaming\)\s*\{\s*if\s*\(\"unreliableinput\"\.equals\(activeInputChannel\)\s*&&\s*gamepadListener\s*!=\s*null\)\s*\{[\s\S]*?if\s*\(controllerLe\.onKeyUp\(event\.getKeyCode\(\),\s*event\)\)\s*return\s+true;\s*\}\s*\}\s*\}",
+                lambda _: dual_key_block,
+                mj,
+                count=1
+            )
+
+            # Auto-preparar o controle e iniciar o legacyInputChannel assim que o 1o frame renderizar
             first_frame_target = "setStreamingState(true);"
             first_frame_replacement = "\n".join([
                 "setStreamingState(true);",
                 "                setNativeGamepadEnabled(true);",
+                "                if (legacyInputChannel != null) {",
+                "                    legacyInputChannel.start(0);",
+                "                }",
                 "                try {",
                 "                    int[] devIds = InputDevice.getDeviceIds();",
                 "                    for (int devId : devIds) {",
@@ -233,54 +305,65 @@ jobs:
             if "InputDevice.getDeviceIds()" not in mj and first_frame_target in mj:
                 mj = mj.replace(first_frame_target, first_frame_replacement, 1)
 
-            # Fechamento inteligente da WebView 14s apos o "Experience boosting..."
-            delayed_close_webview = "\n".join([
+            # CORRECAO CRITICA 4: Em setWebviewVisible(), devolver o foco para a WebView assim que ela sair de View.GONE (fim dos 18% -> 37% -> 100%)
+            focus_webview_visible = "\n".join([
+                "    public void setWebviewVisible() {",
+                "        if (surfaceView != null) {",
+                "            surfaceView.setFocusable(false);",
+                "            surfaceView.setFocusableInTouchMode(false);",
+                "        }",
+                "        if (webView != null) {",
+                "            webView.setVisibility(WebView.VISIBLE);",
+                "            webView.setFocusable(true);",
+                "            webView.setFocusableInTouchMode(true);",
+                "            webView.requestFocus();",
+                "        }",
+                "        if (loadingLayout != null) {",
+                "            loadingLayout.setVisibility(View.GONE);",
+                "        }",
+                "        if (performanceDialog != null) {",
+                "            performanceDialog.dismiss();",
+                "        }",
+                "    }"
+            ])
+            mj = re.sub(
+                r"public\s+void\s+setWebviewVisible\s*\(\s*\)\s*\{[\s\S]*?performanceDialog\.dismiss\(\);\s*\}\s*\}",
+                lambda _: focus_webview_visible,
+                mj,
+                count=1
+            )
+
+            # CORRECAO CRITICA 5: Nunca chamar pauseTimers() nem tornar surfaceView focavel em closeWebview()
+            clean_close_webview = "\n".join([
                 "    public void closeWebview() {",
                 "        runOnUiThread(() -> {",
                 "            if (webView != null) {",
                 "                webView.setVisibility(View.INVISIBLE);",
                 "            }",
-                "            if (surfaceView != null) {",
-                "                surfaceView.setFocusable(true);",
-                "                surfaceView.setFocusableInTouchMode(true);",
-                "                surfaceView.requestFocus();",
-                "            }",
                 "            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
                 "                getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
                 "            }",
-                "            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {",
-                "                if (!isStreaming) return;",
-                "                if (webView != null) {",
-                "                    webViewState = null;",
-                "                    rootLayout.removeView(webView);",
-                "                    webView.stopLoading();",
-                "                    webView.loadUrl(\"about:blank\");",
-                "                    webView.onPause();",
-                "                    webView.pauseTimers();",
-                "                    webView.destroy();",
-                "                    webView = null;",
-                "                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
-                "                        getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
-                "                    }",
-                "                }",
-                "            }, 14000);",
                 "        });",
                 "    }"
             ])
             mj = re.sub(
                 r"public\s+void\s+closeWebview\s*\(\s*\)\s*\{[\s\S]*?webView\s*=\s*null;[\s\S]*?\}\s*\)\s*;\s*\}",
-                lambda _: delayed_close_webview,
+                lambda _: clean_close_webview,
                 mj,
                 count=1
             )
 
-            # Garantir que showWebview() SEMPRE abra a pagina inicial do catalogo (nunca a tela preta de /launch/)
+            # CORRECAO CRITICA 6: Ao sair do jogo (showWebview), voltar para a pagina inicial do catalogo com foco 100% na WebView
             home_show_webview = "\n".join([
                 "    public void showWebview() {",
                 "        if (audioManager != null) {",
                 "            audioManager.setMode(AudioManager.MODE_NORMAL);",
                 "        }",
                 "        runOnUiThread(() -> {",
+                "            if (surfaceView != null) {",
+                "                surfaceView.setFocusable(false);",
+                "                surfaceView.setFocusableInTouchMode(false);",
+                "            }",
                 "            if (webView == null) {",
                 "                initWebView();",
                 "                rootLayout.addView(webView, 1);",
@@ -294,6 +377,8 @@ jobs:
                 "            webView.setVisibility(View.VISIBLE);",
                 "            webView.resumeTimers();",
                 "            webView.onResume();",
+                "            webView.setFocusable(true);",
+                "            webView.setFocusableInTouchMode(true);",
                 "            webView.requestFocus();",
                 "            if (performanceDialog != null) {",
                 "                performanceDialog.dismiss();",
@@ -344,7 +429,7 @@ jobs:
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 6. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer
+        # 6. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer e liberar envio do reliableinput
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
@@ -355,6 +440,12 @@ jobs:
             rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 1;')
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
+
+            # Permitir que reliableinput passe de JS para o DataChannel nativo
+            rj = rj.replace(
+                'if (("unreliableinput".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label))',
+                'if (("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label))'
+            )
 
             transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
             transceiver_fix = "\n".join([
