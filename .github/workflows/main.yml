@@ -48,12 +48,12 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Otimizar para Multilaser TL042 (HD 1.1GHz) + TCL 55P755 (FullHD/4K)
+    - name: Desbloquear Codec H.264 da Multilaser TL042 e Corrigir Handshake WebRTC
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
 
-        # 1. Reduzir PNGs pesados de splash para economizar RAM
+        # 1. Reduzir PNGs pesados de splash para poupar RAM
         tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
         for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
             with open(p, "wb") as f:
@@ -76,8 +76,9 @@ jobs:
                 f.write(kts)
 
         # 4. Otimizar index.js:
-        #    - Executar patchRtcPeerConnection() IMEDIATAMENTE (corrige falha de nao entrar no jogo na Multilaser TL042 1.1GHz)
-        #    - Enviar geometria 1280x720 quando estiver em 720/720HQ (para nao travar o decoder HD da Multilaser TL042)
+        #    - Envolver em guarda unica (evita SyntaxError de const duplicado)
+        #    - Ativar patchRtcPeerConnection() imediatamente
+        #    - Mapear 720HQ -> 720p e 1080HQ -> 1080p em resolutionAlias (evita erro "Voltaremos logo")
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -86,24 +87,41 @@ jobs:
             js = js.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
             js = js.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
             js = js.replace("|| 'es'", "|| 'br'")
-            js = js.replace("|| '1080p'", "|| '1080HQ'")
+            js = js.replace("|| '1080p'", "|| '1080'")
 
-            # Liberar canal 'message' para abertura de todos os jogos (incluindo Fortnite)
+            # Liberar canal 'message' para todos os jogos
             js = re.sub(
                 r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
                 "// Canal message liberado",
                 js
             )
 
-            # Ajustar generateMsDeviceInfo para reportar 1280x720 quando a resolucao for 720 ou 720HQ (ideal para Multilaser TL042)
-            js = js.replace(
-                "function generateMsDeviceInfo(osName) {",
-                "function generateMsDeviceInfo(osName) {\n    const resNow = getTargetResolution();\n    const isHd720 = (resNow === '720' || resNow === '720p' || resNow === '720HQ');"
-            )
-            js = js.replace("widthInPixels: 4096", "widthInPixels: isHd720 ? 1280 : 1920")
-            js = js.replace("heightInPixels: 2160", "heightInPixels: isHd720 ? 720 : 1080")
+            # Corrigir resolutionAlias para nunca enviar '720HQ' ou '1080HQ' brutos ao servidor da Microsoft
+            alias_fix = "\n".join([
+                "let targetRes = getTargetResolution();",
+                "                                        if (targetRes === '720' || targetRes === '720p' || targetRes === '720HQ') {",
+                "                                            overridesData.resolutionAlias = '720p';",
+                "                                        } else if (targetRes === '1440') {",
+                "                                            overridesData.resolutionAlias = '1440p';",
+                "                                        } else {",
+                "                                            overridesData.resolutionAlias = '1080p';",
+                "                                        }"
+            ])
+            js = js.replace("overridesData.resolutionAlias = window.BX_TARGET_RES;", alias_fix)
 
-            # Impedir que a WebView envie 'wasAdded: false' no canal 'control'
+            # Ajustar generateMsDeviceInfo para reportar 1280x720 em 720/720HQ e 1920x1080 em 1080/1080HQ
+            if "const isHd720" not in js:
+                js = js.replace(
+                    "function generateMsDeviceInfo(osName",
+                    "function generateMsDeviceInfo(osName"
+                )
+                js = re.sub(
+                    r"dimensions:\s*\{\s*widthInPixels:\s*[^,]+,\s*heightInPixels:\s*[^\}]+\}",
+                    "dimensions: { widthInPixels: (getTargetResolution().startsWith('720') ? 1280 : 1920), heightInPixels: (getTargetResolution().startsWith('720') ? 720 : 1080) }",
+                    js
+                )
+
+            # Impedir que a WebView desconecte o comando enviando wasAdded: false
             control_guard = "\n".join([
                 "if (label === 'control' && typeof data === 'string') {",
                 "                                    if (data.includes('gamepadChanged') && data.includes('false')) {",
@@ -115,7 +133,7 @@ jobs:
             if "data.includes('gamepadChanged')" not in js:
                 js = js.replace("if (label === 'control' && data.includes('resolutionAlias'))", control_guard, 1)
 
-            # Anunciar controle conectado no inicio da sessao
+            # Anunciar comando conectado no inicio da sessao
             gamepad_connect_helper = "\n".join([
                 "window.sendNativeGamepadConnected = function() {",
                 "    try {",
@@ -142,20 +160,30 @@ jobs:
             js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
             js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
-            js = js.replace("}, 3000);", "}, 100);")
+            js = js.replace("}, 3000);", "}, 50);")
 
-            # CORRECAO CRITICA MULTILASER TL042: Ativar patchRtcPeerConnection() e InitBc() IMEDIATAMENTE dentro de main()
-            # (Em CPUs de 1.1GHz, o evento window 'load' ja passou quando o script termina de ser injetado!)
-            js = js.replace(
-                "function main() {\n    BxLogger.info(\"Init\", \"Loading lightweight xCloud bypass...\");\n    interceptHttpRequests();\n    patchWebSocket();\n    Patcher.init();\n}",
-                "function main() {\n    if (window.__BXC_INJECTED__) return;\n    window.__BXC_INJECTED__ = true;\n    BxLogger.info(\"Init\", \"Loading xCloud bypass (Multi-TV Optimized)...\");\n    InitBc();\n    patchRtcPeerConnection();\n    interceptHttpRequests();\n    patchWebSocket();\n    Patcher.init();\n}"
+            # Garantir que patchRtcPeerConnection() e InitBc() rodem imediatamente no final do script
+            js = re.sub(
+                r"function\s+main\s*\(\s*\)\s*\{[\s\S]*?\}",
+                "\n".join([
+                    "function main() {",
+                    "    BxLogger.info('Init', 'Initializing xCloud WebRTC Bridge immediately...');",
+                    "    InitBc();",
+                    "    patchRtcPeerConnection();",
+                    "    interceptHttpRequests();",
+                    "    patchWebSocket();",
+                    "    Patcher.init();",
+                    "}"
+                ]),
+                js,
+                count=1
             )
 
             sdp_stabilizer = "\n".join([
                 "function forceLowLatencyBaselineSdp(sdp, maxKbps) {",
                 "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 15000;",
                 "    let startKbps = Math.min(capKbps, 10000);",
-                "    let minKbps = 3000;",
+                "    let minKbps = 2500;",
                 "    let lines = sdp.split('\\r\\n');",
                 "    let out = [];",
                 "    let inVideo = false;",
@@ -164,8 +192,6 @@ jobs:
                 "        if (line.startsWith('m=video')) inVideo = true;",
                 "        else if (line.startsWith('m=')) inVideo = false;",
                 "        if (inVideo && line.startsWith('a=fmtp:')) {",
-                "            line = line.replace(/profile-level-id=64[0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
-                "            line = line.replace(/profile-level-id=4[dD][0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
                 "            if (!line.includes('x-google-max-bitrate')) {",
                 "                line += ';x-google-max-bitrate=' + capKbps + ';x-google-min-bitrate=' + minKbps + ';x-google-start-bitrate=' + startKbps;",
                 "            }",
@@ -187,23 +213,25 @@ jobs:
                 )
                 js = js.replace("offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);", "// bitrate aplicado em forceLowLatencyBaselineSdp")
 
-            pt_redirect = "\n".join([
-                "(function forcePtBrLocale() {",
-                "    try {",
-                "        if (window.location && window.location.pathname && /^\\/(fr-fr|en-us|es-es|fr)\\b/i.test(window.location.pathname)) {",
-                "            var newUrl = window.location.href.replace(/\\/(fr-fr|en-us|es-es|fr)(?=\\/|$)/i, '/pt-BR');",
-                "            window.location.replace(newUrl);",
-                "        }",
-                "    } catch (e) {}",
-                "})();"
-            ])
-            if "forcePtBrLocale" not in js:
-                js = pt_redirect + "\n" + js
+            # Envolver todo o index.js num bloco seguro contra dupla injecao
+            if "window.__BXC_SAFE_GUARD__" not in js:
+                js = "\n".join([
+                    "(function() {",
+                    "if (window.__BXC_SAFE_GUARD__) return;",
+                    "window.__BXC_SAFE_GUARD__ = true;",
+                    "try {",
+                    "    if (window.location && window.location.pathname && /^\\/(fr-fr|en-us|es-es|fr)\\b/i.test(window.location.pathname)) {",
+                    "        window.location.replace(window.location.href.replace(/\\/(fr-fr|en-us|es-es|fr)(?=\\/|$)/i, '/pt-BR'));",
+                    "    }",
+                    "} catch (e) {}",
+                    js,
+                    "})();"
+                ])
 
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Corrigir AndroidGamepadListener.java (Deadzone segura de 0.15f para evitar drift no Gears/Forza)
+        # 5. Corrigir AndroidGamepadListener.java (Deadzone segura de 0.15f)
         gp_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
         if os.path.exists(gp_java):
             with open(gp_java, "r", encoding="utf-8") as f:
@@ -213,9 +241,8 @@ jobs:
                 f.write(gp)
 
         # 6. Atualizar MainActivity.java:
-        #    - Detector automatico da Multilaser TL042 / TVs HD (usa 720HQ @ 10 Mbps na TL042 e 1080HQ @ 20 Mbps na TCL 55P755)
-        #    - Garantir injecao do index.js tambem no onPageFinished (caso o onProgressChanged pule na TL042)
-        #    - Limpar memoria da WebView (freeMemory) ao iniciar o jogo
+        #    - Auto-reconectar o StreamingService caso seja nulo
+        #    - Usar 720 (Android nativo) @ 8 Mbps na Multilaser TL042 e 1080HQ @ 20 Mbps na TCL 55P755
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -224,7 +251,6 @@ jobs:
             mj = mj.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
             mj = mj.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
 
-            # Adicionar metodo detector de TV HD / Low-RAM (Multilaser TL042)
             helper_method = "\n".join([
                 "    private boolean isLowSpecHdTv() {",
                 "        try {",
@@ -242,10 +268,17 @@ jobs:
             if "isLowSpecHdTv()" not in mj:
                 mj = mj.replace("    public boolean isStreaming() {", helper_method, 1)
 
+            # Garantir que getStreamingService() reconecte o servico se o Android 11 tiver limpado a memoria
+            mj = mj.replace(
+                "public IStreamingService getStreamingService() {\n        return streamingService;\n    }",
+                "public IStreamingService getStreamingService() {\n        if (streamingService == null) {\n            try { bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE | BIND_IMPORTANT); } catch (Throwable ignored) {}\n        }\n        return streamingService;\n    }"
+            )
+            mj = mj.replace("BIND_AUTO_CREATE)", "BIND_AUTO_CREATE | BIND_IMPORTANT)")
+
             mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720HQ" : "1080HQ")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720HQ" : "1080HQ")')
-            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, isLowSpecHdTv() ? 10 : 20)')
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720" : "1080HQ")')
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720" : "1080HQ")')
+            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, isLowSpecHdTv() ? 8 : 20)')
 
             mj = mj.replace('gpPrefs.getFloat("camera_deadzone", 0.12f)', 'gpPrefs.getFloat("camera_deadzone", 0.16f)')
             mj = mj.replace("gamepadListener.setOnMenuTrigger(this::showStreamingMenuDialog);", "// menu trigger via Select+Start")
@@ -255,16 +288,7 @@ jobs:
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
 
-            # Garantir que o index.js seja injetado no onPageFinished caso a Multilaser TL042 tenha pulado o onProgressChanged
             page_finished_target = "super.onPageFinished(view, url);\n                setWebviewVisible();"
-            page_finished_fix = "\n".join([
-                "super.onPageFinished(view, url);",
-                "                if (url != null && url.contains(\"play\")) {",
-                "                    view.evaluateJavascript(\"if (!window.__BXC_INJECTED__) { \" + JSONObject.quote(loadScriptFromAssets()).substring(1, JSONObject.quote(loadScriptFromAssets()).length() - 1) + \" }\", null);",
-                "                }",
-                "                setWebviewVisible();"
-            ])
-            # Forma mais segura e direta: chamar evaluateJavascript(loadScriptFromAssets()) pois main() agora tem guarda window.__BXC_INJECTED__!
             safe_page_finished = "\n".join([
                 "super.onPageFinished(view, url);",
                 "                if (url != null && url.contains(\"play\")) {",
@@ -275,7 +299,6 @@ jobs:
             if "view.evaluateJavascript(loadScriptFromAssets(), null);" not in mj.split("onPageFinished")[1].split("onPageStarted")[0]:
                 mj = mj.replace(page_finished_target, safe_page_finished, 1)
 
-            # No 1o frame: preparar controle e liberar RAM da WebView (freeMemory + pauseTimers apos 6s)
             first_frame_target = "setStreamingState(true);"
             first_frame_replacement = "\n".join([
                 "setStreamingState(true);",
@@ -298,7 +321,7 @@ jobs:
                 "                        webView.onPause();",
                 "                        webView.pauseTimers();",
                 "                    }",
-                "                }, 6000);"
+                "                }, 8000);"
             ])
             if "InputDevice.getDeviceIds()" not in mj and first_frame_target in mj:
                 mj = mj.replace(first_frame_target, first_frame_replacement, 1)
@@ -348,7 +371,7 @@ jobs:
                 "                    webView.onPause();",
                 "                    webView.pauseTimers();",
                 "                }",
-                "            }, 6000);",
+                "            }, 8000);",
                 "        });",
                 "    }"
             ])
@@ -436,23 +459,61 @@ jobs:
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 7. Corrigir WebRtcReceiver.java: Priorizar H.264 Baseline ANTES do Offer
+        # 7. Corrigir WebRtcReceiver.java:
+        #    - Desbloquear TODOS os descodificadores H.264 da Multilaser TL042 (MStar/Realtek/Allwinner/Android C2)
+        #    - Garantir que se a lista H264 vier vazia, nunca remova os codecs disponiveis
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
                 rj = f.read()
 
             rj = rj.replace(".setEnableInternalTracer(true)", ".setEnableInternalTracer(false)")
-            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 0;')
-            rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 1;')
+            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 1;')
+            rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 2;')
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
+
+            # Criar um VideoDecoderFactory universal que aceita tanto Hardware quanto PlatformSoftware (desbloqueia chips MStar/Realtek/Allwinner na Multilaser TL042)
+            universal_decoder_factory = "\n".join([
+                "        org.webrtc.VideoDecoderFactory decoderFactory = new org.webrtc.VideoDecoderFactory() {",
+                "            private final org.webrtc.VideoDecoderFactory hw = new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());",
+                "            private final org.webrtc.VideoDecoderFactory sw = new org.webrtc.PlatformSoftwareVideoDecoderFactory(eglBase.getEglBaseContext());",
+                "            @Override",
+                "            public org.webrtc.VideoDecoder createDecoder(org.webrtc.VideoCodecInfo info) {",
+                "                org.webrtc.VideoDecoder d = hw.createDecoder(info);",
+                "                if (d == null) d = sw.createDecoder(info);",
+                "                return d;",
+                "            }",
+                "            @Override",
+                "            public org.webrtc.VideoCodecInfo[] getSupportedCodecs() {",
+                "                java.util.LinkedHashMap<String, org.webrtc.VideoCodecInfo> map = new java.util.LinkedHashMap<>();",
+                "                for (org.webrtc.VideoCodecInfo c : hw.getSupportedCodecs()) map.put(c.name + c.params, c);",
+                "                for (org.webrtc.VideoCodecInfo c : sw.getSupportedCodecs()) map.put(c.name + c.params, c);",
+                "                boolean hasH264 = false;",
+                "                for (org.webrtc.VideoCodecInfo c : map.values()) {",
+                "                    if (\"H264\".equalsIgnoreCase(c.name)) { hasH264 = true; break; }",
+                "                }",
+                "                if (!hasH264) {",
+                "                    java.util.Map<String, String> params = new java.util.HashMap<>();",
+                "                    params.put(\"level-asymmetry-allowed\", \"1\");",
+                "                    params.put(\"packetization-mode\", \"1\");",
+                "                    params.put(\"profile-level-id\", \"42e01f\");",
+                "                    map.put(\"H264_fallback\", new org.webrtc.VideoCodecInfo(\"H264\", params));",
+                "                }",
+                "                return map.values().toArray(new org.webrtc.VideoCodecInfo[0]);",
+                "            }",
+                "        };"
+            ])
+            rj = rj.replace(
+                "DefaultVideoDecoderFactory decoderFactory =\n                new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());",
+                universal_decoder_factory
+            )
 
             transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
             transceiver_fix = "\n".join([
                 "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));",
                 "        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {",
-                "            setVideoCodecPreferences(transceiver);",
+                "            try { setVideoCodecPreferences(transceiver); } catch (Throwable ignored) {}",
                 "        }"
             ])
             if "if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)" not in rj and transceiver_target in rj:
@@ -507,11 +568,12 @@ jobs:
             except Exception:
                 pass
 
-        # 9. Garantir extractNativeLibs="true" e android:largeHeap="true" (Essencial para a Multilaser TL042 nao fechar por falta de RAM!)
+        # 9. No AndroidManifest.xml: manter StreamingService no processo principal (nao morrer por falta de RAM na Multilaser TL042)
         man_path = "app/src/main/AndroidManifest.xml"
         if os.path.exists(man_path):
             with open(man_path, "r", encoding="utf-8") as f:
                 man = f.read()
+            man = re.sub(r'android:process="[^"]*"', '', man)
             if 'android:extractNativeLibs="false"' in man:
                 man = man.replace('android:extractNativeLibs="false"', 'android:extractNativeLibs="true"')
             elif 'android:extractNativeLibs' not in man:
