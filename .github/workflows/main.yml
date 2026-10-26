@@ -48,12 +48,12 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Corrigir Construtor VideoCodecInfo e Compilar APK
+    - name: Corrigir Bugs de Controle (Forza Start / Gears Drift / Zero Delay Camera) + 1080HQ 20Mbps
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
 
-        # 1. Reduzir PNGs pesados de splash para poupar RAM
+        # 1. Reduzir PNGs pesados de splash
         tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
         for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
             with open(p, "wb") as f:
@@ -75,7 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js
+        # 4. Otimizar index.js: Build anterior (1080HQ @ 20Mbps Baseline) + Bloqueio de Gamepad duplicado na WebView
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -86,91 +86,20 @@ jobs:
             js = js.replace("|| 'es'", "|| 'br'")
             js = js.replace("|| '1080p'", "|| '1080HQ'")
 
-            js = re.sub(
-                r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
-                "// Canal message liberado",
-                js
-            )
-
-            alias_fix = "\n".join([
-                "let targetRes = getTargetResolution();",
-                "                                        if (targetRes === '720' || targetRes === '720p' || targetRes === '720HQ') {",
-                "                                            overridesData.resolutionAlias = '720p';",
-                "                                        } else if (targetRes === '1440') {",
-                "                                            overridesData.resolutionAlias = '1440p';",
-                "                                        } else {",
-                "                                            overridesData.resolutionAlias = '1080p';",
-                "                                        }"
-            ])
-            js = js.replace("overridesData.resolutionAlias = window.BX_TARGET_RES;", alias_fix)
-
-            if "const isHd720" not in js:
-                js = re.sub(
-                    r"dimensions:\s*\{\s*widthInPixels:\s*[^,]+,\s*heightInPixels:\s*[^\}]+\}",
-                    "dimensions: { widthInPixels: (getTargetResolution().startsWith('720') ? 1280 : 1920), heightInPixels: (getTargetResolution().startsWith('720') ? 720 : 1080) }",
-                    js
-                )
-
-            control_guard = "\n".join([
-                "if (label === 'control' && typeof data === 'string') {",
-                "                                    if (data.includes('gamepadChanged') && data.includes('false')) {",
-                "                                        return;",
-                "                                    }",
-                "                                }",
-                "                                if (label === 'control' && data.includes('resolutionAlias'))"
-            ])
-            if "data.includes('gamepadChanged')" not in js:
-                js = js.replace("if (label === 'control' && data.includes('resolutionAlias'))", control_guard, 1)
-
-            gamepad_connect_helper = "\n".join([
-                "window.sendNativeGamepadConnected = function() {",
-                "    try {",
-                "        if (window.AndroidBridge && window.AndroidBridge.onDataChannelSend) {",
-                "            var msg = JSON.stringify({ message: 'gamepadChanged', gamepadIndex: 0, wasAdded: true });",
-                "            var b64 = window.btoa(unescape(encodeURIComponent(msg)));",
-                "            window.AndroidBridge.onDataChannelSend('control', null, b64, false);",
-                "        }",
-                "    } catch (e) {}",
-                "};"
-            ])
-            if "sendNativeGamepadConnected" not in js:
-                js = gamepad_connect_helper + "\n" + js
-                js = js.replace(
-                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();",
-                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();\n        if (label === 'control' && dc.readyState === 'open') { setTimeout(window.sendNativeGamepadConnected, 300); }"
-                )
-                js = js.replace(
-                    "setTimeout(CXkeepalive, 50);",
-                    "setTimeout(CXkeepalive, 50);\n            setTimeout(window.sendNativeGamepadConnected, 600);"
-                )
+            js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
+            js = js.replace("heightInPixels: 2160", "heightInPixels: 1080")
 
             js = js.replace("canvas.width = 1920;", "canvas.width = 2;")
             js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
             js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
-            js = js.replace("}, 3000);", "}, 50);")
-
-            js = re.sub(
-                r"function\s+main\s*\(\s*\)\s*\{[\s\S]*?\}",
-                "\n".join([
-                    "function main() {",
-                    "    BxLogger.info('Init', 'Initializing xCloud WebRTC Bridge immediately...');",
-                    "    InitBc();",
-                    "    patchRtcPeerConnection();",
-                    "    interceptHttpRequests();",
-                    "    patchWebSocket();",
-                    "    Patcher.init();",
-                    "}"
-                ]),
-                js,
-                count=1
-            )
+            js = js.replace("}, 3000);", "}, 300);")
 
             sdp_stabilizer = "\n".join([
                 "function forceLowLatencyBaselineSdp(sdp, maxKbps) {",
-                "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 15000;",
-                "    let startKbps = Math.min(capKbps, 10000);",
-                "    let minKbps = 2500;",
+                "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 20000;",
+                "    let startKbps = Math.min(capKbps, 12000);",
+                "    let minKbps = 4000;",
                 "    let lines = sdp.split('\\r\\n');",
                 "    let out = [];",
                 "    let inVideo = false;",
@@ -179,6 +108,8 @@ jobs:
                 "        if (line.startsWith('m=video')) inVideo = true;",
                 "        else if (line.startsWith('m=')) inVideo = false;",
                 "        if (inVideo && line.startsWith('a=fmtp:')) {",
+                "            line = line.replace(/profile-level-id=64[0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
+                "            line = line.replace(/profile-level-id=4[dD][0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
                 "            if (!line.includes('x-google-max-bitrate')) {",
                 "                line += ';x-google-max-bitrate=' + capKbps + ';x-google-min-bitrate=' + minKbps + ';x-google-start-bitrate=' + startKbps;",
                 "            }",
@@ -200,6 +131,13 @@ jobs:
                 )
                 js = js.replace("offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);", "// bitrate aplicado em forceLowLatencyBaselineSdp")
 
+            # Quando o streaming comeca (simulateOnTrack), desativa o leitor de gamepad duplicado da WebView
+            # para impedir que o gatilho RT acione o botao Start pelo Chromium no Forza Horizon 6
+            js = js.replace(
+                "window.simulateOnTrack = function(kind, id) {",
+                "window.simulateOnTrack = function(kind, id) {\n        try { navigator.getGamepads = function() { return []; }; } catch (e) {}"
+            )
+
             pt_redirect = "\n".join([
                 "(function forcePtBrLocale() {",
                 "    try {",
@@ -216,16 +154,695 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Corrigir AndroidGamepadListener.java
-        gp_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
-        if os.path.exists(gp_java):
-            with open(gp_java, "r", encoding="utf-8") as f:
-                gp = f.read()
-            gp = gp.replace("this.stickDeadzone = stickDeadzone;", "this.stickDeadzone = Math.max(stickDeadzone, 0.15f);")
-            with open(gp_java, "w", encoding="utf-8") as f:
-                f.write(gp)
+        # 5. Corrigir GamepadTransitionFrame.java: Tirar o bloqueio de 10% (0.1f) da camera (Zero Delay) e garantir reset limpo
+        gtf_java = "app/src/main/java/com/world/cloudxsolution/GamepadTransitionFrame.java"
+        if os.path.exists(gtf_java):
+            gtf_code = """package com.world.cloudxsolution;
 
-        # 6. Atualizar MainActivity.java
+public final class GamepadTransitionFrame {
+
+    public int gamepadId;
+
+    public static final int INDEX_DPAD_UP = 0;
+    public static final int INDEX_DPAD_DOWN = 1;
+    public static final int INDEX_DPAD_LEFT = 2;
+    public static final int INDEX_DPAD_RIGHT = 3;
+    public static final int INDEX_MENU = 4;
+    public static final int INDEX_VIEW = 5;
+    public static final int INDEX_LEFT_THUMB = 6;
+    public static final int INDEX_RIGHT_THUMB = 7;
+    public static final int INDEX_LEFT_SHOULDER = 8;
+    public static final int INDEX_RIGHT_SHOULDER = 9;
+    public static final int INDEX_NEXUS = 10;
+    public static final int INDEX_SHARE = 11;
+    public static final int INDEX_A = 12;
+    public static final int INDEX_B = 13;
+    public static final int INDEX_X = 14;
+    public static final int INDEX_Y = 15;
+    public static final int TRANSITION_COUNT = 16;
+
+    public static final int AXIS_LEFT_X = 0;
+    public static final int AXIS_LEFT_Y = 1;
+    public static final int AXIS_RIGHT_X = 2;
+    public static final int AXIS_RIGHT_Y = 3;
+    public static final int AXIS_LEFT_TRIGGER = 4;
+    public static final int AXIS_RIGHT_TRIGGER = 5;
+    public static final int AXIS_COUNT = 6;
+
+    public final int[] transitions = new int[TRANSITION_COUNT];
+    public final boolean[] held = new boolean[TRANSITION_COUNT];
+    public final float[] axes = new float[AXIS_COUNT];
+
+    public int physicalPhysicality;
+    public int virtualPhysicality;
+
+    public GamepadTransitionFrame(int gamepadId) {
+        this.gamepadId = gamepadId;
+    }
+
+    public void bumpButton(String button) {
+        int index = getButtonIndex(button);
+        if (index != -1) {
+            bumpButton(index);
+        }
+    }
+
+    public void bumpButton(int index) {
+        if (index >= 0 && index < TRANSITION_COUNT && !held[index]) {
+            transitions[index]++;
+            held[index] = true;
+        }
+    }
+
+    public void setReleased(String button) {
+        int index = getButtonIndex(button);
+        if (index != -1) {
+            setReleased(index);
+        }
+    }
+
+    public void setReleased(int index) {
+        if (index >= 0 && index < TRANSITION_COUNT && held[index]) {
+            held[index] = false;
+            transitions[index]++;
+        }
+    }
+
+    public void resetAllHeldButtons() {
+        for (int i = 0; i < TRANSITION_COUNT; i++) {
+            if (held[i]) {
+                held[i] = false;
+                transitions[i]++;
+            }
+        }
+    }
+
+    private int getButtonIndex(String button) {
+        switch (button) {
+            case "A": return INDEX_A;
+            case "B": return INDEX_B;
+            case "X": return INDEX_X;
+            case "Y": return INDEX_Y;
+            case "DPadUp": return INDEX_DPAD_UP;
+            case "DPadDown": return INDEX_DPAD_DOWN;
+            case "DPadLeft": return INDEX_DPAD_LEFT;
+            case "DPadRight": return INDEX_DPAD_RIGHT;
+            case "LeftShoulder": return INDEX_LEFT_SHOULDER;
+            case "RightShoulder": return INDEX_RIGHT_SHOULDER;
+            case "LeftThumb": return INDEX_LEFT_THUMB;
+            case "RightThumb": return INDEX_RIGHT_THUMB;
+            case "View": return INDEX_VIEW;
+            case "Menu": return INDEX_MENU;
+            case "Nexus": return INDEX_NEXUS;
+            case "Share": return INDEX_SHARE;
+            default: return -1;
+        }
+    }
+
+    public void setLeftStick(float x, float y) {
+        axes[AXIS_LEFT_X] = x;
+        axes[AXIS_LEFT_Y] = -y;
+    }
+
+    public void setRightStick(float x, float y) {
+        axes[AXIS_RIGHT_X] = x;
+        axes[AXIS_RIGHT_Y] = -y;
+    }
+
+    public void setTriggers(float left, float right) {
+        axes[AXIS_LEFT_TRIGGER] = left;
+        axes[AXIS_RIGHT_TRIGGER] = right;
+    }
+
+    public int computeButtonPhysicality() {
+        int p = GamepadInputPhysicality.NONE;
+        if (held[INDEX_A]) p |= GamepadInputPhysicality.A;
+        if (held[INDEX_B]) p |= GamepadInputPhysicality.B;
+        if (held[INDEX_X]) p |= GamepadInputPhysicality.X;
+        if (held[INDEX_Y]) p |= GamepadInputPhysicality.Y;
+        if (held[INDEX_MENU]) p |= GamepadInputPhysicality.MENU;
+        if (held[INDEX_VIEW]) p |= GamepadInputPhysicality.VIEW;
+        if (held[INDEX_LEFT_THUMB]) p |= GamepadInputPhysicality.LEFT_THUMB;
+        if (held[INDEX_RIGHT_THUMB]) p |= GamepadInputPhysicality.RIGHT_THUMB;
+        if (held[INDEX_LEFT_SHOULDER]) p |= GamepadInputPhysicality.LEFT_SHOULDER;
+        if (held[INDEX_RIGHT_SHOULDER]) p |= GamepadInputPhysicality.RIGHT_SHOULDER;
+        if (held[INDEX_NEXUS]) p |= GamepadInputPhysicality.NEXUS;
+        if (held[INDEX_SHARE]) p |= GamepadInputPhysicality.MISC;
+
+        if (held[INDEX_DPAD_UP]) p |= GamepadInputPhysicality.DPAD_UP;
+        if (held[INDEX_DPAD_DOWN]) p |= GamepadInputPhysicality.DPAD_DOWN;
+        if (held[INDEX_DPAD_LEFT]) p |= GamepadInputPhysicality.DPAD_LEFT;
+        if (held[INDEX_DPAD_RIGHT]) p |= GamepadInputPhysicality.DPAD_RIGHT;
+
+        if (axes[AXIS_LEFT_TRIGGER] > 0.01f) p |= GamepadInputPhysicality.LEFT_TRIGGER;
+        if (axes[AXIS_RIGHT_TRIGGER] > 0.01f) p |= GamepadInputPhysicality.RIGHT_TRIGGER;
+
+        if (Math.abs(axes[AXIS_LEFT_X]) > 0.001f) p |= GamepadInputPhysicality.LEFT_THUMB_X_AXIS;
+        if (Math.abs(axes[AXIS_LEFT_Y]) > 0.001f) p |= GamepadInputPhysicality.LEFT_THUMB_Y_AXIS;
+        // Zero-delay para a camera (Analogico Direito)
+        if (Math.abs(axes[AXIS_RIGHT_X]) > 0.0001f) p |= GamepadInputPhysicality.RIGHT_THUMB_X_AXIS;
+        if (Math.abs(axes[AXIS_RIGHT_Y]) > 0.0001f) p |= GamepadInputPhysicality.RIGHT_THUMB_Y_AXIS;
+
+        return p;
+    }
+
+    public GamepadTransitionFrame copy() {
+        GamepadTransitionFrame f = new GamepadTransitionFrame(gamepadId);
+        System.arraycopy(this.transitions, 0, f.transitions, 0, TRANSITION_COUNT);
+        System.arraycopy(this.held, 0, f.held, 0, TRANSITION_COUNT);
+        System.arraycopy(this.axes, 0, f.axes, 0, AXIS_COUNT);
+        f.physicalPhysicality = physicalPhysicality;
+        f.virtualPhysicality = virtualPhysicality;
+        return f;
+    }
+}
+"""
+            with open(gtf_java, "w", encoding="utf-8") as f:
+                f.write(gtf_code)
+
+        # 6. Corrigir UnreliableInputPacket.java: Garantir envio do 0.0f quando o analogico volta ao centro (Fim do drift no Gears)
+        uip_java = "app/src/main/java/com/world/cloudxsolution/UnreliableInputPacket.java"
+        if os.path.exists(uip_java):
+            with open(uip_java, "r", encoding="utf-8") as f:
+                uip = f.read()
+            # Quando curr.axes[i] == 0f e prev.axes[i] != 0f, obriga a marcar o eixo como alterado mesmo se a diferenca for < 0.001f
+            uip = uip.replace(
+                "Math.abs(curr.axes[i] - prev.axes[i]) > 0.001f",
+                "(Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f || (curr.axes[i] == 0f && prev.axes[i] != 0f))"
+            )
+            with open(uip_java, "w", encoding="utf-8") as f:
+                f.write(uip)
+
+        # 7. Corrigir AndroidGamepadListener.java:
+        # - Analogico Direito com ZERO deadzone (0.0f) para resposta instantanea da camera
+        # - Analogico Esquerdo com filtro anti-drift para nao andar para tras no Gears of War
+        # - Bloqueio total de eventos de tecla de gatilho (BUTTON_L2/R2/Z/C/GAS/BRAKE) para nao apertar Start no Forza
+        agl_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
+        if os.path.exists(agl_java):
+            agl_code = """package com.world.cloudxsolution;
+
+import android.os.Handler;
+import android.os.Looper;
+import android.view.InputDevice;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
+
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+public final class AndroidGamepadListener {
+
+    public interface PacketSender {
+        void sendPacket(ByteBuffer buffer);
+    }
+
+    private final PacketSender sender;
+    private final GamepadTransitionFrame transitionFrame;
+    private GamepadTransitionFrame previousFrame = null;
+
+    private float stickDeadzone = 0.14f;
+    private float cameraSensitivity = 1.5f;
+    private volatile InputDevice lastDevice;
+    private int lastDeviceId = -1;
+
+    private int rightStickXAxis = MotionEvent.AXIS_Z;
+    private int rightStickYAxis = MotionEvent.AXIS_RZ;
+    private int leftTriggerAxis = MotionEvent.AXIS_LTRIGGER;
+    private int rightTriggerAxis = MotionEvent.AXIS_RTRIGGER;
+    private boolean leftTriggerIsAnalog = true;
+    private boolean rightTriggerIsAnalog = true;
+    private float rightStickCurveExponent = 1.0f;
+
+    private final float[] stickScratch = new float[2];
+    private boolean testModeActive = false;
+
+    private boolean selectHeld = false;
+    private boolean startHeld = false;
+    private boolean menuTriggeredThisHold = false;
+    private Runnable onMenuTrigger;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable longPressMenuRunnable = () -> {
+        if (selectHeld && startHeld && !menuTriggeredThisHold && onMenuTrigger != null) {
+            menuTriggeredThisHold = true;
+            transitionFrame.setReleased("View");
+            transitionFrame.setReleased("Menu");
+            sendReport(false);
+            onMenuTrigger.run();
+        }
+    };
+
+    private long tickCounter = 1;
+    private final ScheduledExecutorService keepAliveExecutor = Executors.newSingleThreadScheduledExecutor();
+
+    public AndroidGamepadListener(int gamepadIndex, float sensitivity, float deadzone, PacketSender sender) {
+        this.sender = sender;
+        this.transitionFrame = new GamepadTransitionFrame(gamepadIndex);
+        this.cameraSensitivity = sensitivity;
+        this.stickDeadzone = Math.max(0.10f, deadzone);
+
+        keepAliveExecutor.scheduleAtFixedRate(() -> {
+            synchronized (AndroidGamepadListener.this) {
+                if (!testModeActive && previousFrame != null) {
+                    sendReport(true);
+                }
+            }
+        }, 250, 250, TimeUnit.MILLISECONDS);
+    }
+
+    public void setOnMenuTrigger(Runnable callback) {
+        this.onMenuTrigger = callback;
+    }
+
+    public void setTestModeActive(boolean active) {
+        this.testModeActive = active;
+    }
+
+    public void setgamepadIndex(int idx) {
+        this.transitionFrame.gamepadId = idx;
+    }
+
+    public void setStickDeadzone(float dz) {
+        this.stickDeadzone = dz;
+    }
+
+    public float getStickDeadzone() {
+        return this.stickDeadzone;
+    }
+
+    public void setCameraSensitivity(float sens) {
+        this.cameraSensitivity = sens;
+    }
+
+    public float getCameraSensitivity() {
+        return this.cameraSensitivity;
+    }
+
+    public int getRightStickAxisX() {
+        return rightStickXAxis;
+    }
+
+    public int getRightStickAxisY() {
+        return rightStickYAxis;
+    }
+
+    public float getRightStickResponseCurve() {
+        return rightStickCurveExponent;
+    }
+
+    public InputDevice getLastDevice() {
+        return lastDevice;
+    }
+
+    public String prepare(InputDevice device) {
+        if (device == null || device.isVirtual()) return "";
+        int id = device.getId();
+        if (id == lastDeviceId) return "";
+        lastDeviceId = id;
+        lastDevice = device;
+
+        // Zera todos os eixos e botoes ao conectar/trocar de controle para evitar drift inicial
+        Arrays.fill(transitionFrame.axes, 0f);
+        transitionFrame.resetAllHeldButtons();
+
+        if (device.getMotionRange(MotionEvent.AXIS_Z, InputDevice.SOURCE_JOYSTICK) != null
+                && device.getMotionRange(MotionEvent.AXIS_RZ, InputDevice.SOURCE_JOYSTICK) != null) {
+            rightStickXAxis = MotionEvent.AXIS_Z;
+            rightStickYAxis = MotionEvent.AXIS_RZ;
+        } else if (device.getMotionRange(MotionEvent.AXIS_RX, InputDevice.SOURCE_JOYSTICK) != null
+                && device.getMotionRange(MotionEvent.AXIS_RY, InputDevice.SOURCE_JOYSTICK) != null) {
+            rightStickXAxis = MotionEvent.AXIS_RX;
+            rightStickYAxis = MotionEvent.AXIS_RY;
+        } else {
+            rightStickXAxis = MotionEvent.AXIS_Z;
+            rightStickYAxis = MotionEvent.AXIS_RZ;
+        }
+
+        if (device.getMotionRange(MotionEvent.AXIS_LTRIGGER, InputDevice.SOURCE_JOYSTICK) != null) {
+            leftTriggerAxis = MotionEvent.AXIS_LTRIGGER;
+            leftTriggerIsAnalog = true;
+        } else if (device.getMotionRange(MotionEvent.AXIS_BRAKE, InputDevice.SOURCE_JOYSTICK) != null) {
+            leftTriggerAxis = MotionEvent.AXIS_BRAKE;
+            leftTriggerIsAnalog = true;
+        } else {
+            leftTriggerIsAnalog = false;
+        }
+
+        if (device.getMotionRange(MotionEvent.AXIS_RTRIGGER, InputDevice.SOURCE_JOYSTICK) != null) {
+            rightTriggerAxis = MotionEvent.AXIS_RTRIGGER;
+            rightTriggerIsAnalog = true;
+        } else if (device.getMotionRange(MotionEvent.AXIS_GAS, InputDevice.SOURCE_JOYSTICK) != null) {
+            rightTriggerAxis = MotionEvent.AXIS_GAS;
+            rightTriggerIsAnalog = true;
+        } else {
+            rightTriggerIsAnalog = false;
+        }
+
+        return "";
+    }
+
+    public synchronized boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (testModeActive) return false;
+        if (event == null || !isGamepadEvent(event, keyCode)) return false;
+
+        // CORRECAO FORZA HORIZON 6: Sempre consumir eventos digitais de gatilho (L2/R2/Z/C/GAS/BRAKE)
+        // para que NUNCA vazem para a WebView (que mapeia R2/Z como Start/Menu no Chromium!)
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) {
+            if (!leftTriggerIsAnalog) {
+                transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 1.0f;
+                sendReport(false);
+            }
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) {
+            if (!rightTriggerIsAnalog) {
+                transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 1.0f;
+                sendReport(false);
+            }
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) {
+            // Em controles HID que enviam BUTTON_Z/C quando aperta os gatilhos, ignorar para nao disparar Start
+            return true;
+        }
+
+        if (event.getRepeatCount() > 0) {
+            return true;
+        }
+
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT || keyCode == KeyEvent.KEYCODE_BACK) {
+            selectHeld = true;
+            checkMenuCombo();
+        } else if (keyCode == KeyEvent.KEYCODE_BUTTON_START) {
+            startHeld = true;
+            checkMenuCombo();
+        }
+
+        String button = mapButton(keyCode);
+        if (button == null) return false;
+
+        transitionFrame.bumpButton(button);
+        sendReport(false);
+        return true;
+    }
+
+    public synchronized boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (testModeActive) return false;
+        if (event == null || !isGamepadEvent(event, keyCode)) return false;
+
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) {
+            if (!leftTriggerIsAnalog) {
+                transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 0.0f;
+                sendReport(false);
+            }
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) {
+            if (!rightTriggerIsAnalog) {
+                transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 0.0f;
+                sendReport(false);
+            }
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) {
+            return true;
+        }
+
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT || keyCode == KeyEvent.KEYCODE_BACK) {
+            selectHeld = false;
+            mainHandler.removeCallbacks(longPressMenuRunnable);
+            menuTriggeredThisHold = false;
+        } else if (keyCode == KeyEvent.KEYCODE_BUTTON_START) {
+            startHeld = false;
+            mainHandler.removeCallbacks(longPressMenuRunnable);
+            menuTriggeredThisHold = false;
+        }
+
+        String button = mapButton(keyCode);
+        if (button == null) return false;
+
+        transitionFrame.setReleased(button);
+        sendReport(false);
+        return true;
+    }
+
+    private void checkMenuCombo() {
+        if (selectHeld && startHeld && !menuTriggeredThisHold) {
+            mainHandler.removeCallbacks(longPressMenuRunnable);
+            mainHandler.postDelayed(longPressMenuRunnable, 400);
+        }
+    }
+
+    public synchronized boolean onGenericMotion(MotionEvent event) {
+        if (testModeActive) return false;
+        if (event == null || (event.getSource() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK) {
+            return false;
+        }
+        InputDevice device = event.getDevice();
+        if (device == null || device.isVirtual()) return false;
+
+        // 1. Analogico Esquerdo (Movimento): Com deadzone segura (minimo 0.14f) para eliminar o andar para tras sozinho no Gears of War
+        float rawLeftX = getCenteredAxis(event, device, MotionEvent.AXIS_X);
+        float rawLeftY = getCenteredAxis(event, device, MotionEvent.AXIS_Y);
+        float safeLeftDz = Math.max(0.14f, stickDeadzone);
+        computeStickResponse(rawLeftX, rawLeftY, safeLeftDz, 1.0f, 1.0f, stickScratch);
+        transitionFrame.setLeftStick(stickScratch[0], stickScratch[1]);
+
+        // 2. Analogico Direito (Camera): ZERO DEADZONE (0.0f) como solicitado para zero delay na mira/camera!
+        float rawRightX = getCenteredAxis(event, device, rightStickXAxis);
+        float rawRightY = getCenteredAxis(event, device, rightStickYAxis);
+        computeStickResponse(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, cameraSensitivity, stickScratch);
+        transitionFrame.setRightStick(stickScratch[0], stickScratch[1]);
+
+        // 3. Gatilhos LT e RT (Leitura combinada LTRIGGER/BRAKE e RTRIGGER/GAS sempre entre 0.0f e 1.0f)
+        float lt = transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER];
+        if (leftTriggerIsAnalog) {
+            lt = Math.max(readTriggerAxis(event, device, MotionEvent.AXIS_LTRIGGER),
+                          readTriggerAxis(event, device, MotionEvent.AXIS_BRAKE));
+        }
+        float rt = transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER];
+        if (rightTriggerIsAnalog) {
+            rt = Math.max(readTriggerAxis(event, device, MotionEvent.AXIS_RTRIGGER),
+                          readTriggerAxis(event, device, MotionEvent.AXIS_GAS));
+        }
+        transitionFrame.setTriggers(lt, rt);
+
+        // 4. D-Pad (Setas via HAT_X e HAT_Y)
+        float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
+        float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
+
+        updateDPadState("DPadLeft", hatX < -0.5f);
+        updateDPadState("DPadRight", hatX > 0.5f);
+        updateDPadState("DPadUp", hatY < -0.5f);
+        updateDPadState("DPadDown", hatY > 0.5f);
+
+        sendReport(false);
+        return true;
+    }
+
+    private static float getCenteredAxis(MotionEvent event, InputDevice device, int axis) {
+        InputDevice.MotionRange range = device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK);
+        if (range != null) {
+            float value = event.getAxisValue(axis);
+            // Usa o flat nativo do hardware se disponivel para evitar drift de repouso
+            if (axis == MotionEvent.AXIS_X || axis == MotionEvent.AXIS_Y) {
+                if (Math.abs(value) <= Math.max(range.getFlat(), 0.08f)) {
+                    return 0.0f;
+                }
+            }
+            return clamp(value, -1.0f, 1.0f);
+        }
+        return 0.0f;
+    }
+
+    private static float readTriggerAxis(MotionEvent event, InputDevice device, int axis) {
+        InputDevice.MotionRange range = device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK);
+        if (range == null) return 0.0f;
+        float val = event.getAxisValue(axis);
+        // Caso o controle reporte gatilho de -1.0 (solto) a +1.0 (pressionado), converte para 0.0..1.0
+        if (range.getMin() < -0.1f) {
+            val = (val + 1.0f) * 0.5f;
+        }
+        if (val < 0.03f) return 0.0f;
+        return clamp(val, 0.0f, 1.0f);
+    }
+
+    private void updateDPadState(String button, boolean pressed) {
+        int idx = getDpadIndex(button);
+        if (idx == -1) return;
+        if (pressed && !transitionFrame.held[idx]) {
+            transitionFrame.bumpButton(idx);
+        } else if (!pressed && transitionFrame.held[idx]) {
+            transitionFrame.setReleased(idx);
+        }
+    }
+
+    private int getDpadIndex(String button) {
+        switch (button) {
+            case "DPadUp": return GamepadTransitionFrame.INDEX_DPAD_UP;
+            case "DPadDown": return GamepadTransitionFrame.INDEX_DPAD_DOWN;
+            case "DPadLeft": return GamepadTransitionFrame.INDEX_DPAD_LEFT;
+            case "DPadRight": return GamepadTransitionFrame.INDEX_DPAD_RIGHT;
+            default: return -1;
+        }
+    }
+
+    public static void computeStickResponse(float rawX, float rawY, float deadzone, float curveExp, float sensitivity, float[] out) {
+        float mag = (float) Math.hypot(rawX, rawY);
+        if (mag <= deadzone || mag == 0.0f) {
+            out[0] = 0.0f;
+            out[1] = 0.0f;
+            return;
+        }
+        float normX = rawX / mag;
+        float normY = rawY / mag;
+        float clampedMag = Math.min(1.0f, mag);
+        float rescaledMag = (deadzone > 0.0f && deadzone < 0.99f)
+                ? (clampedMag - deadzone) / (1.0f - deadzone)
+                : clampedMag;
+        if (curveExp != 1.0f && curveExp > 0.0f) {
+            rescaledMag = (float) Math.pow(rescaledMag, curveExp);
+        }
+        rescaledMag = Math.min(1.0f, rescaledMag * sensitivity);
+        out[0] = clamp(normX * rescaledMag, -1.0f, 1.0f);
+        out[1] = clamp(normY * rescaledMag, -1.0f, 1.0f);
+    }
+
+    private static float clamp(float v, float min, float max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    private synchronized void sendReport(boolean isKeepAlive) {
+        transitionFrame.physicalPhysicality = transitionFrame.computeButtonPhysicality();
+        transitionFrame.virtualPhysicality = GamepadInputPhysicality.NONE;
+
+        ByteBuffer packet;
+        if (isKeepAlive || previousFrame == null) {
+            GamepadTransitionFrame prev = (previousFrame != null) ? previousFrame : new GamepadTransitionFrame(transitionFrame.gamepadId);
+            packet = UnreliableInputPacket.forChangedGamepads(tickCounter, transitionFrame, prev);
+        } else {
+            if (!hasChanges(transitionFrame, previousFrame)) {
+                return;
+            }
+            packet = UnreliableInputPacket.forChangedGamepads(tickCounter, transitionFrame, previousFrame);
+        }
+
+        if (packet != null && sender != null) {
+            tickCounter++;
+            previousFrame = transitionFrame.copy();
+            sender.sendPacket(packet);
+        }
+    }
+
+    private boolean hasChanges(GamepadTransitionFrame curr, GamepadTransitionFrame prev) {
+        for (int i = 0; i < GamepadTransitionFrame.TRANSITION_COUNT; i++) {
+            if (curr.transitions[i] != prev.transitions[i] || curr.held[i] != prev.held[i]) return true;
+        }
+        for (int i = 0; i < GamepadTransitionFrame.AXIS_COUNT; i++) {
+            if (Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f) return true;
+            if (curr.axes[i] == 0.0f && prev.axes[i] != 0.0f) return true;
+        }
+        return curr.physicalPhysicality != prev.physicalPhysicality;
+    }
+
+    public void pressNexusOnce() {
+        new Thread(() -> {
+            try {
+                synchronized (AndroidGamepadListener.this) {
+                    transitionFrame.bumpButton("Nexus");
+                    sendReport(false);
+                }
+                Thread.sleep(80);
+                synchronized (AndroidGamepadListener.this) {
+                    transitionFrame.setReleased("Nexus");
+                    sendReport(false);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }).start();
+    }
+
+    private boolean isGamepadEvent(KeyEvent event, int keyCode) {
+        int src = event.getSource();
+        boolean isGp = (src & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                || (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+        if (!isGp) return false;
+        return mapButton(keyCode) != null
+                || keyCode == KeyEvent.KEYCODE_BUTTON_L2
+                || keyCode == KeyEvent.KEYCODE_BUTTON_R2
+                || keyCode == KeyEvent.KEYCODE_BUTTON_Z
+                || keyCode == KeyEvent.KEYCODE_BUTTON_C;
+    }
+
+    private String mapButton(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BUTTON_A: return "A";
+            case KeyEvent.KEYCODE_BUTTON_B: return "B";
+            case KeyEvent.KEYCODE_BUTTON_X: return "X";
+            case KeyEvent.KEYCODE_BUTTON_Y: return "Y";
+            case KeyEvent.KEYCODE_BUTTON_L1: return "LeftShoulder";
+            case KeyEvent.KEYCODE_BUTTON_R1: return "RightShoulder";
+            case KeyEvent.KEYCODE_BUTTON_THUMBL: return "LeftThumb";
+            case KeyEvent.KEYCODE_BUTTON_THUMBR: return "RightThumb";
+            case KeyEvent.KEYCODE_BUTTON_START: return "Menu";
+            case KeyEvent.KEYCODE_BUTTON_SELECT:
+            case KeyEvent.KEYCODE_BACK: return "View";
+            case KeyEvent.KEYCODE_DPAD_UP: return "DPadUp";
+            case KeyEvent.KEYCODE_DPAD_DOWN: return "DPadDown";
+            case KeyEvent.KEYCODE_DPAD_LEFT: return "DPadLeft";
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return "DPadRight";
+            case KeyEvent.KEYCODE_BUTTON_MODE: return "Nexus";
+            default: return null;
+        }
+    }
+}
+"""
+            with open(agl_java, "w", encoding="utf-8") as f:
+                f.write(agl_code)
+
+        # 8. Corrigir tambem AndroidControllerLe.java (Canal Classico):
+        # - Consumir BUTTON_L2/R2/Z/C mesmo quando o gatilho e analogico (para nao vazar para a WebView)
+        # - Deixar o analogico direito SEM deadzone (zero delay na camera)
+        acle_java = "app/src/main/java/com/world/cloudxsolution/AndroidControllerLe.java"
+        if os.path.exists(acle_java):
+            with open(acle_java, "r", encoding="utf-8") as f:
+                acle = f.read()
+
+            # No onGenericMotion do AndroidControllerLe, tirar o deadzone(...) do rightX e rightY
+            acle = acle.replace(
+                "float rightX = applySensitivity(deadzone(event.getAxisValue(rightStickXAxis)));",
+                "float rightX = applySensitivity(event.getAxisValue(rightStickXAxis));"
+            )
+            acle = acle.replace(
+                "float rightY = applySensitivity(deadzone(event.getAxisValue(rightStickYAxis)));",
+                "float rightY = applySensitivity(event.getAxisValue(rightStickYAxis));"
+            )
+
+            # Consumir sempre L2/R2/Z/C no onKeyDown e onKeyUp para nao vazar para a WebView
+            acle = acle.replace(
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }',
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;'
+            )
+            acle = acle.replace(
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }',
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }'
+            )
+            acle = acle.replace(
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }',
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;'
+            )
+            acle = acle.replace(
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }',
+                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f; sendIfChanged(); } return true; }'
+            )
+
+            with open(acle_java, "w", encoding="utf-8") as f:
+                f.write(acle)
+
+        # 9. Atualizar MainActivity.java (Build anterior 1080HQ @ 20Mbps + PT-BR)
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -233,177 +850,15 @@ jobs:
 
             mj = mj.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
             mj = mj.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
-
-            helper_method = "\n".join([
-                "    private boolean isLowSpecHdTv() {",
-                "        try {",
-                "            String model = Build.MODEL != null ? Build.MODEL.toUpperCase(Locale.ROOT) : \"\";",
-                "            if (model.contains(\"TL042\") || model.contains(\"MULTI\")) return true;",
-                "            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();",
-                "            if (Math.min(dm.widthPixels, dm.heightPixels) <= 800) return true;",
-                "            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);",
-                "            if (am != null && am.isLowRamDevice()) return true;",
-                "        } catch (Throwable ignored) {}",
-                "        return false;",
-                "    }",
-                "    public boolean isStreaming() {"
-            ])
-            if "isLowSpecHdTv()" not in mj:
-                mj = mj.replace("    public boolean isStreaming() {", helper_method, 1)
-
-            mj = mj.replace(
-                "public IStreamingService getStreamingService() {\n        return streamingService;\n    }",
-                "public IStreamingService getStreamingService() {\n        if (streamingService == null) {\n            try { bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE | BIND_IMPORTANT); } catch (Throwable ignored) {}\n        }\n        return streamingService;\n    }"
-            )
-            mj = mj.replace("BIND_AUTO_CREATE)", "BIND_AUTO_CREATE | BIND_IMPORTANT)")
-
             mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720" : "1080HQ")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720" : "1080HQ")')
-            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, isLowSpecHdTv() ? 8 : 20)')
-
-            mj = mj.replace('gpPrefs.getFloat("camera_deadzone", 0.12f)', 'gpPrefs.getFloat("camera_deadzone", 0.16f)')
-            mj = mj.replace("gamepadListener.setOnMenuTrigger(this::showStreamingMenuDialog);", "// menu trigger via Select+Start")
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
+            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, 20)')
 
             mj = mj.replace('"Disable in game performance"', '"Ocultar desempenho no jogo"')
             mj = mj.replace('"Show in game performance"', '"Mostrar desempenho no jogo"')
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
-
-            page_finished_target = "super.onPageFinished(view, url);\n                setWebviewVisible();"
-            safe_page_finished = "\n".join([
-                "super.onPageFinished(view, url);",
-                "                if (url != null && url.contains(\"play\")) {",
-                "                    view.evaluateJavascript(loadScriptFromAssets(), null);",
-                "                }",
-                "                setWebviewVisible();"
-            ])
-            if "view.evaluateJavascript(loadScriptFromAssets(), null);" not in mj.split("onPageFinished")[1].split("onPageStarted")[0]:
-                mj = mj.replace(page_finished_target, safe_page_finished, 1)
-
-            first_frame_target = "setStreamingState(true);"
-            first_frame_replacement = "\n".join([
-                "setStreamingState(true);",
-                "                setNativeGamepadEnabled(true);",
-                "                try {",
-                "                    int[] devIds = InputDevice.getDeviceIds();",
-                "                    for (int devId : devIds) {",
-                "                        InputDevice dev = InputDevice.getDevice(devId);",
-                "                        if (dev != null && ((dev.getSources() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD || (dev.getSources() & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)) {",
-                "                            if (gamepadListener != null) gamepadListener.prepare(dev);",
-                "                            if (controllerLe != null) controllerLe.detectAxisLayout(dev);",
-                "                            break;",
-                "                        }",
-                "                    }",
-                "                } catch (Throwable ignored) {}",
-                "                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {",
-                "                    if (isStreaming && webView != null) {",
-                "                        webView.setVisibility(View.INVISIBLE);",
-                "                        webView.freeMemory();",
-                "                        webView.onPause();",
-                "                        webView.pauseTimers();",
-                "                    }",
-                "                }, 8000);"
-            ])
-            if "InputDevice.getDeviceIds()" not in mj and first_frame_target in mj:
-                mj = mj.replace(first_frame_target, first_frame_replacement, 1)
-
-            focus_webview_visible = "\n".join([
-                "    public void setWebviewVisible() {",
-                "        if (surfaceView != null) {",
-                "            surfaceView.setFocusable(false);",
-                "            surfaceView.setFocusableInTouchMode(false);",
-                "        }",
-                "        if (webView != null) {",
-                "            webView.resumeTimers();",
-                "            webView.onResume();",
-                "            webView.setVisibility(WebView.VISIBLE);",
-                "            webView.setFocusable(true);",
-                "            webView.setFocusableInTouchMode(true);",
-                "            webView.requestFocus();",
-                "        }",
-                "        if (loadingLayout != null) {",
-                "            loadingLayout.setVisibility(View.GONE);",
-                "        }",
-                "        if (performanceDialog != null) {",
-                "            performanceDialog.dismiss();",
-                "        }",
-                "    }"
-            ])
-            mj = re.sub(
-                r"public\s+void\s+setWebviewVisible\s*\(\s*\)\s*\{[\s\S]*?performanceDialog\.dismiss\(\);\s*\}\s*\}",
-                lambda _: focus_webview_visible,
-                mj,
-                count=1
-            )
-
-            clean_close_webview = "\n".join([
-                "    public void closeWebview() {",
-                "        runOnUiThread(() -> {",
-                "            if (webView != null) {",
-                "                webView.setVisibility(View.INVISIBLE);",
-                "                webView.freeMemory();",
-                "            }",
-                "            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
-                "                getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
-                "            }",
-                "            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {",
-                "                if (isStreaming && webView != null) {",
-                "                    webView.freeMemory();",
-                "                    webView.onPause();",
-                "                    webView.pauseTimers();",
-                "                }",
-                "            }, 8000);",
-                "        });",
-                "    }"
-            ])
-            mj = re.sub(
-                r"public\s+void\s+closeWebview\s*\(\s*\)\s*\{[\s\S]*?webView\s*=\s*null;[\s\S]*?\}\s*\)\s*;\s*\}",
-                lambda _: clean_close_webview,
-                mj,
-                count=1
-            )
-
-            home_show_webview = "\n".join([
-                "    public void showWebview() {",
-                "        if (audioManager != null) {",
-                "            audioManager.setMode(AudioManager.MODE_NORMAL);",
-                "        }",
-                "        runOnUiThread(() -> {",
-                "            if (surfaceView != null) {",
-                "                surfaceView.setFocusable(false);",
-                "                surfaceView.setFocusableInTouchMode(false);",
-                "            }",
-                "            if (webView == null) {",
-                "                initWebView();",
-                "                rootLayout.addView(webView, 1);",
-                "                webView.resumeTimers();",
-                "                webView.onResume();",
-                "                webView.loadUrl(\"https://www.xbox.com/pt-BR/play\");",
-                "            } else {",
-                "                webView.resumeTimers();",
-                "                webView.onResume();",
-                "                String curUrl = webView.getUrl();",
-                "                if (curUrl == null || curUrl.contains(\"/launch/\") || curUrl.equals(\"about:blank\")) {",
-                "                    webView.loadUrl(\"https://www.xbox.com/pt-BR/play\");",
-                "                }",
-                "            }",
-                "            webView.setVisibility(View.VISIBLE);",
-                "            webView.setFocusable(true);",
-                "            webView.setFocusableInTouchMode(true);",
-                "            webView.requestFocus();",
-                "            if (performanceDialog != null) {",
-                "                performanceDialog.dismiss();",
-                "            }",
-                "        });",
-                "    }"
-            ])
-            mj = re.sub(
-                r"public\s+void\s+showWebview\s*\(\s*\)\s*\{[\s\S]*?performanceDialog\.dismiss\(\);\s*\}\s*\}\);\s*\}",
-                lambda _: home_show_webview,
-                mj,
-                count=1
-            )
 
             hook_target = "super.onPageStarted(view, url, favicon);"
             redirect_hook = "\n".join([
@@ -431,58 +886,33 @@ jobs:
 
             mj = mj.replace(
                 "Integer[] bitrateValues = {0, 5, 10, 15, 20, 30, 40, 50};",
-                "Integer[] bitrateValues = {0, 6, 8, 10, 12, 15, 18, 20};"
+                "Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};"
             )
             mj = mj.replace(
                 'String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};',
-                'String[] bitrateLabels = {"Automático", "6 Mbps (TV Leve)", "8 Mbps (Ideal Multilaser)", "10 Mbps (Padrão HD)", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Máx TCL 55)"};'
+                'String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Qualidade Máxima)"};'
             )
 
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 7. Corrigir WebRtcReceiver.java sem instanciar VideoCodecInfo manualmente (evita erro de construtor)
+        # 10. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
                 rj = f.read()
 
             rj = rj.replace(".setEnableInternalTracer(true)", ".setEnableInternalTracer(false)")
-            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 1;')
-            rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 2;')
+            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 0;')
+            rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 1;')
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
-
-            # Usar DefaultVideoDecoderFactory e PlatformSoftwareVideoDecoderFactory nativos sem fallback manual de VideoCodecInfo
-            safe_decoder_factory = "\n".join([
-                "        org.webrtc.VideoDecoderFactory decoderFactory = new org.webrtc.VideoDecoderFactory() {",
-                "            private final org.webrtc.VideoDecoderFactory hw = new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());",
-                "            private final org.webrtc.VideoDecoderFactory sw = new org.webrtc.PlatformSoftwareVideoDecoderFactory(eglBase.getEglBaseContext());",
-                "            @Override",
-                "            public org.webrtc.VideoDecoder createDecoder(org.webrtc.VideoCodecInfo info) {",
-                "                org.webrtc.VideoDecoder d = hw.createDecoder(info);",
-                "                if (d == null) d = sw.createDecoder(info);",
-                "                return d;",
-                "            }",
-                "            @Override",
-                "            public org.webrtc.VideoCodecInfo[] getSupportedCodecs() {",
-                "                java.util.LinkedHashMap<String, org.webrtc.VideoCodecInfo> map = new java.util.LinkedHashMap<>();",
-                "                for (org.webrtc.VideoCodecInfo c : hw.getSupportedCodecs()) map.put(c.name + (c.params != null ? c.params.toString() : \"\"), c);",
-                "                for (org.webrtc.VideoCodecInfo c : sw.getSupportedCodecs()) map.put(c.name + (c.params != null ? c.params.toString() : \"\"), c);",
-                "                return map.values().toArray(new org.webrtc.VideoCodecInfo[0]);",
-                "            }",
-                "        };"
-            ])
-            rj = rj.replace(
-                "DefaultVideoDecoderFactory decoderFactory =\n                new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());",
-                safe_decoder_factory
-            )
 
             transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
             transceiver_fix = "\n".join([
                 "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));",
                 "        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {",
-                "            try { setVideoCodecPreferences(transceiver); } catch (Throwable ignored) {}",
+                "            setVideoCodecPreferences(transceiver);",
                 "        }"
             ])
             if "if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)" not in rj and transceiver_target in rj:
@@ -491,7 +921,7 @@ jobs:
             with open(rtc_java, "w", encoding="utf-8") as f:
                 f.write(rj)
 
-        # 8. Traduzir todos os botoes dos layouts XML
+        # 11. Traduzir todos os botoes dos layouts XML
         replacements = {
             "Exit Game": "Sair do Jogo",
             "Exit the game": "Sair do Jogo",
@@ -537,18 +967,15 @@ jobs:
             except Exception:
                 pass
 
-        # 9. Garantir extractNativeLibs="true" e android:largeHeap="true"
+        # 12. Garantir extractNativeLibs="true" no AndroidManifest.xml
         man_path = "app/src/main/AndroidManifest.xml"
         if os.path.exists(man_path):
             with open(man_path, "r", encoding="utf-8") as f:
                 man = f.read()
-            man = re.sub(r'android:process="[^"]*"', '', man)
             if 'android:extractNativeLibs="false"' in man:
                 man = man.replace('android:extractNativeLibs="false"', 'android:extractNativeLibs="true"')
             elif 'android:extractNativeLibs' not in man:
                 man = man.replace('<application', '<application android:extractNativeLibs="true"')
-            if 'android:largeHeap' not in man:
-                man = man.replace('<application', '<application android:largeHeap="true"')
             with open(man_path, "w", encoding="utf-8") as f:
                 f.write(man)
         PYEOF
