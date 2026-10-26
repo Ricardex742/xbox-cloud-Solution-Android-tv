@@ -48,7 +48,7 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Corrigir Bugs de Controle (Forza Start / Gears Drift / Zero Delay Camera) + 1080HQ 20Mbps
+    - name: Aplicar Correcoes de Controle (Forza Start / Gears Drift / Zero Delay Camera) e Video 1080HQ 20Mbps
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
@@ -75,7 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js: Build anterior (1080HQ @ 20Mbps Baseline) + Bloqueio de Gamepad duplicado na WebView
+        # 4. Otimizar index.js (1080HQ @ 20Mbps Baseline + Desativar Gamepad fantasma da WebView)
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -131,12 +131,11 @@ jobs:
                 )
                 js = js.replace("offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);", "// bitrate aplicado em forceLowLatencyBaselineSdp")
 
-            # Quando o streaming comeca (simulateOnTrack), desativa o leitor de gamepad duplicado da WebView
-            # para impedir que o gatilho RT acione o botao Start pelo Chromium no Forza Horizon 6
-            js = js.replace(
-                "window.simulateOnTrack = function(kind, id) {",
-                "window.simulateOnTrack = function(kind, id) {\n        try { navigator.getGamepads = function() { return []; }; } catch (e) {}"
-            )
+            if "navigator.getGamepads = function" not in js:
+                js = js.replace(
+                    "window.simulateOnTrack = function(kind, id) {",
+                    "window.simulateOnTrack = function(kind, id) {\n        try { navigator.getGamepads = function() { return []; }; } catch (e) {}"
+                )
 
             pt_redirect = "\n".join([
                 "(function forcePtBrLocale() {",
@@ -154,178 +153,25 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Corrigir GamepadTransitionFrame.java: Tirar o bloqueio de 10% (0.1f) da camera (Zero Delay) e garantir reset limpo
+        # 5. Patch cirurgico em GamepadTransitionFrame.java (Zero Delay na Camera + Fim do bloqueio de 0.1f)
         gtf_java = "app/src/main/java/com/world/cloudxsolution/GamepadTransitionFrame.java"
         if os.path.exists(gtf_java):
-            gtf_code = """package com.world.cloudxsolution;
-
-public final class GamepadTransitionFrame {
-
-    public int gamepadId;
-
-    public static final int INDEX_DPAD_UP = 0;
-    public static final int INDEX_DPAD_DOWN = 1;
-    public static final int INDEX_DPAD_LEFT = 2;
-    public static final int INDEX_DPAD_RIGHT = 3;
-    public static final int INDEX_MENU = 4;
-    public static final int INDEX_VIEW = 5;
-    public static final int INDEX_LEFT_THUMB = 6;
-    public static final int INDEX_RIGHT_THUMB = 7;
-    public static final int INDEX_LEFT_SHOULDER = 8;
-    public static final int INDEX_RIGHT_SHOULDER = 9;
-    public static final int INDEX_NEXUS = 10;
-    public static final int INDEX_SHARE = 11;
-    public static final int INDEX_A = 12;
-    public static final int INDEX_B = 13;
-    public static final int INDEX_X = 14;
-    public static final int INDEX_Y = 15;
-    public static final int TRANSITION_COUNT = 16;
-
-    public static final int AXIS_LEFT_X = 0;
-    public static final int AXIS_LEFT_Y = 1;
-    public static final int AXIS_RIGHT_X = 2;
-    public static final int AXIS_RIGHT_Y = 3;
-    public static final int AXIS_LEFT_TRIGGER = 4;
-    public static final int AXIS_RIGHT_TRIGGER = 5;
-    public static final int AXIS_COUNT = 6;
-
-    public final int[] transitions = new int[TRANSITION_COUNT];
-    public final boolean[] held = new boolean[TRANSITION_COUNT];
-    public final float[] axes = new float[AXIS_COUNT];
-
-    public int physicalPhysicality;
-    public int virtualPhysicality;
-
-    public GamepadTransitionFrame(int gamepadId) {
-        this.gamepadId = gamepadId;
-    }
-
-    public void bumpButton(String button) {
-        int index = getButtonIndex(button);
-        if (index != -1) {
-            bumpButton(index);
-        }
-    }
-
-    public void bumpButton(int index) {
-        if (index >= 0 && index < TRANSITION_COUNT && !held[index]) {
-            transitions[index]++;
-            held[index] = true;
-        }
-    }
-
-    public void setReleased(String button) {
-        int index = getButtonIndex(button);
-        if (index != -1) {
-            setReleased(index);
-        }
-    }
-
-    public void setReleased(int index) {
-        if (index >= 0 && index < TRANSITION_COUNT && held[index]) {
-            held[index] = false;
-            transitions[index]++;
-        }
-    }
-
-    public void resetAllHeldButtons() {
-        for (int i = 0; i < TRANSITION_COUNT; i++) {
-            if (held[i]) {
-                held[i] = false;
-                transitions[i]++;
-            }
-        }
-    }
-
-    private int getButtonIndex(String button) {
-        switch (button) {
-            case "A": return INDEX_A;
-            case "B": return INDEX_B;
-            case "X": return INDEX_X;
-            case "Y": return INDEX_Y;
-            case "DPadUp": return INDEX_DPAD_UP;
-            case "DPadDown": return INDEX_DPAD_DOWN;
-            case "DPadLeft": return INDEX_DPAD_LEFT;
-            case "DPadRight": return INDEX_DPAD_RIGHT;
-            case "LeftShoulder": return INDEX_LEFT_SHOULDER;
-            case "RightShoulder": return INDEX_RIGHT_SHOULDER;
-            case "LeftThumb": return INDEX_LEFT_THUMB;
-            case "RightThumb": return INDEX_RIGHT_THUMB;
-            case "View": return INDEX_VIEW;
-            case "Menu": return INDEX_MENU;
-            case "Nexus": return INDEX_NEXUS;
-            case "Share": return INDEX_SHARE;
-            default: return -1;
-        }
-    }
-
-    public void setLeftStick(float x, float y) {
-        axes[AXIS_LEFT_X] = x;
-        axes[AXIS_LEFT_Y] = -y;
-    }
-
-    public void setRightStick(float x, float y) {
-        axes[AXIS_RIGHT_X] = x;
-        axes[AXIS_RIGHT_Y] = -y;
-    }
-
-    public void setTriggers(float left, float right) {
-        axes[AXIS_LEFT_TRIGGER] = left;
-        axes[AXIS_RIGHT_TRIGGER] = right;
-    }
-
-    public int computeButtonPhysicality() {
-        int p = GamepadInputPhysicality.NONE;
-        if (held[INDEX_A]) p |= GamepadInputPhysicality.A;
-        if (held[INDEX_B]) p |= GamepadInputPhysicality.B;
-        if (held[INDEX_X]) p |= GamepadInputPhysicality.X;
-        if (held[INDEX_Y]) p |= GamepadInputPhysicality.Y;
-        if (held[INDEX_MENU]) p |= GamepadInputPhysicality.MENU;
-        if (held[INDEX_VIEW]) p |= GamepadInputPhysicality.VIEW;
-        if (held[INDEX_LEFT_THUMB]) p |= GamepadInputPhysicality.LEFT_THUMB;
-        if (held[INDEX_RIGHT_THUMB]) p |= GamepadInputPhysicality.RIGHT_THUMB;
-        if (held[INDEX_LEFT_SHOULDER]) p |= GamepadInputPhysicality.LEFT_SHOULDER;
-        if (held[INDEX_RIGHT_SHOULDER]) p |= GamepadInputPhysicality.RIGHT_SHOULDER;
-        if (held[INDEX_NEXUS]) p |= GamepadInputPhysicality.NEXUS;
-        if (held[INDEX_SHARE]) p |= GamepadInputPhysicality.MISC;
-
-        if (held[INDEX_DPAD_UP]) p |= GamepadInputPhysicality.DPAD_UP;
-        if (held[INDEX_DPAD_DOWN]) p |= GamepadInputPhysicality.DPAD_DOWN;
-        if (held[INDEX_DPAD_LEFT]) p |= GamepadInputPhysicality.DPAD_LEFT;
-        if (held[INDEX_DPAD_RIGHT]) p |= GamepadInputPhysicality.DPAD_RIGHT;
-
-        if (axes[AXIS_LEFT_TRIGGER] > 0.01f) p |= GamepadInputPhysicality.LEFT_TRIGGER;
-        if (axes[AXIS_RIGHT_TRIGGER] > 0.01f) p |= GamepadInputPhysicality.RIGHT_TRIGGER;
-
-        if (Math.abs(axes[AXIS_LEFT_X]) > 0.001f) p |= GamepadInputPhysicality.LEFT_THUMB_X_AXIS;
-        if (Math.abs(axes[AXIS_LEFT_Y]) > 0.001f) p |= GamepadInputPhysicality.LEFT_THUMB_Y_AXIS;
-        // Zero-delay para a camera (Analogico Direito)
-        if (Math.abs(axes[AXIS_RIGHT_X]) > 0.0001f) p |= GamepadInputPhysicality.RIGHT_THUMB_X_AXIS;
-        if (Math.abs(axes[AXIS_RIGHT_Y]) > 0.0001f) p |= GamepadInputPhysicality.RIGHT_THUMB_Y_AXIS;
-
-        return p;
-    }
-
-    public GamepadTransitionFrame copy() {
-        GamepadTransitionFrame f = new GamepadTransitionFrame(gamepadId);
-        System.arraycopy(this.transitions, 0, f.transitions, 0, TRANSITION_COUNT);
-        System.arraycopy(this.held, 0, f.held, 0, TRANSITION_COUNT);
-        System.arraycopy(this.axes, 0, f.axes, 0, AXIS_COUNT);
-        f.physicalPhysicality = physicalPhysicality;
-        f.virtualPhysicality = virtualPhysicality;
-        return f;
-    }
-}
-"""
+            with open(gtf_java, "r", encoding="utf-8") as f:
+                gtf = f.read()
+            gtf = gtf.replace("Math.abs(axes[AXIS_LEFT_X]) > 0.1f", "Math.abs(axes[AXIS_LEFT_X]) > 0.001f")
+            gtf = gtf.replace("Math.abs(axes[AXIS_LEFT_Y]) > 0.1f", "Math.abs(axes[AXIS_LEFT_Y]) > 0.001f")
+            gtf = gtf.replace("Math.abs(axes[AXIS_RIGHT_X]) > 0.1f", "Math.abs(axes[AXIS_RIGHT_X]) > 0.0001f")
+            gtf = gtf.replace("Math.abs(axes[AXIS_RIGHT_Y]) > 0.1f", "Math.abs(axes[AXIS_RIGHT_Y]) > 0.0001f")
+            gtf = gtf.replace("axes[AXIS_LEFT_TRIGGER] > 0.05f", "axes[AXIS_LEFT_TRIGGER] > 0.01f")
+            gtf = gtf.replace("axes[AXIS_RIGHT_TRIGGER] > 0.05f", "axes[AXIS_RIGHT_TRIGGER] > 0.01f")
             with open(gtf_java, "w", encoding="utf-8") as f:
-                f.write(gtf_code)
+                f.write(gtf)
 
-        # 6. Corrigir UnreliableInputPacket.java: Garantir envio do 0.0f quando o analogico volta ao centro (Fim do drift no Gears)
+        # 6. Patch cirurgico em UnreliableInputPacket.java (Garantir envio do 0.0f quando soltar o analogico)
         uip_java = "app/src/main/java/com/world/cloudxsolution/UnreliableInputPacket.java"
         if os.path.exists(uip_java):
             with open(uip_java, "r", encoding="utf-8") as f:
                 uip = f.read()
-            # Quando curr.axes[i] == 0f e prev.axes[i] != 0f, obriga a marcar o eixo como alterado mesmo se a diferenca for < 0.001f
             uip = uip.replace(
                 "Math.abs(curr.axes[i] - prev.axes[i]) > 0.001f",
                 "(Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f || (curr.axes[i] == 0f && prev.axes[i] != 0f))"
@@ -333,485 +179,65 @@ public final class GamepadTransitionFrame {
             with open(uip_java, "w", encoding="utf-8") as f:
                 f.write(uip)
 
-        # 7. Corrigir AndroidGamepadListener.java:
-        # - Analogico Direito com ZERO deadzone (0.0f) para resposta instantanea da camera
-        # - Analogico Esquerdo com filtro anti-drift para nao andar para tras no Gears of War
-        # - Bloqueio total de eventos de tecla de gatilho (BUTTON_L2/R2/Z/C/GAS/BRAKE) para nao apertar Start no Forza
+        # 7. Patch cirurgico em AndroidGamepadListener.java (Preservando 100% das assinaturas de metodos originais)
         agl_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
         if os.path.exists(agl_java):
-            agl_code = """package com.world.cloudxsolution;
+            with open(agl_java, "r", encoding="utf-8") as f:
+                agl = f.read()
 
-import android.os.Handler;
-import android.os.Looper;
-import android.view.InputDevice;
-import android.view.KeyEvent;
-import android.view.MotionEvent;
+            # A. Zero Deadzone (0.0f) no Analogico Direito (Camera)
+            agl = agl.replace(
+                "applyRadialDeadzone(rawRightX, rawRightY, stickDeadzone, rightStickCurveExponent, stickScratch);",
+                "applyRadialDeadzone(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, stickScratch);"
+            )
+            agl = agl.replace(
+                "computeStickResponse(rawRightX, rawRightY, stickDeadzone, rightStickCurveExponent, cameraSensitivity, stickScratch);",
+                "computeStickResponse(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, cameraSensitivity, stickScratch);"
+            )
 
-import java.nio.ByteBuffer;
-import java.util.Arrays;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+            # B. Deadzone segura (minimo 0.15f) no Analogico Esquerdo para eliminar drift no Gears of War
+            agl = agl.replace(
+                "applyRadialDeadzone(rawLeftX, rawLeftY, stickDeadzone, 1.0f, stickScratch);",
+                "applyRadialDeadzone(rawLeftX, rawLeftY, Math.max(0.15f, stickDeadzone), 1.0f, stickScratch);"
+            )
+            agl = agl.replace(
+                "computeStickResponse(rawLeftX, rawLeftY, stickDeadzone, 1.0f, 1.0f, stickScratch);",
+                "computeStickResponse(rawLeftX, rawLeftY, Math.max(0.15f, stickDeadzone), 1.0f, 1.0f, stickScratch);"
+            )
 
-public final class AndroidGamepadListener {
+            # C. Consumir sempre L2/R2/Z/C no onKeyDown e onKeyUp para nao vazar para a WebView e nao apertar Start no Forza
+            agl = agl.replace(
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 1.0f;\n            sendReport(false);\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendReport(false); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
+            )
+            agl = agl.replace(
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 1.0f;\n            sendReport(false);\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendReport(false); } return true; }"
+            )
+            agl = agl.replace(
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 0f;\n            sendReport(false);\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 0f; sendReport(false); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
+            )
+            agl = agl.replace(
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 0f;\n            sendReport(false);\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 0f; sendReport(false); } return true; }"
+            )
 
-    public interface PacketSender {
-        void sendPacket(ByteBuffer buffer);
-    }
+            # D. Garantir que hasChanges envie 0.0f quando o analogico zerar
+            agl = agl.replace(
+                "if (Math.abs(curr.axes[i] - prev.axes[i]) > 0.001f) return true;",
+                "if (Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f || (curr.axes[i] == 0f && prev.axes[i] != 0f)) return true;"
+            )
 
-    private final PacketSender sender;
-    private final GamepadTransitionFrame transitionFrame;
-    private GamepadTransitionFrame previousFrame = null;
-
-    private float stickDeadzone = 0.14f;
-    private float cameraSensitivity = 1.5f;
-    private volatile InputDevice lastDevice;
-    private int lastDeviceId = -1;
-
-    private int rightStickXAxis = MotionEvent.AXIS_Z;
-    private int rightStickYAxis = MotionEvent.AXIS_RZ;
-    private int leftTriggerAxis = MotionEvent.AXIS_LTRIGGER;
-    private int rightTriggerAxis = MotionEvent.AXIS_RTRIGGER;
-    private boolean leftTriggerIsAnalog = true;
-    private boolean rightTriggerIsAnalog = true;
-    private float rightStickCurveExponent = 1.0f;
-
-    private final float[] stickScratch = new float[2];
-    private boolean testModeActive = false;
-
-    private boolean selectHeld = false;
-    private boolean startHeld = false;
-    private boolean menuTriggeredThisHold = false;
-    private Runnable onMenuTrigger;
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Runnable longPressMenuRunnable = () -> {
-        if (selectHeld && startHeld && !menuTriggeredThisHold && onMenuTrigger != null) {
-            menuTriggeredThisHold = true;
-            transitionFrame.setReleased("View");
-            transitionFrame.setReleased("Menu");
-            sendReport(false);
-            onMenuTrigger.run();
-        }
-    };
-
-    private long tickCounter = 1;
-    private final ScheduledExecutorService keepAliveExecutor = Executors.newSingleThreadScheduledExecutor();
-
-    public AndroidGamepadListener(int gamepadIndex, float sensitivity, float deadzone, PacketSender sender) {
-        this.sender = sender;
-        this.transitionFrame = new GamepadTransitionFrame(gamepadIndex);
-        this.cameraSensitivity = sensitivity;
-        this.stickDeadzone = Math.max(0.10f, deadzone);
-
-        keepAliveExecutor.scheduleAtFixedRate(() -> {
-            synchronized (AndroidGamepadListener.this) {
-                if (!testModeActive && previousFrame != null) {
-                    sendReport(true);
-                }
-            }
-        }, 250, 250, TimeUnit.MILLISECONDS);
-    }
-
-    public void setOnMenuTrigger(Runnable callback) {
-        this.onMenuTrigger = callback;
-    }
-
-    public void setTestModeActive(boolean active) {
-        this.testModeActive = active;
-    }
-
-    public void setgamepadIndex(int idx) {
-        this.transitionFrame.gamepadId = idx;
-    }
-
-    public void setStickDeadzone(float dz) {
-        this.stickDeadzone = dz;
-    }
-
-    public float getStickDeadzone() {
-        return this.stickDeadzone;
-    }
-
-    public void setCameraSensitivity(float sens) {
-        this.cameraSensitivity = sens;
-    }
-
-    public float getCameraSensitivity() {
-        return this.cameraSensitivity;
-    }
-
-    public int getRightStickAxisX() {
-        return rightStickXAxis;
-    }
-
-    public int getRightStickAxisY() {
-        return rightStickYAxis;
-    }
-
-    public float getRightStickResponseCurve() {
-        return rightStickCurveExponent;
-    }
-
-    public InputDevice getLastDevice() {
-        return lastDevice;
-    }
-
-    public String prepare(InputDevice device) {
-        if (device == null || device.isVirtual()) return "";
-        int id = device.getId();
-        if (id == lastDeviceId) return "";
-        lastDeviceId = id;
-        lastDevice = device;
-
-        // Zera todos os eixos e botoes ao conectar/trocar de controle para evitar drift inicial
-        Arrays.fill(transitionFrame.axes, 0f);
-        transitionFrame.resetAllHeldButtons();
-
-        if (device.getMotionRange(MotionEvent.AXIS_Z, InputDevice.SOURCE_JOYSTICK) != null
-                && device.getMotionRange(MotionEvent.AXIS_RZ, InputDevice.SOURCE_JOYSTICK) != null) {
-            rightStickXAxis = MotionEvent.AXIS_Z;
-            rightStickYAxis = MotionEvent.AXIS_RZ;
-        } else if (device.getMotionRange(MotionEvent.AXIS_RX, InputDevice.SOURCE_JOYSTICK) != null
-                && device.getMotionRange(MotionEvent.AXIS_RY, InputDevice.SOURCE_JOYSTICK) != null) {
-            rightStickXAxis = MotionEvent.AXIS_RX;
-            rightStickYAxis = MotionEvent.AXIS_RY;
-        } else {
-            rightStickXAxis = MotionEvent.AXIS_Z;
-            rightStickYAxis = MotionEvent.AXIS_RZ;
-        }
-
-        if (device.getMotionRange(MotionEvent.AXIS_LTRIGGER, InputDevice.SOURCE_JOYSTICK) != null) {
-            leftTriggerAxis = MotionEvent.AXIS_LTRIGGER;
-            leftTriggerIsAnalog = true;
-        } else if (device.getMotionRange(MotionEvent.AXIS_BRAKE, InputDevice.SOURCE_JOYSTICK) != null) {
-            leftTriggerAxis = MotionEvent.AXIS_BRAKE;
-            leftTriggerIsAnalog = true;
-        } else {
-            leftTriggerIsAnalog = false;
-        }
-
-        if (device.getMotionRange(MotionEvent.AXIS_RTRIGGER, InputDevice.SOURCE_JOYSTICK) != null) {
-            rightTriggerAxis = MotionEvent.AXIS_RTRIGGER;
-            rightTriggerIsAnalog = true;
-        } else if (device.getMotionRange(MotionEvent.AXIS_GAS, InputDevice.SOURCE_JOYSTICK) != null) {
-            rightTriggerAxis = MotionEvent.AXIS_GAS;
-            rightTriggerIsAnalog = true;
-        } else {
-            rightTriggerIsAnalog = false;
-        }
-
-        return "";
-    }
-
-    public synchronized boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (testModeActive) return false;
-        if (event == null || !isGamepadEvent(event, keyCode)) return false;
-
-        // CORRECAO FORZA HORIZON 6: Sempre consumir eventos digitais de gatilho (L2/R2/Z/C/GAS/BRAKE)
-        // para que NUNCA vazem para a WebView (que mapeia R2/Z como Start/Menu no Chromium!)
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) {
-            if (!leftTriggerIsAnalog) {
-                transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 1.0f;
-                sendReport(false);
-            }
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) {
-            if (!rightTriggerIsAnalog) {
-                transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 1.0f;
-                sendReport(false);
-            }
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) {
-            // Em controles HID que enviam BUTTON_Z/C quando aperta os gatilhos, ignorar para nao disparar Start
-            return true;
-        }
-
-        if (event.getRepeatCount() > 0) {
-            return true;
-        }
-
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT || keyCode == KeyEvent.KEYCODE_BACK) {
-            selectHeld = true;
-            checkMenuCombo();
-        } else if (keyCode == KeyEvent.KEYCODE_BUTTON_START) {
-            startHeld = true;
-            checkMenuCombo();
-        }
-
-        String button = mapButton(keyCode);
-        if (button == null) return false;
-
-        transitionFrame.bumpButton(button);
-        sendReport(false);
-        return true;
-    }
-
-    public synchronized boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (testModeActive) return false;
-        if (event == null || !isGamepadEvent(event, keyCode)) return false;
-
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) {
-            if (!leftTriggerIsAnalog) {
-                transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 0.0f;
-                sendReport(false);
-            }
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) {
-            if (!rightTriggerIsAnalog) {
-                transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 0.0f;
-                sendReport(false);
-            }
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) {
-            return true;
-        }
-
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT || keyCode == KeyEvent.KEYCODE_BACK) {
-            selectHeld = false;
-            mainHandler.removeCallbacks(longPressMenuRunnable);
-            menuTriggeredThisHold = false;
-        } else if (keyCode == KeyEvent.KEYCODE_BUTTON_START) {
-            startHeld = false;
-            mainHandler.removeCallbacks(longPressMenuRunnable);
-            menuTriggeredThisHold = false;
-        }
-
-        String button = mapButton(keyCode);
-        if (button == null) return false;
-
-        transitionFrame.setReleased(button);
-        sendReport(false);
-        return true;
-    }
-
-    private void checkMenuCombo() {
-        if (selectHeld && startHeld && !menuTriggeredThisHold) {
-            mainHandler.removeCallbacks(longPressMenuRunnable);
-            mainHandler.postDelayed(longPressMenuRunnable, 400);
-        }
-    }
-
-    public synchronized boolean onGenericMotion(MotionEvent event) {
-        if (testModeActive) return false;
-        if (event == null || (event.getSource() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK) {
-            return false;
-        }
-        InputDevice device = event.getDevice();
-        if (device == null || device.isVirtual()) return false;
-
-        // 1. Analogico Esquerdo (Movimento): Com deadzone segura (minimo 0.14f) para eliminar o andar para tras sozinho no Gears of War
-        float rawLeftX = getCenteredAxis(event, device, MotionEvent.AXIS_X);
-        float rawLeftY = getCenteredAxis(event, device, MotionEvent.AXIS_Y);
-        float safeLeftDz = Math.max(0.14f, stickDeadzone);
-        computeStickResponse(rawLeftX, rawLeftY, safeLeftDz, 1.0f, 1.0f, stickScratch);
-        transitionFrame.setLeftStick(stickScratch[0], stickScratch[1]);
-
-        // 2. Analogico Direito (Camera): ZERO DEADZONE (0.0f) como solicitado para zero delay na mira/camera!
-        float rawRightX = getCenteredAxis(event, device, rightStickXAxis);
-        float rawRightY = getCenteredAxis(event, device, rightStickYAxis);
-        computeStickResponse(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, cameraSensitivity, stickScratch);
-        transitionFrame.setRightStick(stickScratch[0], stickScratch[1]);
-
-        // 3. Gatilhos LT e RT (Leitura combinada LTRIGGER/BRAKE e RTRIGGER/GAS sempre entre 0.0f e 1.0f)
-        float lt = transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER];
-        if (leftTriggerIsAnalog) {
-            lt = Math.max(readTriggerAxis(event, device, MotionEvent.AXIS_LTRIGGER),
-                          readTriggerAxis(event, device, MotionEvent.AXIS_BRAKE));
-        }
-        float rt = transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER];
-        if (rightTriggerIsAnalog) {
-            rt = Math.max(readTriggerAxis(event, device, MotionEvent.AXIS_RTRIGGER),
-                          readTriggerAxis(event, device, MotionEvent.AXIS_GAS));
-        }
-        transitionFrame.setTriggers(lt, rt);
-
-        // 4. D-Pad (Setas via HAT_X e HAT_Y)
-        float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
-        float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
-
-        updateDPadState("DPadLeft", hatX < -0.5f);
-        updateDPadState("DPadRight", hatX > 0.5f);
-        updateDPadState("DPadUp", hatY < -0.5f);
-        updateDPadState("DPadDown", hatY > 0.5f);
-
-        sendReport(false);
-        return true;
-    }
-
-    private static float getCenteredAxis(MotionEvent event, InputDevice device, int axis) {
-        InputDevice.MotionRange range = device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK);
-        if (range != null) {
-            float value = event.getAxisValue(axis);
-            // Usa o flat nativo do hardware se disponivel para evitar drift de repouso
-            if (axis == MotionEvent.AXIS_X || axis == MotionEvent.AXIS_Y) {
-                if (Math.abs(value) <= Math.max(range.getFlat(), 0.08f)) {
-                    return 0.0f;
-                }
-            }
-            return clamp(value, -1.0f, 1.0f);
-        }
-        return 0.0f;
-    }
-
-    private static float readTriggerAxis(MotionEvent event, InputDevice device, int axis) {
-        InputDevice.MotionRange range = device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK);
-        if (range == null) return 0.0f;
-        float val = event.getAxisValue(axis);
-        // Caso o controle reporte gatilho de -1.0 (solto) a +1.0 (pressionado), converte para 0.0..1.0
-        if (range.getMin() < -0.1f) {
-            val = (val + 1.0f) * 0.5f;
-        }
-        if (val < 0.03f) return 0.0f;
-        return clamp(val, 0.0f, 1.0f);
-    }
-
-    private void updateDPadState(String button, boolean pressed) {
-        int idx = getDpadIndex(button);
-        if (idx == -1) return;
-        if (pressed && !transitionFrame.held[idx]) {
-            transitionFrame.bumpButton(idx);
-        } else if (!pressed && transitionFrame.held[idx]) {
-            transitionFrame.setReleased(idx);
-        }
-    }
-
-    private int getDpadIndex(String button) {
-        switch (button) {
-            case "DPadUp": return GamepadTransitionFrame.INDEX_DPAD_UP;
-            case "DPadDown": return GamepadTransitionFrame.INDEX_DPAD_DOWN;
-            case "DPadLeft": return GamepadTransitionFrame.INDEX_DPAD_LEFT;
-            case "DPadRight": return GamepadTransitionFrame.INDEX_DPAD_RIGHT;
-            default: return -1;
-        }
-    }
-
-    public static void computeStickResponse(float rawX, float rawY, float deadzone, float curveExp, float sensitivity, float[] out) {
-        float mag = (float) Math.hypot(rawX, rawY);
-        if (mag <= deadzone || mag == 0.0f) {
-            out[0] = 0.0f;
-            out[1] = 0.0f;
-            return;
-        }
-        float normX = rawX / mag;
-        float normY = rawY / mag;
-        float clampedMag = Math.min(1.0f, mag);
-        float rescaledMag = (deadzone > 0.0f && deadzone < 0.99f)
-                ? (clampedMag - deadzone) / (1.0f - deadzone)
-                : clampedMag;
-        if (curveExp != 1.0f && curveExp > 0.0f) {
-            rescaledMag = (float) Math.pow(rescaledMag, curveExp);
-        }
-        rescaledMag = Math.min(1.0f, rescaledMag * sensitivity);
-        out[0] = clamp(normX * rescaledMag, -1.0f, 1.0f);
-        out[1] = clamp(normY * rescaledMag, -1.0f, 1.0f);
-    }
-
-    private static float clamp(float v, float min, float max) {
-        return Math.max(min, Math.min(max, v));
-    }
-
-    private synchronized void sendReport(boolean isKeepAlive) {
-        transitionFrame.physicalPhysicality = transitionFrame.computeButtonPhysicality();
-        transitionFrame.virtualPhysicality = GamepadInputPhysicality.NONE;
-
-        ByteBuffer packet;
-        if (isKeepAlive || previousFrame == null) {
-            GamepadTransitionFrame prev = (previousFrame != null) ? previousFrame : new GamepadTransitionFrame(transitionFrame.gamepadId);
-            packet = UnreliableInputPacket.forChangedGamepads(tickCounter, transitionFrame, prev);
-        } else {
-            if (!hasChanges(transitionFrame, previousFrame)) {
-                return;
-            }
-            packet = UnreliableInputPacket.forChangedGamepads(tickCounter, transitionFrame, previousFrame);
-        }
-
-        if (packet != null && sender != null) {
-            tickCounter++;
-            previousFrame = transitionFrame.copy();
-            sender.sendPacket(packet);
-        }
-    }
-
-    private boolean hasChanges(GamepadTransitionFrame curr, GamepadTransitionFrame prev) {
-        for (int i = 0; i < GamepadTransitionFrame.TRANSITION_COUNT; i++) {
-            if (curr.transitions[i] != prev.transitions[i] || curr.held[i] != prev.held[i]) return true;
-        }
-        for (int i = 0; i < GamepadTransitionFrame.AXIS_COUNT; i++) {
-            if (Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f) return true;
-            if (curr.axes[i] == 0.0f && prev.axes[i] != 0.0f) return true;
-        }
-        return curr.physicalPhysicality != prev.physicalPhysicality;
-    }
-
-    public void pressNexusOnce() {
-        new Thread(() -> {
-            try {
-                synchronized (AndroidGamepadListener.this) {
-                    transitionFrame.bumpButton("Nexus");
-                    sendReport(false);
-                }
-                Thread.sleep(80);
-                synchronized (AndroidGamepadListener.this) {
-                    transitionFrame.setReleased("Nexus");
-                    sendReport(false);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }).start();
-    }
-
-    private boolean isGamepadEvent(KeyEvent event, int keyCode) {
-        int src = event.getSource();
-        boolean isGp = (src & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
-                || (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
-        if (!isGp) return false;
-        return mapButton(keyCode) != null
-                || keyCode == KeyEvent.KEYCODE_BUTTON_L2
-                || keyCode == KeyEvent.KEYCODE_BUTTON_R2
-                || keyCode == KeyEvent.KEYCODE_BUTTON_Z
-                || keyCode == KeyEvent.KEYCODE_BUTTON_C;
-    }
-
-    private String mapButton(int keyCode) {
-        switch (keyCode) {
-            case KeyEvent.KEYCODE_BUTTON_A: return "A";
-            case KeyEvent.KEYCODE_BUTTON_B: return "B";
-            case KeyEvent.KEYCODE_BUTTON_X: return "X";
-            case KeyEvent.KEYCODE_BUTTON_Y: return "Y";
-            case KeyEvent.KEYCODE_BUTTON_L1: return "LeftShoulder";
-            case KeyEvent.KEYCODE_BUTTON_R1: return "RightShoulder";
-            case KeyEvent.KEYCODE_BUTTON_THUMBL: return "LeftThumb";
-            case KeyEvent.KEYCODE_BUTTON_THUMBR: return "RightThumb";
-            case KeyEvent.KEYCODE_BUTTON_START: return "Menu";
-            case KeyEvent.KEYCODE_BUTTON_SELECT:
-            case KeyEvent.KEYCODE_BACK: return "View";
-            case KeyEvent.KEYCODE_DPAD_UP: return "DPadUp";
-            case KeyEvent.KEYCODE_DPAD_DOWN: return "DPadDown";
-            case KeyEvent.KEYCODE_DPAD_LEFT: return "DPadLeft";
-            case KeyEvent.KEYCODE_DPAD_RIGHT: return "DPadRight";
-            case KeyEvent.KEYCODE_BUTTON_MODE: return "Nexus";
-            default: return null;
-        }
-    }
-}
-"""
             with open(agl_java, "w", encoding="utf-8") as f:
-                f.write(agl_code)
+                f.write(agl)
 
-        # 8. Corrigir tambem AndroidControllerLe.java (Canal Classico):
-        # - Consumir BUTTON_L2/R2/Z/C mesmo quando o gatilho e analogico (para nao vazar para a WebView)
-        # - Deixar o analogico direito SEM deadzone (zero delay na camera)
+        # 8. Patch cirurgico em AndroidControllerLe.java (Canal Classico: Zero deadzone na camera + bloqueio L2/R2/Z/C)
         acle_java = "app/src/main/java/com/world/cloudxsolution/AndroidControllerLe.java"
         if os.path.exists(acle_java):
             with open(acle_java, "r", encoding="utf-8") as f:
                 acle = f.read()
 
-            # No onGenericMotion do AndroidControllerLe, tirar o deadzone(...) do rightX e rightY
             acle = acle.replace(
                 "float rightX = applySensitivity(deadzone(event.getAxisValue(rightStickXAxis)));",
                 "float rightX = applySensitivity(event.getAxisValue(rightStickXAxis));"
@@ -820,29 +246,27 @@ public final class AndroidGamepadListener {
                 "float rightY = applySensitivity(deadzone(event.getAxisValue(rightStickYAxis)));",
                 "float rightY = applySensitivity(event.getAxisValue(rightStickYAxis));"
             )
-
-            # Consumir sempre L2/R2/Z/C no onKeyDown e onKeyUp para nao vazar para a WebView
             acle = acle.replace(
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }',
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;'
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
             )
             acle = acle.replace(
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }',
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }'
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }"
             )
             acle = acle.replace(
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }',
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;'
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
             )
             acle = acle.replace(
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }',
-                'if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f; sendIfChanged(); } return true; }'
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }",
+                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f; sendIfChanged(); } return true; }"
             )
 
             with open(acle_java, "w", encoding="utf-8") as f:
                 f.write(acle)
 
-        # 9. Atualizar MainActivity.java (Build anterior 1080HQ @ 20Mbps + PT-BR)
+        # 9. Atualizar MainActivity.java (1080HQ @ 20Mbps + PT-BR)
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
