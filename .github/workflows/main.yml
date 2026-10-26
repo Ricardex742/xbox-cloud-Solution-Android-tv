@@ -48,7 +48,7 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Desbloquear Codec H.264 da Multilaser TL042 e Corrigir Handshake WebRTC
+    - name: Corrigir Construtor VideoCodecInfo e Compilar APK
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
@@ -75,10 +75,7 @@ jobs:
             with open(bg_kts, "w", encoding="utf-8") as f:
                 f.write(kts)
 
-        # 4. Otimizar index.js:
-        #    - Envolver em guarda unica (evita SyntaxError de const duplicado)
-        #    - Ativar patchRtcPeerConnection() imediatamente
-        #    - Mapear 720HQ -> 720p e 1080HQ -> 1080p em resolutionAlias (evita erro "Voltaremos logo")
+        # 4. Otimizar index.js
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -87,16 +84,14 @@ jobs:
             js = js.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
             js = js.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
             js = js.replace("|| 'es'", "|| 'br'")
-            js = js.replace("|| '1080p'", "|| '1080'")
+            js = js.replace("|| '1080p'", "|| '1080HQ'")
 
-            # Liberar canal 'message' para todos os jogos
             js = re.sub(
                 r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
                 "// Canal message liberado",
                 js
             )
 
-            # Corrigir resolutionAlias para nunca enviar '720HQ' ou '1080HQ' brutos ao servidor da Microsoft
             alias_fix = "\n".join([
                 "let targetRes = getTargetResolution();",
                 "                                        if (targetRes === '720' || targetRes === '720p' || targetRes === '720HQ') {",
@@ -109,19 +104,13 @@ jobs:
             ])
             js = js.replace("overridesData.resolutionAlias = window.BX_TARGET_RES;", alias_fix)
 
-            # Ajustar generateMsDeviceInfo para reportar 1280x720 em 720/720HQ e 1920x1080 em 1080/1080HQ
             if "const isHd720" not in js:
-                js = js.replace(
-                    "function generateMsDeviceInfo(osName",
-                    "function generateMsDeviceInfo(osName"
-                )
                 js = re.sub(
                     r"dimensions:\s*\{\s*widthInPixels:\s*[^,]+,\s*heightInPixels:\s*[^\}]+\}",
                     "dimensions: { widthInPixels: (getTargetResolution().startsWith('720') ? 1280 : 1920), heightInPixels: (getTargetResolution().startsWith('720') ? 720 : 1080) }",
                     js
                 )
 
-            # Impedir que a WebView desconecte o comando enviando wasAdded: false
             control_guard = "\n".join([
                 "if (label === 'control' && typeof data === 'string') {",
                 "                                    if (data.includes('gamepadChanged') && data.includes('false')) {",
@@ -133,7 +122,6 @@ jobs:
             if "data.includes('gamepadChanged')" not in js:
                 js = js.replace("if (label === 'control' && data.includes('resolutionAlias'))", control_guard, 1)
 
-            # Anunciar comando conectado no inicio da sessao
             gamepad_connect_helper = "\n".join([
                 "window.sendNativeGamepadConnected = function() {",
                 "    try {",
@@ -162,7 +150,6 @@ jobs:
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
             js = js.replace("}, 3000);", "}, 50);")
 
-            # Garantir que patchRtcPeerConnection() e InitBc() rodem imediatamente no final do script
             js = re.sub(
                 r"function\s+main\s*\(\s*\)\s*\{[\s\S]*?\}",
                 "\n".join([
@@ -213,25 +200,23 @@ jobs:
                 )
                 js = js.replace("offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);", "// bitrate aplicado em forceLowLatencyBaselineSdp")
 
-            # Envolver todo o index.js num bloco seguro contra dupla injecao
-            if "window.__BXC_SAFE_GUARD__" not in js:
-                js = "\n".join([
-                    "(function() {",
-                    "if (window.__BXC_SAFE_GUARD__) return;",
-                    "window.__BXC_SAFE_GUARD__ = true;",
-                    "try {",
-                    "    if (window.location && window.location.pathname && /^\\/(fr-fr|en-us|es-es|fr)\\b/i.test(window.location.pathname)) {",
-                    "        window.location.replace(window.location.href.replace(/\\/(fr-fr|en-us|es-es|fr)(?=\\/|$)/i, '/pt-BR'));",
-                    "    }",
-                    "} catch (e) {}",
-                    js,
-                    "})();"
-                ])
+            pt_redirect = "\n".join([
+                "(function forcePtBrLocale() {",
+                "    try {",
+                "        if (window.location && window.location.pathname && /^\\/(fr-fr|en-us|es-es|fr)\\b/i.test(window.location.pathname)) {",
+                "            var newUrl = window.location.href.replace(/\\/(fr-fr|en-us|es-es|fr)(?=\\/|$)/i, '/pt-BR');",
+                "            window.location.replace(newUrl);",
+                "        }",
+                "    } catch (e) {}",
+                "})();"
+            ])
+            if "forcePtBrLocale" not in js:
+                js = pt_redirect + "\n" + js
 
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Corrigir AndroidGamepadListener.java (Deadzone segura de 0.15f)
+        # 5. Corrigir AndroidGamepadListener.java
         gp_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
         if os.path.exists(gp_java):
             with open(gp_java, "r", encoding="utf-8") as f:
@@ -240,9 +225,7 @@ jobs:
             with open(gp_java, "w", encoding="utf-8") as f:
                 f.write(gp)
 
-        # 6. Atualizar MainActivity.java:
-        #    - Auto-reconectar o StreamingService caso seja nulo
-        #    - Usar 720 (Android nativo) @ 8 Mbps na Multilaser TL042 e 1080HQ @ 20 Mbps na TCL 55P755
+        # 6. Atualizar MainActivity.java
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -268,7 +251,6 @@ jobs:
             if "isLowSpecHdTv()" not in mj:
                 mj = mj.replace("    public boolean isStreaming() {", helper_method, 1)
 
-            # Garantir que getStreamingService() reconecte o servico se o Android 11 tiver limpado a memoria
             mj = mj.replace(
                 "public IStreamingService getStreamingService() {\n        return streamingService;\n    }",
                 "public IStreamingService getStreamingService() {\n        if (streamingService == null) {\n            try { bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE | BIND_IMPORTANT); } catch (Throwable ignored) {}\n        }\n        return streamingService;\n    }"
@@ -459,9 +441,7 @@ jobs:
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 7. Corrigir WebRtcReceiver.java:
-        #    - Desbloquear TODOS os descodificadores H.264 da Multilaser TL042 (MStar/Realtek/Allwinner/Android C2)
-        #    - Garantir que se a lista H264 vier vazia, nunca remova os codecs disponiveis
+        # 7. Corrigir WebRtcReceiver.java sem instanciar VideoCodecInfo manualmente (evita erro de construtor)
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
@@ -473,8 +453,8 @@ jobs:
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
 
-            # Criar um VideoDecoderFactory universal que aceita tanto Hardware quanto PlatformSoftware (desbloqueia chips MStar/Realtek/Allwinner na Multilaser TL042)
-            universal_decoder_factory = "\n".join([
+            # Usar DefaultVideoDecoderFactory e PlatformSoftwareVideoDecoderFactory nativos sem fallback manual de VideoCodecInfo
+            safe_decoder_factory = "\n".join([
                 "        org.webrtc.VideoDecoderFactory decoderFactory = new org.webrtc.VideoDecoderFactory() {",
                 "            private final org.webrtc.VideoDecoderFactory hw = new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());",
                 "            private final org.webrtc.VideoDecoderFactory sw = new org.webrtc.PlatformSoftwareVideoDecoderFactory(eglBase.getEglBaseContext());",
@@ -487,26 +467,15 @@ jobs:
                 "            @Override",
                 "            public org.webrtc.VideoCodecInfo[] getSupportedCodecs() {",
                 "                java.util.LinkedHashMap<String, org.webrtc.VideoCodecInfo> map = new java.util.LinkedHashMap<>();",
-                "                for (org.webrtc.VideoCodecInfo c : hw.getSupportedCodecs()) map.put(c.name + c.params, c);",
-                "                for (org.webrtc.VideoCodecInfo c : sw.getSupportedCodecs()) map.put(c.name + c.params, c);",
-                "                boolean hasH264 = false;",
-                "                for (org.webrtc.VideoCodecInfo c : map.values()) {",
-                "                    if (\"H264\".equalsIgnoreCase(c.name)) { hasH264 = true; break; }",
-                "                }",
-                "                if (!hasH264) {",
-                "                    java.util.Map<String, String> params = new java.util.HashMap<>();",
-                "                    params.put(\"level-asymmetry-allowed\", \"1\");",
-                "                    params.put(\"packetization-mode\", \"1\");",
-                "                    params.put(\"profile-level-id\", \"42e01f\");",
-                "                    map.put(\"H264_fallback\", new org.webrtc.VideoCodecInfo(\"H264\", params));",
-                "                }",
+                "                for (org.webrtc.VideoCodecInfo c : hw.getSupportedCodecs()) map.put(c.name + (c.params != null ? c.params.toString() : \"\"), c);",
+                "                for (org.webrtc.VideoCodecInfo c : sw.getSupportedCodecs()) map.put(c.name + (c.params != null ? c.params.toString() : \"\"), c);",
                 "                return map.values().toArray(new org.webrtc.VideoCodecInfo[0]);",
                 "            }",
                 "        };"
             ])
             rj = rj.replace(
                 "DefaultVideoDecoderFactory decoderFactory =\n                new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());",
-                universal_decoder_factory
+                safe_decoder_factory
             )
 
             transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
@@ -568,7 +537,7 @@ jobs:
             except Exception:
                 pass
 
-        # 9. No AndroidManifest.xml: manter StreamingService no processo principal (nao morrer por falta de RAM na Multilaser TL042)
+        # 9. Garantir extractNativeLibs="true" e android:largeHeap="true"
         man_path = "app/src/main/AndroidManifest.xml"
         if os.path.exists(man_path):
             with open(man_path, "r", encoding="utf-8") as f:
