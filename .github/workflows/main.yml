@@ -48,12 +48,12 @@ jobs:
 
         yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-    - name: Ativar Controle Dual-Channel (input + unreliableinput) e Restaurar Foco da WebView
+    - name: Otimizar para Multilaser TL042 (HD 1.1GHz) + TCL 55P755 (FullHD/4K)
       run: |
         python3 - << 'PYEOF'
         import os, glob, base64, re
 
-        # 1. Reduzir PNGs pesados de splash
+        # 1. Reduzir PNGs pesados de splash para economizar RAM
         tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
         for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
             with open(p, "wb") as f:
@@ -76,9 +76,8 @@ jobs:
                 f.write(kts)
 
         # 4. Otimizar index.js:
-        #    - Desbloquear 'reliableinput' e 'message' para que o servidor valide o controle
-        #    - Enviar 'gamepadChanged: wasAdded=true'
-        #    - Manter 1080HQ / 20 Mbps com H.264 Baseline (42e01f)
+        #    - Executar patchRtcPeerConnection() IMEDIATAMENTE (corrige falha de nao entrar no jogo na Multilaser TL042 1.1GHz)
+        #    - Enviar geometria 1280x720 quando estiver em 720/720HQ (para nao travar o decoder HD da Multilaser TL042)
         idx_path = "app/src/main/assets/index.js"
         if os.path.exists(idx_path):
             with open(idx_path, "r", encoding="utf-8") as f:
@@ -89,24 +88,26 @@ jobs:
             js = js.replace("|| 'es'", "|| 'br'")
             js = js.replace("|| '1080p'", "|| '1080HQ'")
 
-            # CORRECAO CRITICA 1: Desbloquear 'reliableinput' no send do DataChannel para não travar o protocolo V2 do controle
-            js = js.replace(
-                "if (label === 'input' || label === 'unreliableinput' || label === 'reliableinput') return;",
-                "if (label === 'input' || label === 'unreliableinput') return;"
-            )
-
-            # Liberar canal 'message' para o Fortnite passar da tela de carregamento
+            # Liberar canal 'message' para abertura de todos os jogos (incluindo Fortnite)
             js = re.sub(
                 r"if\s*\(\s*label\s*===\s*'message'\s*&&\s*typeof\s+data\s*===\s*'string'\s*&&\s*!data\.includes\('Handshake'\)\s*\)\s*\{\s*return;\s*\}",
                 "// Canal message liberado",
                 js
             )
 
-            # Impedir que a WebView desconecte o controle enviando wasAdded: false
+            # Ajustar generateMsDeviceInfo para reportar 1280x720 quando a resolucao for 720 ou 720HQ (ideal para Multilaser TL042)
+            js = js.replace(
+                "function generateMsDeviceInfo(osName) {",
+                "function generateMsDeviceInfo(osName) {\n    const resNow = getTargetResolution();\n    const isHd720 = (resNow === '720' || resNow === '720p' || resNow === '720HQ');"
+            )
+            js = js.replace("widthInPixels: 4096", "widthInPixels: isHd720 ? 1280 : 1920")
+            js = js.replace("heightInPixels: 2160", "heightInPixels: isHd720 ? 720 : 1080")
+
+            # Impedir que a WebView envie 'wasAdded: false' no canal 'control'
             control_guard = "\n".join([
                 "if (label === 'control' && typeof data === 'string') {",
                 "                                    if (data.includes('gamepadChanged') && data.includes('false')) {",
-                "                                        data = data.replace(/\"wasAdded\"\\s*:\\s*false/g, '\"wasAdded\":true');",
+                "                                        return;",
                 "                                    }",
                 "                                }",
                 "                                if (label === 'control' && data.includes('resolutionAlias'))"
@@ -114,7 +115,7 @@ jobs:
             if "data.includes('gamepadChanged')" not in js:
                 js = js.replace("if (label === 'control' && data.includes('resolutionAlias'))", control_guard, 1)
 
-            # Anunciar controle conectado no canal 'control'
+            # Anunciar controle conectado no inicio da sessao
             gamepad_connect_helper = "\n".join([
                 "window.sendNativeGamepadConnected = function() {",
                 "    try {",
@@ -130,27 +131,31 @@ jobs:
                 js = gamepad_connect_helper + "\n" + js
                 js = js.replace(
                     "if (dc.onopen && dc.readyState === 'open') dc.onopen();",
-                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();\n        if (label === 'control' && dc.readyState === 'open') { setTimeout(window.sendNativeGamepadConnected, 200); setTimeout(window.sendNativeGamepadConnected, 1500); }"
+                    "if (dc.onopen && dc.readyState === 'open') dc.onopen();\n        if (label === 'control' && dc.readyState === 'open') { setTimeout(window.sendNativeGamepadConnected, 300); }"
                 )
                 js = js.replace(
                     "setTimeout(CXkeepalive, 50);",
-                    "setTimeout(CXkeepalive, 50);\n            setTimeout(window.sendNativeGamepadConnected, 500);\n            setTimeout(window.sendNativeGamepadConnected, 2500);"
+                    "setTimeout(CXkeepalive, 50);\n            setTimeout(window.sendNativeGamepadConnected, 600);"
                 )
-
-            js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
-            js = js.replace("heightInPixels: 2160", "heightInPixels: 1080")
 
             js = js.replace("canvas.width = 1920;", "canvas.width = 2;")
             js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
             js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
             js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
-            js = js.replace("}, 3000);", "}, 300);")
+            js = js.replace("}, 3000);", "}, 100);")
+
+            # CORRECAO CRITICA MULTILASER TL042: Ativar patchRtcPeerConnection() e InitBc() IMEDIATAMENTE dentro de main()
+            # (Em CPUs de 1.1GHz, o evento window 'load' ja passou quando o script termina de ser injetado!)
+            js = js.replace(
+                "function main() {\n    BxLogger.info(\"Init\", \"Loading lightweight xCloud bypass...\");\n    interceptHttpRequests();\n    patchWebSocket();\n    Patcher.init();\n}",
+                "function main() {\n    if (window.__BXC_INJECTED__) return;\n    window.__BXC_INJECTED__ = true;\n    BxLogger.info(\"Init\", \"Loading xCloud bypass (Multi-TV Optimized)...\");\n    InitBc();\n    patchRtcPeerConnection();\n    interceptHttpRequests();\n    patchWebSocket();\n    Patcher.init();\n}"
+            )
 
             sdp_stabilizer = "\n".join([
                 "function forceLowLatencyBaselineSdp(sdp, maxKbps) {",
-                "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 20000;",
-                "    let startKbps = Math.min(capKbps, 12000);",
-                "    let minKbps = 4000;",
+                "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 15000;",
+                "    let startKbps = Math.min(capKbps, 10000);",
+                "    let minKbps = 3000;",
                 "    let lines = sdp.split('\\r\\n');",
                 "    let out = [];",
                 "    let inVideo = false;",
@@ -198,10 +203,19 @@ jobs:
             with open(idx_path, "w", encoding="utf-8") as f:
                 f.write(js)
 
-        # 5. Atualizar MainActivity.java:
-        #    - Alimentar AMBOS os canais (gamepadListener + controllerLe) simultaneamente durante o jogo
-        #    - Nunca chamar pauseTimers() na WebView e nunca tornar a surfaceView focavel (evita perder o controle no site ao sair do jogo)
-        #    - Devolver o foco explicitamente para a WebView em setWebviewVisible() e showWebview()
+        # 5. Corrigir AndroidGamepadListener.java (Deadzone segura de 0.15f para evitar drift no Gears/Forza)
+        gp_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
+        if os.path.exists(gp_java):
+            with open(gp_java, "r", encoding="utf-8") as f:
+                gp = f.read()
+            gp = gp.replace("this.stickDeadzone = stickDeadzone;", "this.stickDeadzone = Math.max(stickDeadzone, 0.15f);")
+            with open(gp_java, "w", encoding="utf-8") as f:
+                f.write(gp)
+
+        # 6. Atualizar MainActivity.java:
+        #    - Detector automatico da Multilaser TL042 / TVs HD (usa 720HQ @ 10 Mbps na TL042 e 1080HQ @ 20 Mbps na TCL 55P755)
+        #    - Garantir injecao do index.js tambem no onPageFinished (caso o onProgressChanged pule na TL042)
+        #    - Limpar memoria da WebView (freeMemory) ao iniciar o jogo
         main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
         if os.path.exists(main_java):
             with open(main_java, "r", encoding="utf-8") as f:
@@ -209,87 +223,63 @@ jobs:
 
             mj = mj.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
             mj = mj.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
+
+            # Adicionar metodo detector de TV HD / Low-RAM (Multilaser TL042)
+            helper_method = "\n".join([
+                "    private boolean isLowSpecHdTv() {",
+                "        try {",
+                "            String model = Build.MODEL != null ? Build.MODEL.toUpperCase(Locale.ROOT) : \"\";",
+                "            if (model.contains(\"TL042\") || model.contains(\"MULTI\")) return true;",
+                "            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();",
+                "            if (Math.min(dm.widthPixels, dm.heightPixels) <= 800) return true;",
+                "            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);",
+                "            if (am != null && am.isLowRamDevice()) return true;",
+                "        } catch (Throwable ignored) {}",
+                "        return false;",
+                "    }",
+                "    public boolean isStreaming() {"
+            ])
+            if "isLowSpecHdTv()" not in mj:
+                mj = mj.replace("    public boolean isStreaming() {", helper_method, 1)
+
             mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
-            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, 20)')
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720HQ" : "1080HQ")')
+            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, isLowSpecHdTv() ? "720HQ" : "1080HQ")')
+            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, isLowSpecHdTv() ? 10 : 20)')
+
+            mj = mj.replace('gpPrefs.getFloat("camera_deadzone", 0.12f)', 'gpPrefs.getFloat("camera_deadzone", 0.16f)')
+            mj = mj.replace("gamepadListener.setOnMenuTrigger(this::showStreamingMenuDialog);", "// menu trigger via Select+Start")
 
             mj = mj.replace('"Disable in game performance"', '"Ocultar desempenho no jogo"')
             mj = mj.replace('"Show in game performance"', '"Mostrar desempenho no jogo"')
             mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
             mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
 
-            # CORRECAO CRITICA 2: Remover a trava de activeInputChannel nos callbacks de envio para enviar em qualquer canal que esteja OPEN
-            mj = mj.replace(
-                'if (isStreaming && streamingService != null && "unreliableinput".equals(activeInputChannel))',
-                'if (isStreaming && streamingService != null)'
-            )
-            mj = mj.replace(
-                'if (isStreaming && streamingService != null && "input".equals(activeInputChannel))',
-                'if (isStreaming && streamingService != null)'
-            )
-
-            # CORRECAO CRITICA 3: Alimentar TANTO o gamepadListener QUANTO o controllerLe em cada movimento e aperto de botao
-            dual_motion_block = "\n".join([
-                "if (isStreaming) {",
-                "                    boolean handled = false;",
-                "                    if (gamepadListener != null) {",
-                "                        String prepMsg = gamepadListener.prepare(event.getDevice());",
-                "                        if (prepMsg != null && !prepMsg.isEmpty()) showCustomToast(prepMsg);",
-                "                        if (gamepadListener.onGenericMotion(event)) handled = true;",
-                "                    }",
-                "                    if (controllerLe != null) {",
-                "                        controllerLe.detectAxisLayout(event.getDevice());",
-                "                        if (controllerLe.onGenericMotion(event)) handled = true;",
-                "                    }",
-                "                    if (handled) return true;",
-                "                }"
+            # Garantir que o index.js seja injetado no onPageFinished caso a Multilaser TL042 tenha pulado o onProgressChanged
+            page_finished_target = "super.onPageFinished(view, url);\n                setWebviewVisible();"
+            page_finished_fix = "\n".join([
+                "super.onPageFinished(view, url);",
+                "                if (url != null && url.contains(\"play\")) {",
+                "                    view.evaluateJavascript(\"if (!window.__BXC_INJECTED__) { \" + JSONObject.quote(loadScriptFromAssets()).substring(1, JSONObject.quote(loadScriptFromAssets()).length() - 1) + \" }\", null);",
+                "                }",
+                "                setWebviewVisible();"
             ])
-            mj = re.sub(
-                r"if\s*\(isStreaming\)\s*\{\s*if\s*\(\"unreliableinput\"\.equals\(activeInputChannel\)\s*&&\s*gamepadListener\s*!=\s*null\)\s*\{[\s\S]*?if\s*\(controllerLe\.onGenericMotion\(event\)\)\s*return\s+true;\s*\}\s*\}",
-                lambda _: dual_motion_block,
-                mj,
-                count=1
-            )
-
-            dual_key_block = "\n".join([
-                "if (isStreaming) {",
-                "                    boolean handled = false;",
-                "                    if (gamepadListener != null) {",
-                "                        String prepMsg = gamepadListener.prepare(event.getDevice());",
-                "                        if (prepMsg != null && !prepMsg.isEmpty()) showCustomToast(prepMsg);",
-                "                        if (event.getAction() == KeyEvent.ACTION_DOWN) {",
-                "                            if (gamepadListener.onKeyDown(event.getKeyCode(), event)) handled = true;",
-                "                        } else if (event.getAction() == KeyEvent.ACTION_UP) {",
-                "                            if (gamepadListener.onKeyUp(event.getKeyCode(), event)) handled = true;",
-                "                        }",
-                "                    }",
-                "                    if (controllerLe != null) {",
-                "                        controllerLe.detectAxisLayout(event.getDevice());",
-                "                        if (event.getAction() == KeyEvent.ACTION_DOWN) {",
-                "                            if (controllerLe.onKeyDown(event.getKeyCode(), event)) handled = true;",
-                "                        } else if (event.getAction() == KeyEvent.ACTION_UP) {",
-                "                            if (controllerLe.onKeyUp(event.getKeyCode(), event)) handled = true;",
-                "                        }",
-                "                    }",
-                "                    if (handled) return true;",
-                "                }"
+            # Forma mais segura e direta: chamar evaluateJavascript(loadScriptFromAssets()) pois main() agora tem guarda window.__BXC_INJECTED__!
+            safe_page_finished = "\n".join([
+                "super.onPageFinished(view, url);",
+                "                if (url != null && url.contains(\"play\")) {",
+                "                    view.evaluateJavascript(loadScriptFromAssets(), null);",
+                "                }",
+                "                setWebviewVisible();"
             ])
-            mj = re.sub(
-                r"if\s*\(isStreaming\)\s*\{\s*if\s*\(\"unreliableinput\"\.equals\(activeInputChannel\)\s*&&\s*gamepadListener\s*!=\s*null\)\s*\{[\s\S]*?if\s*\(controllerLe\.onKeyUp\(event\.getKeyCode\(\),\s*event\)\)\s*return\s+true;\s*\}\s*\}\s*\}",
-                lambda _: dual_key_block,
-                mj,
-                count=1
-            )
+            if "view.evaluateJavascript(loadScriptFromAssets(), null);" not in mj.split("onPageFinished")[1].split("onPageStarted")[0]:
+                mj = mj.replace(page_finished_target, safe_page_finished, 1)
 
-            # Auto-preparar o controle e iniciar o legacyInputChannel assim que o 1o frame renderizar
+            # No 1o frame: preparar controle e liberar RAM da WebView (freeMemory + pauseTimers apos 6s)
             first_frame_target = "setStreamingState(true);"
             first_frame_replacement = "\n".join([
                 "setStreamingState(true);",
                 "                setNativeGamepadEnabled(true);",
-                "                if (legacyInputChannel != null) {",
-                "                    legacyInputChannel.start(0);",
-                "                }",
                 "                try {",
                 "                    int[] devIds = InputDevice.getDeviceIds();",
                 "                    for (int devId : devIds) {",
@@ -300,12 +290,19 @@ jobs:
                 "                            break;",
                 "                        }",
                 "                    }",
-                "                } catch (Throwable ignored) {}"
+                "                } catch (Throwable ignored) {}",
+                "                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {",
+                "                    if (isStreaming && webView != null) {",
+                "                        webView.setVisibility(View.INVISIBLE);",
+                "                        webView.freeMemory();",
+                "                        webView.onPause();",
+                "                        webView.pauseTimers();",
+                "                    }",
+                "                }, 6000);"
             ])
             if "InputDevice.getDeviceIds()" not in mj and first_frame_target in mj:
                 mj = mj.replace(first_frame_target, first_frame_replacement, 1)
 
-            # CORRECAO CRITICA 4: Em setWebviewVisible(), devolver o foco para a WebView assim que ela sair de View.GONE (fim dos 18% -> 37% -> 100%)
             focus_webview_visible = "\n".join([
                 "    public void setWebviewVisible() {",
                 "        if (surfaceView != null) {",
@@ -313,6 +310,8 @@ jobs:
                 "            surfaceView.setFocusableInTouchMode(false);",
                 "        }",
                 "        if (webView != null) {",
+                "            webView.resumeTimers();",
+                "            webView.onResume();",
                 "            webView.setVisibility(WebView.VISIBLE);",
                 "            webView.setFocusable(true);",
                 "            webView.setFocusableInTouchMode(true);",
@@ -333,16 +332,23 @@ jobs:
                 count=1
             )
 
-            # CORRECAO CRITICA 5: Nunca chamar pauseTimers() nem tornar surfaceView focavel em closeWebview()
             clean_close_webview = "\n".join([
                 "    public void closeWebview() {",
                 "        runOnUiThread(() -> {",
                 "            if (webView != null) {",
                 "                webView.setVisibility(View.INVISIBLE);",
+                "                webView.freeMemory();",
                 "            }",
                 "            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {",
                 "                getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);",
                 "            }",
+                "            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {",
+                "                if (isStreaming && webView != null) {",
+                "                    webView.freeMemory();",
+                "                    webView.onPause();",
+                "                    webView.pauseTimers();",
+                "                }",
+                "            }, 6000);",
                 "        });",
                 "    }"
             ])
@@ -353,7 +359,6 @@ jobs:
                 count=1
             )
 
-            # CORRECAO CRITICA 6: Ao sair do jogo (showWebview), voltar para a pagina inicial do catalogo com foco 100% na WebView
             home_show_webview = "\n".join([
                 "    public void showWebview() {",
                 "        if (audioManager != null) {",
@@ -367,16 +372,18 @@ jobs:
                 "            if (webView == null) {",
                 "                initWebView();",
                 "                rootLayout.addView(webView, 1);",
+                "                webView.resumeTimers();",
+                "                webView.onResume();",
                 "                webView.loadUrl(\"https://www.xbox.com/pt-BR/play\");",
                 "            } else {",
+                "                webView.resumeTimers();",
+                "                webView.onResume();",
                 "                String curUrl = webView.getUrl();",
                 "                if (curUrl == null || curUrl.contains(\"/launch/\") || curUrl.equals(\"about:blank\")) {",
                 "                    webView.loadUrl(\"https://www.xbox.com/pt-BR/play\");",
                 "                }",
                 "            }",
                 "            webView.setVisibility(View.VISIBLE);",
-                "            webView.resumeTimers();",
-                "            webView.onResume();",
                 "            webView.setFocusable(true);",
                 "            webView.setFocusableInTouchMode(true);",
                 "            webView.requestFocus();",
@@ -419,17 +426,17 @@ jobs:
 
             mj = mj.replace(
                 "Integer[] bitrateValues = {0, 5, 10, 15, 20, 30, 40, 50};",
-                "Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};"
+                "Integer[] bitrateValues = {0, 6, 8, 10, 12, 15, 18, 20};"
             )
             mj = mj.replace(
                 'String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};',
-                'String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Qualidade Máxima)"};'
+                'String[] bitrateLabels = {"Automático", "6 Mbps (TV Leve)", "8 Mbps (Ideal Multilaser)", "10 Mbps (Padrão HD)", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Máx TCL 55)"};'
             )
 
             with open(main_java, "w", encoding="utf-8") as f:
                 f.write(mj)
 
-        # 6. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer e liberar envio do reliableinput
+        # 7. Corrigir WebRtcReceiver.java: Priorizar H.264 Baseline ANTES do Offer
         rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
         if os.path.exists(rtc_java):
             with open(rtc_java, "r", encoding="utf-8") as f:
@@ -440,12 +447,6 @@ jobs:
             rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 1;')
             rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
             rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
-
-            # Permitir que reliableinput passe de JS para o DataChannel nativo
-            rj = rj.replace(
-                'if (("unreliableinput".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label))',
-                'if (("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label))'
-            )
 
             transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
             transceiver_fix = "\n".join([
@@ -460,7 +461,7 @@ jobs:
             with open(rtc_java, "w", encoding="utf-8") as f:
                 f.write(rj)
 
-        # 7. Traduzir todos os botoes dos layouts XML
+        # 8. Traduzir todos os botoes dos layouts XML
         replacements = {
             "Exit Game": "Sair do Jogo",
             "Exit the game": "Sair do Jogo",
@@ -506,7 +507,7 @@ jobs:
             except Exception:
                 pass
 
-        # 8. Garantir extractNativeLibs="true" no AndroidManifest.xml
+        # 9. Garantir extractNativeLibs="true" e android:largeHeap="true" (Essencial para a Multilaser TL042 nao fechar por falta de RAM!)
         man_path = "app/src/main/AndroidManifest.xml"
         if os.path.exists(man_path):
             with open(man_path, "r", encoding="utf-8") as f:
@@ -515,6 +516,8 @@ jobs:
                 man = man.replace('android:extractNativeLibs="false"', 'android:extractNativeLibs="true"')
             elif 'android:extractNativeLibs' not in man:
                 man = man.replace('<application', '<application android:extractNativeLibs="true"')
+            if 'android:largeHeap' not in man:
+                man = man.replace('<application', '<application android:largeHeap="true"')
             with open(man_path, "w", encoding="utf-8") as f:
                 f.write(man)
         PYEOF
