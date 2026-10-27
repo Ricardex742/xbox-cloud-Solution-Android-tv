@@ -47,7 +47,8 @@ public class WebRtcReceiver implements Loggable {
     private PeerConnectionFactory peerConnectionFactory;
     private PeerConnection peerConnection;
     private AudioDeviceModule audioDeviceModule;
-    private final HashMap<String, DataChannel> dataChannels = new HashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, DataChannel> dataChannels = new java.util.concurrent.ConcurrentHashMap<>();
+    private long lastSendWarningMs;
 
     private SurfaceViewRenderer remoteRenderer;
     private SignalingListener signalingListener;
@@ -107,7 +108,7 @@ private boolean showStats=false;
 
         PeerConnectionFactory.InitializationOptions initOptions =
                 PeerConnectionFactory.InitializationOptions.builder(appContext)
-                        .setEnableInternalTracer(true)
+                        .setEnableInternalTracer(false)
                         .createInitializationOptions();
         PeerConnectionFactory.initialize(initOptions);
 
@@ -323,11 +324,11 @@ private boolean showStats=false;
 
     private int getH264ProfileRank(String profileLevelId) {
         if (profileLevelId == null) return -1;
-        String p = profileLevelId.toLowerCase();
-        if (p.startsWith("6400")) return 3;
-        if (p.startsWith("4d00")) return 2;
-        if (p.startsWith("42e0")) return 1;
-        if (p.startsWith("4200")) return 0;
+        String p = profileLevelId.toLowerCase(Locale.ROOT);
+        if (p.startsWith("6400")) return 0;
+        if (p.startsWith("4d00")) return 1;
+        if (p.startsWith("42e0")) return 4;
+        if (p.startsWith("4200")) return 3;
         return -1;
     }
 
@@ -356,13 +357,15 @@ private boolean showStats=false;
         }, answerSdp);
     }
 
-    public void createOffer(OfferReadyCallback callback) {
+    public void createOffer(int bitrateKbps, OfferReadyCallback callback) {
         peerConnection.createOffer(new SdpObserverAdapter() {
             @Override
             public void onCreateSuccess(SessionDescription sessionDescription) {
+                final SessionDescription configuredOffer = new SessionDescription(sessionDescription.type,
+                        SdpPolicy.videoBandwidth(sessionDescription.description, bitrateKbps));
                 peerConnection.setLocalDescription(new SdpObserverAdapter() {
-                    @Override public void onSetSuccess() { callback.onOfferReady(sessionDescription); }
-                }, sessionDescription);
+                    @Override public void onSetSuccess() { callback.onOfferReady(configuredOffer); }
+                }, configuredOffer);
             }
         }, new org.webrtc.MediaConstraints());
     }
@@ -383,6 +386,9 @@ private boolean showStats=false;
         else if ("sendrecv".equals(direction)) transceiverDirection = RtpTransceiver.RtpTransceiverDirection.SEND_RECV;
 
         RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));
+        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {
+            setVideoCodecPreferences(transceiver);
+        }
         if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO) {
             localAudioSender = transceiver.getSender();
             Log.i(TAG, "Stored audio sender from addTransceiver");
@@ -487,15 +493,21 @@ private boolean showStats=false;
         });
     }
 
-    public void sendDataChannelMessage(String label, byte[] data, boolean isBinary) {
+    public synchronized void sendDataChannelMessage(String label, byte[] data, boolean isBinary) {
         DataChannel channel = dataChannels.get(label);
         if (channel != null && channel.state() == DataChannel.State.OPEN) {
 
-            channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary));
+            if (!channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary))) {
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastSendWarningMs >= 1000) {
+                    lastSendWarningMs = now;
+                    Log.w(TAG, "DataChannel rejected send: " + label);
+                }
+            }
         }
     }
 
-    public void sendDataChannelMessage(String label, String dataStr, boolean isBinary) {
+    public synchronized void sendDataChannelMessage(String label, String dataStr, boolean isBinary) {
         if (("unreliableinput".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) 
                 && host.isNativeGamepadEnabled()) {
             return;
@@ -507,7 +519,13 @@ private boolean showStats=false;
             data = Base64.decode(dataStr, Base64.DEFAULT);
             //Log.i(TAG, "sending text frame (" + label + "): " + Arrays.toString(data));
 
-            channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary));
+            if (!channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary))) {
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastSendWarningMs >= 1000) {
+                    lastSendWarningMs = now;
+                    Log.w(TAG, "DataChannel rejected send: " + label);
+                }
+            }
         }
     }
 

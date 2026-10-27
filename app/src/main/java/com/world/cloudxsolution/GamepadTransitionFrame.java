@@ -139,13 +139,13 @@ public final class GamepadTransitionFrame {
         if (held[INDEX_DPAD_LEFT]) p |= GamepadInputPhysicality.DPAD_LEFT;
         if (held[INDEX_DPAD_RIGHT]) p |= GamepadInputPhysicality.DPAD_RIGHT;
 
-        if (axes[AXIS_LEFT_TRIGGER] > 0.05f) p |= GamepadInputPhysicality.LEFT_TRIGGER;
-        if (axes[AXIS_RIGHT_TRIGGER] > 0.05f) p |= GamepadInputPhysicality.RIGHT_TRIGGER;
+        if (axes[AXIS_LEFT_TRIGGER] > 0.01f) p |= GamepadInputPhysicality.LEFT_TRIGGER;
+        if (axes[AXIS_RIGHT_TRIGGER] > 0.01f) p |= GamepadInputPhysicality.RIGHT_TRIGGER;
 
-        if (Math.abs(axes[AXIS_LEFT_X]) > 0.1f) p |= GamepadInputPhysicality.LEFT_THUMB_X_AXIS;
-        if (Math.abs(axes[AXIS_LEFT_Y]) > 0.1f) p |= GamepadInputPhysicality.LEFT_THUMB_Y_AXIS;
-        if (Math.abs(axes[AXIS_RIGHT_X]) > 0.1f) p |= GamepadInputPhysicality.RIGHT_THUMB_X_AXIS;
-        if (Math.abs(axes[AXIS_RIGHT_Y]) > 0.1f) p |= GamepadInputPhysicality.RIGHT_THUMB_Y_AXIS;
+        if (Math.round(InputMath.clamp(axes[AXIS_LEFT_X]) * 32767f) != 0) p |= GamepadInputPhysicality.LEFT_THUMB_X_AXIS;
+        if (Math.round(InputMath.clamp(axes[AXIS_LEFT_Y]) * 32767f) != 0) p |= GamepadInputPhysicality.LEFT_THUMB_Y_AXIS;
+        if (Math.round(InputMath.clamp(axes[AXIS_RIGHT_X]) * 32767f) != 0) p |= GamepadInputPhysicality.RIGHT_THUMB_X_AXIS;
+        if (Math.round(InputMath.clamp(axes[AXIS_RIGHT_Y]) * 32767f) != 0) p |= GamepadInputPhysicality.RIGHT_THUMB_Y_AXIS;
 
         return p;
     }

@@ -61,10 +61,10 @@ public final class UnreliableInputPacket {
         // Axes ordered according to the previous fields
         buf.putShort(normalizeTrigger(Math.abs(f.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER]) < 0.001f ? 0f : f.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER]));
         buf.putShort(normalizeTrigger(Math.abs(f.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER]) < 0.001f ? 0f : f.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER]));
-        buf.putShort(normalizeAxis(Math.abs(f.axes[GamepadTransitionFrame.AXIS_LEFT_X]) < 0.001f ? 0f : f.axes[GamepadTransitionFrame.AXIS_LEFT_X]));
-        buf.putShort(normalizeAxis(Math.abs(f.axes[GamepadTransitionFrame.AXIS_LEFT_Y]) < 0.001f ? 0f : f.axes[GamepadTransitionFrame.AXIS_LEFT_Y]));
-        buf.putShort(normalizeAxis(Math.abs(f.axes[GamepadTransitionFrame.AXIS_RIGHT_X]) < 0.001f ? 0f : f.axes[GamepadTransitionFrame.AXIS_RIGHT_X]));
-        buf.putShort(normalizeAxis(Math.abs(f.axes[GamepadTransitionFrame.AXIS_RIGHT_Y]) < 0.001f ? 0f : f.axes[GamepadTransitionFrame.AXIS_RIGHT_Y]));
+        buf.putShort(normalizeAxis(f.axes[GamepadTransitionFrame.AXIS_LEFT_X]));
+        buf.putShort(normalizeAxis(f.axes[GamepadTransitionFrame.AXIS_LEFT_Y]));
+        buf.putShort(normalizeAxis(f.axes[GamepadTransitionFrame.AXIS_RIGHT_X]));
+        buf.putShort(normalizeAxis(f.axes[GamepadTransitionFrame.AXIS_RIGHT_Y]));
 
         buf.putInt(f.physicalPhysicality);
         buf.putInt(f.virtualPhysicality);

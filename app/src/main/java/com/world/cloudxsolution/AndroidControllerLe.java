@@ -29,6 +29,9 @@ public final class AndroidControllerLe {
     // single key/motion event.
     private final Set<Integer> detectedDeviceIds = new HashSet<>();
 
+    private final float[] stickScratch = new float[2];
+    private boolean hasHatAxes;
+
     private float stickDeadzone = 0.12f;
 
     // Camera sensitivity multiplier applied to the right stick only.
@@ -40,11 +43,11 @@ public final class AndroidControllerLe {
 
 
     public void setStickDeadzone(float deadzone) {
-        this.stickDeadzone = deadzone;
+        this.stickDeadzone = InputMath.leftDeadzone(deadzone);
     }
 
     public void setCameraSensitivity(float sensitivity) {
-        this.cameraSensitivity = sensitivity;
+        this.cameraSensitivity = InputMath.sensitivity(sensitivity);
     }
 
     private int rightStickXAxis = MotionEvent.AXIS_Z;
@@ -79,7 +82,9 @@ public final class AndroidControllerLe {
      * that used to run on every single key/motion event.
      */
     public int detectAxisLayout(InputDevice device) {
-        if (device == null) return 0;
+        if (device == null || device.isVirtual()
+                || ((device.getSources() & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD
+                && (device.getSources() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK)) return 0;
 
         int id = device.getId();
         //Log.d("INPUT_SOURCE", "device.getId:"+id);
@@ -87,10 +92,13 @@ public final class AndroidControllerLe {
         if (detectedDeviceIds.contains(id)) {
             this.lastDevice = device;
             return 2;
-        }else if(!detectedDeviceIds.isEmpty()){
-            return 1;
-
         }
+        releaseAll();
+        detectedDeviceIds.clear();
+        rightStickXAxis = MotionEvent.AXIS_Z;
+        rightStickYAxis = MotionEvent.AXIS_RZ;
+        hasHatAxes = device.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null
+                && device.getMotionRange(MotionEvent.AXIS_HAT_Y, InputDevice.SOURCE_JOYSTICK) != null;
         this.lastDevice = device;
         detectedDeviceIds.add(id);
 
@@ -128,16 +136,9 @@ public final class AndroidControllerLe {
         if (!isGamepadSource(event, keyCode)) return false;
         //Log.d("INPUT_SOURCE", "keyCode:"+keyCode);
 
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {
-            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f;
-            sendIfChanged();
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {
-            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f;
-            sendIfChanged();
-            return true;
-        }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }
 
         String button = mapButton(keyCode);
         if (button == null) return false;
@@ -151,16 +152,9 @@ public final class AndroidControllerLe {
 
         if (!isGamepadSource(event, keyCode)) return false;
 
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {
-            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f;
-            sendIfChanged();
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {
-            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f;
-            sendIfChanged();
-            return true;
-        }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f; sendIfChanged(); } return true; }
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f; sendIfChanged(); } return true; }
 
         String button = mapButton(keyCode);
         if (button == null) return false;
@@ -176,14 +170,12 @@ public final class AndroidControllerLe {
             return false;
         }
 
-        float leftX = deadzone(event.getAxisValue(MotionEvent.AXIS_X));
-        float leftY = deadzone(event.getAxisValue(MotionEvent.AXIS_Y));
-        float rightX = applySensitivity(deadzone(event.getAxisValue(rightStickXAxis)));
-        float rightY = applySensitivity(deadzone(event.getAxisValue(rightStickYAxis)));
-        // Log.d("INPUT_SOURCE", "setLeftStick:"+leftX+ "   "+leftY);
-        // Log.d("INPUT_SOURCE", "setRightStick:"+rightX+ "   "+rightY);
-        frame.setLeftStick(leftX, leftY);
-        frame.setRightStick(rightX, rightY);
+        InputMath.response(event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y),
+                stickDeadzone, 1f, 1f, stickScratch);
+        frame.setLeftStick(stickScratch[0], stickScratch[1]);
+        InputMath.response(event.getAxisValue(rightStickXAxis), event.getAxisValue(rightStickYAxis),
+                0f, 1f, cameraSensitivity, stickScratch);
+        frame.setRightStick(stickScratch[0], stickScratch[1]);
 
         float leftTrigger = leftTriggerIsAnalog
                 ? Math.max(0f, event.getAxisValue(leftTriggerAxis)) : frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER];
@@ -200,7 +192,7 @@ public final class AndroidControllerLe {
         boolean hatUp = hatY < -0.5f;
         boolean hatDown = hatY > 0.5f;
 
-        frame.setDPad(hatUp, hatDown, hatLeft, hatRight);
+        if (hasHatAxes) frame.setDPad(hatUp, hatDown, hatLeft, hatRight);
 
         sendIfChanged();
         return true;
@@ -229,8 +221,15 @@ public final class AndroidControllerLe {
         }
     }
 
+    public synchronized void releaseAll() {
+        java.util.Arrays.fill(frame.axes, 0f);
+        frame.buttons = 0;
+        frame.setDPad(false, false, false, false);
+        lastSent = null;
+        sendIfChanged();
+    }
+
     private boolean isGamepadSource(KeyEvent event, int keyCode) {
-        if (mapButton(keyCode) != null) return true; // Valid gamepad button
         int source = event.getSource();
         return (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
                 || (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;

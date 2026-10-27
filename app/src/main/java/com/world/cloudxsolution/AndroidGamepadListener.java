@@ -47,7 +47,11 @@ public final class AndroidGamepadListener {
     private volatile boolean testModeActive = false;
 
     public void setTestModeActive(boolean active) {
-        this.testModeActive = active;
+        synchronized (stateLock) {
+            releaseAll();
+            this.testModeActive = active;
+            if (!active) releaseAll();
+        }
     }
 
     public boolean isTestModeActive() {
@@ -94,7 +98,7 @@ public final class AndroidGamepadListener {
 
     public String prepare(InputDevice device) {
         if (device == null) return "";
-        if (device.isVirtual()) return ""; // remote/injected input source, not a real gamepad -- never let it reconfigure mapping
+        if (isRemoteEvent(device)) return ""; // remote/injected input source, not a real gamepad -- never let it reconfigure mapping
 
         String descriptor = device.getDescriptor();
 
@@ -103,6 +107,7 @@ public final class AndroidGamepadListener {
             if (isPrepared && descriptor != null && descriptor.equals(preparedDeviceDescriptor)) {
                 return "";
             }
+            if (isPrepared) releaseAll();
             preparedDeviceDescriptor = descriptor;
             String devName = device.getName();
             Arrays.fill(keyCodeMap, -1);
@@ -167,7 +172,9 @@ public final class AndroidGamepadListener {
     }
 
     private boolean isRemoteEvent(InputDevice device) {
-        return device == null || device.isVirtual();
+        return device == null || device.isVirtual()
+                || ((device.getSources() & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD
+                && (device.getSources() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK);
     }
 
     private void map(int keyCode, int transitionIndex) {
@@ -186,6 +193,33 @@ public final class AndroidGamepadListener {
             this.snapshot = snapshot;
         }
     }
+    private boolean handleTrigger(int keyCode, boolean down) {
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;
+        boolean left = keyCode == KeyEvent.KEYCODE_BUTTON_L2;
+        if (!left && keyCode != KeyEvent.KEYCODE_BUTTON_R2) return false;
+        synchronized (stateLock) {
+            if (!(left ? leftTriggerIsAnalog : rightTriggerIsAnalog)) {
+                int axis = left ? GamepadTransitionFrame.AXIS_LEFT_TRIGGER : GamepadTransitionFrame.AXIS_RIGHT_TRIGGER;
+                float value = down ? 1f : 0f;
+                if (transitionFrame.axes[axis] != value) {
+                    transitionFrame.axes[axis] = value;
+                    sendUnreliableIfChanged(down ? TYPE_KEYDOWN : TYPE_KEYUP);
+                }
+            }
+        }
+        return true;
+    }
+
+    public void releaseAll() {
+        synchronized (stateLock) {
+            transitionFrame.resetAllHeldButtons();
+            Arrays.fill(transitionFrame.axes, 0f);
+            Arrays.fill(keyDown, false);
+            prevHatUp = prevHatDown = prevHatLeft = prevHatRight = false;
+            sendUnreliableIfChanged(TYPE_KEYUP);
+        }
+    }
+
     private long ms=0;
     //private long pression=0;
     private final boolean[] keyDown = new boolean[KeyEvent.getMaxKeyCode() + 1];
@@ -194,6 +228,8 @@ public final class AndroidGamepadListener {
         if (!isPrepared || isRemoteEvent(event.getDevice())) {
             return false;
         }
+        if (keyCode < 0 || keyCode >= keyDown.length) return false;
+        if (handleTrigger(keyCode, true)) return true;
         if (keyDown[keyCode]) {
             return true;
         }
@@ -228,6 +264,8 @@ public final class AndroidGamepadListener {
             return false;
         }
 
+        if (keyCode < 0 || keyCode >= keyDown.length) return false;
+        if (handleTrigger(keyCode, false)) return true;
         int index = (keyCode >= 0 && keyCode < keyCodeMap.length) ? keyCodeMap[keyCode] : -1;
         if (index == -1) {
 
@@ -265,10 +303,10 @@ private long Gms=0;
             // ~41% larger on diagonals than on the cardinal axes and skews the output direction near
             // the edge of the deadzone. That mismatch between input angle and output angle is exactly
             // what reads as "unordered"/desynced stick movement, especially on the camera stick.
-            applyRadialDeadzone(rawLeftX, rawLeftY, stickDeadzone, 1.0f, stickScratch);
+            applyRadialDeadzone(rawLeftX, rawLeftY, Math.max(0.15f, stickDeadzone), 1.0f, stickScratch);
             transitionFrame.setLeftStick(stickScratch[0], stickScratch[1]);
 
-            applyRadialDeadzone(rawRightX, rawRightY, stickDeadzone, rightStickCurveExponent, stickScratch);
+            applyRadialDeadzone(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, stickScratch);
             float rx = stickScratch[0] * cameraSensitivity;
             float ry = stickScratch[1] * cameraSensitivity;
             transitionFrame.setRightStick(clamp(rx), clamp(ry));
@@ -310,7 +348,13 @@ private long Gms=0;
         return true;
     }
 
+    private boolean axesWereActive;
+
     private void sendUnreliableIfChanged(int methodType) {
+        boolean axesActive = false;
+        for (float value : transitionFrame.axes) axesActive |= value != 0f;
+        boolean becameNeutral = axesWereActive && !axesActive;
+        axesWereActive = axesActive;
         transitionFrame.physicalPhysicality = transitionFrame.computeButtonPhysicality();
 
         GamepadTransitionFrame snapshot = transitionFrame.copy();
@@ -318,7 +362,7 @@ private long Gms=0;
         long tick = tickCounter++;
         GamepadPendingState state = new GamepadPendingState(token, tick, snapshot);
         
-        if (methodType == TYPE_KEYDOWN || methodType == TYPE_KEYUP) {
+        if (methodType == TYPE_KEYDOWN || methodType == TYPE_KEYUP || becameNeutral) {
             // Send multiple times to ensure the button event reaches the server
             // over the unreliable channel.
             sendTwice(state);
@@ -345,17 +389,7 @@ private long Gms=0;
      * Result is written into `out` (out[0]=x, out[1]=y) to avoid allocation on the hot input path.
      */
     private static void applyRadialDeadzone(float rawX, float rawY, float deadzone, float curveExponent, float[] out) {
-        float magnitude = (float) Math.sqrt(rawX * rawX + rawY * rawY);
-        if (magnitude < deadzone || magnitude < 1e-6f) {
-            out[0] = 0f;
-            out[1] = 0f;
-            return;
-        }
-        float normalizedMag = Math.min(1f, (magnitude - deadzone) / (1f - deadzone));
-        float curvedMag = (curveExponent == 1.0f) ? normalizedMag : (float) Math.pow(normalizedMag, curveExponent);
-        float scale = curvedMag / magnitude; // reapply as a fraction of the ORIGINAL vector -> preserves angle exactly
-        out[0] = rawX * scale;
-        out[1] = rawY * scale;
+        InputMath.response(rawX, rawY, deadzone, curveExponent, 1f, out);
     }
 
     private static float clamp(float value) {
@@ -365,7 +399,7 @@ private long Gms=0;
     }
 
     public void setStickDeadzone(float deadzone) {
-        this.stickDeadzone = deadzone;
+        this.stickDeadzone = InputMath.leftDeadzone(deadzone);
     }
 
     public float getStickDeadzone() {
@@ -373,7 +407,7 @@ private long Gms=0;
     }
 
     public void setCameraSensitivity(float sensitivity) {
-        this.cameraSensitivity = sensitivity;
+        this.cameraSensitivity = InputMath.sensitivity(sensitivity);
     }
 
     public float getCameraSensitivity() {
@@ -441,6 +475,7 @@ private long Gms=0;
     }
 
     public void stop() {
+        releaseAll();
     }
 
     public void detectAxisLayout(InputDevice device) {

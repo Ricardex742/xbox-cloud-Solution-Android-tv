@@ -1,3 +1,11 @@
+(function forcePtBrLocale() {
+    try {
+        if (window.location && window.location.pathname && /^\/(fr-fr|en-us|es-es|fr)\b/i.test(window.location.pathname)) {
+            var newUrl = window.location.href.replace(/\/(fr-fr|en-us|es-es|fr)(?=\/|$)/i, '/pt-BR');
+            window.location.replace(newUrl);
+        }
+    } catch (e) {}
+})();
 "use strict";
 
 // Bridge for Native Android WebRTC
@@ -154,11 +162,13 @@ function getTargetRegion() {
 
 function getTargetResolution() {
     // Padrao configurado para 1080
-    return window.BX_TARGET_RES || localStorage.getItem('BX_TARGET_RES') || '1080';
+    return window.BX_TARGET_RES || localStorage.getItem('BX_TARGET_RES') || '1080HQ';
 }
 
 function getTargetBitrate() {
-    return window.BX_TARGET_BITRATE || parseInt(localStorage.getItem('BX_TARGET_BITRATE')) || 0;
+    const value = window.BX_TARGET_BITRATE ?? localStorage.getItem('BX_TARGET_BITRATE') ?? 20;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, Math.min(20, parsed)) : 20;
 }
 
 function getOsNameFromResolution(resolution) {
@@ -487,42 +497,6 @@ class Patcher {
     }
 }
 
-function patchSdpBitrate(sdp, videoBitrate) {
-    if (!videoBitrate) return sdp;
-
-    let lines = sdp.split('\r\n');
-    let newLines = [];
-    let inVideoSection = false;
-
-    for (let line of lines) {
-        newLines.push(line);
-        if (line.startsWith('m=video')) {
-            inVideoSection = true;
-        } else if (line.startsWith('m=')) {
-            inVideoSection = false;
-        }
-
-        if (inVideoSection && line.startsWith('c=IN')) {
-            newLines.push('b=AS:' + videoBitrate);
-        }
-    }
-    return newLines.join('\r\n');
-}
-
-function patchSdpFps(sdp, fps) {
-    let lines = sdp.split('\r\n');
-    for (let i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith('a=fmtp:')) {
-            if (!lines[i].includes('max-fr=')) {
-                lines[i] += ';max-fr=' + fps;
-            } else {
-                lines[i] = lines[i].replace(/max-fr=\d+/, 'max-fr=' + fps);
-            }
-        }
-    }
-    return lines.join('\r\n');
-}
-
 function patchRtcPeerConnection() {
     let OrgRTCPeerConnection = window.RTCPeerConnection;
 
@@ -553,6 +527,7 @@ function patchRtcPeerConnection() {
     };
 
     window.simulateOnTrack = function(kind, id) {
+        try { navigator.getGamepads = function() { return []; }; } catch (e) {}
         console.log("[BxC] Simulating lightweight ontrack for " + kind);
 
         let stream;
@@ -756,23 +731,11 @@ function patchRtcPeerConnection() {
             createOffer: function() {
                 return new Promise((resolve) => {
                     window.pendingOfferResolver = (offer) => {
-                        const bitrateMbps = getTargetBitrate();
-                        if (bitrateMbps > 0) {
-                            try {
-                                const bitrateKbps = bitrateMbps * 1000;
-                                offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);
-                                BxLogger.info("Patcher", "Applied bitrate patch:", bitrateMbps + " Mbps");
-                            } catch (e) {
-                                BxLogger.error("Patcher", "Bitrate patch failed", e);
-                            }
-                        }
-
-                        offer.sdp = patchSdpFps(offer.sdp, 60);
                         this.localDescription = offer;
                         resolve(offer);
                     };
                     if (window.AndroidBridge) {
-                        window.AndroidBridge.onOfferRequested();
+                        window.AndroidBridge.onOfferRequested(getTargetBitrate());
                     }
                 });
             },

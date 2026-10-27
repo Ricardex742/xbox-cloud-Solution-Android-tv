@@ -1,445 +1,50 @@
-name: Build CloudX Android TV APK
-
+name: Build and validate CloudX
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '21'
-
-    - name: Set up Gradle 8.13
-      uses: gradle/actions/setup-gradle@v4
-      with:
-        gradle-version: '8.13'
-
-    - name: Preparar Estrutura do Projeto
-      run: |
-        set -e
-        if [ ! -f "settings.gradle.kts" ]; then
-          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
-          if [ -n "$ZIP_FILE" ]; then
-            unzip -q -o "$ZIP_FILE"
-          fi
-        fi
-
-        if [ ! -f "settings.gradle.kts" ]; then
-          SUBDIR=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1 | xargs dirname 2>/dev/null || true)
-          if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
-            shopt -s dotglob
-            mv "$SUBDIR"/* . || true
-          fi
-        fi
-
-        rm -f gradle/gradle-daemon-jvm.properties
-        echo "" >> gradle.properties
-        echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
-
-        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
-
-    - name: Aplicar Correcoes de Controle (Forza Start / Gears Drift / Zero Delay Camera) e Video 1080HQ 20Mbps
-      run: |
-        python3 - << 'PYEOF'
-        import os, glob, base64, re
-
-        # 1. Reduzir PNGs pesados de splash
-        tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
-        for p in glob.glob("app/src/main/res/drawable*/splash_branding_*.png"):
-            with open(p, "wb") as f:
-                f.write(tiny_png)
-
-        # 2. Esvaziar web-rtc-stream.js redundante
-        unused_js = "app/src/main/assets/web-rtc-stream.js"
-        if os.path.exists(unused_js):
-            with open(unused_js, "w", encoding="utf-8") as f:
-                f.write("")
-
-        # 3. Desativar bloqueios de R8/Minify no build.gradle.kts
-        bg_kts = "app/build.gradle.kts"
-        if os.path.exists(bg_kts):
-            with open(bg_kts, "r", encoding="utf-8") as f:
-                kts = f.read()
-            kts = re.sub(r"isMinifyEnabled\s*=\s*true", "isMinifyEnabled = false", kts)
-            kts = re.sub(r"isShrinkResources\s*=\s*true", "isShrinkResources = false", kts)
-            with open(bg_kts, "w", encoding="utf-8") as f:
-                f.write(kts)
-
-        # 4. Otimizar index.js (1080HQ @ 20Mbps Baseline + Desativar Gamepad fantasma da WebView)
-        idx_path = "app/src/main/assets/index.js"
-        if os.path.exists(idx_path):
-            with open(idx_path, "r", encoding="utf-8") as f:
-                js = f.read()
-
-            js = js.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
-            js = js.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
-            js = js.replace("|| 'es'", "|| 'br'")
-            js = js.replace("|| '1080p'", "|| '1080HQ'")
-
-            js = js.replace("widthInPixels: 4096", "widthInPixels: 1920")
-            js = js.replace("heightInPixels: 2160", "heightInPixels: 1080")
-
-            js = js.replace("canvas.width = 1920;", "canvas.width = 2;")
-            js = js.replace("canvas.height = 1080;", "canvas.height = 2;")
-            js = js.replace("ctx.fillRect(0, 0, 1920, 1080);", "ctx.fillRect(0, 0, 2, 2);")
-            js = js.replace("canvas.captureStream(60)", "canvas.captureStream(1)")
-            js = js.replace("}, 3000);", "}, 300);")
-
-            sdp_stabilizer = "\n".join([
-                "function forceLowLatencyBaselineSdp(sdp, maxKbps) {",
-                "    let capKbps = (maxKbps && maxKbps > 0) ? Math.min(maxKbps, 22000) : 20000;",
-                "    let startKbps = Math.min(capKbps, 12000);",
-                "    let minKbps = 4000;",
-                "    let lines = sdp.split('\\r\\n');",
-                "    let out = [];",
-                "    let inVideo = false;",
-                "    for (let i = 0; i < lines.length; i++) {",
-                "        let line = lines[i];",
-                "        if (line.startsWith('m=video')) inVideo = true;",
-                "        else if (line.startsWith('m=')) inVideo = false;",
-                "        if (inVideo && line.startsWith('a=fmtp:')) {",
-                "            line = line.replace(/profile-level-id=64[0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
-                "            line = line.replace(/profile-level-id=4[dD][0-9a-fA-F]{4}/g, 'profile-level-id=42e01f');",
-                "            if (!line.includes('x-google-max-bitrate')) {",
-                "                line += ';x-google-max-bitrate=' + capKbps + ';x-google-min-bitrate=' + minKbps + ';x-google-start-bitrate=' + startKbps;",
-                "            }",
-                "        }",
-                "        out.push(line);",
-                "        if (inVideo && line.startsWith('c=IN')) {",
-                "            out.push('b=AS:' + capKbps);",
-                "        }",
-                "    }",
-                "    return out.join('\\r\\n');",
-                "}"
-            ])
-
-            if "forceLowLatencyBaselineSdp" not in js:
-                js = js + "\n" + sdp_stabilizer
-                js = js.replace(
-                    "offer.sdp = patchSdpFps(offer.sdp, 60);",
-                    "offer.sdp = patchSdpFps(offer.sdp, 60);\n                        offer.sdp = forceLowLatencyBaselineSdp(offer.sdp, getTargetBitrate() * 1000);"
-                )
-                js = js.replace("offer.sdp = patchSdpBitrate(offer.sdp, bitrateKbps);", "// bitrate aplicado em forceLowLatencyBaselineSdp")
-
-            if "navigator.getGamepads = function" not in js:
-                js = js.replace(
-                    "window.simulateOnTrack = function(kind, id) {",
-                    "window.simulateOnTrack = function(kind, id) {\n        try { navigator.getGamepads = function() { return []; }; } catch (e) {}"
-                )
-
-            pt_redirect = "\n".join([
-                "(function forcePtBrLocale() {",
-                "    try {",
-                "        if (window.location && window.location.pathname && /^\\/(fr-fr|en-us|es-es|fr)\\b/i.test(window.location.pathname)) {",
-                "            var newUrl = window.location.href.replace(/\\/(fr-fr|en-us|es-es|fr)(?=\\/|$)/i, '/pt-BR');",
-                "            window.location.replace(newUrl);",
-                "        }",
-                "    } catch (e) {}",
-                "})();"
-            ])
-            if "forcePtBrLocale" not in js:
-                js = pt_redirect + "\n" + js
-
-            with open(idx_path, "w", encoding="utf-8") as f:
-                f.write(js)
-
-        # 5. Patch cirurgico em GamepadTransitionFrame.java (Zero Delay na Camera + Fim do bloqueio de 0.1f)
-        gtf_java = "app/src/main/java/com/world/cloudxsolution/GamepadTransitionFrame.java"
-        if os.path.exists(gtf_java):
-            with open(gtf_java, "r", encoding="utf-8") as f:
-                gtf = f.read()
-            gtf = gtf.replace("Math.abs(axes[AXIS_LEFT_X]) > 0.1f", "Math.abs(axes[AXIS_LEFT_X]) > 0.001f")
-            gtf = gtf.replace("Math.abs(axes[AXIS_LEFT_Y]) > 0.1f", "Math.abs(axes[AXIS_LEFT_Y]) > 0.001f")
-            gtf = gtf.replace("Math.abs(axes[AXIS_RIGHT_X]) > 0.1f", "Math.abs(axes[AXIS_RIGHT_X]) > 0.0001f")
-            gtf = gtf.replace("Math.abs(axes[AXIS_RIGHT_Y]) > 0.1f", "Math.abs(axes[AXIS_RIGHT_Y]) > 0.0001f")
-            gtf = gtf.replace("axes[AXIS_LEFT_TRIGGER] > 0.05f", "axes[AXIS_LEFT_TRIGGER] > 0.01f")
-            gtf = gtf.replace("axes[AXIS_RIGHT_TRIGGER] > 0.05f", "axes[AXIS_RIGHT_TRIGGER] > 0.01f")
-            with open(gtf_java, "w", encoding="utf-8") as f:
-                f.write(gtf)
-
-        # 6. Patch cirurgico em UnreliableInputPacket.java (Garantir envio do 0.0f quando soltar o analogico)
-        uip_java = "app/src/main/java/com/world/cloudxsolution/UnreliableInputPacket.java"
-        if os.path.exists(uip_java):
-            with open(uip_java, "r", encoding="utf-8") as f:
-                uip = f.read()
-            uip = uip.replace(
-                "Math.abs(curr.axes[i] - prev.axes[i]) > 0.001f",
-                "(Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f || (curr.axes[i] == 0f && prev.axes[i] != 0f))"
-            )
-            with open(uip_java, "w", encoding="utf-8") as f:
-                f.write(uip)
-
-        # 7. Patch cirurgico em AndroidGamepadListener.java (Preservando 100% das assinaturas de metodos originais)
-        agl_java = "app/src/main/java/com/world/cloudxsolution/AndroidGamepadListener.java"
-        if os.path.exists(agl_java):
-            with open(agl_java, "r", encoding="utf-8") as f:
-                agl = f.read()
-
-            # A. Zero Deadzone (0.0f) no Analogico Direito (Camera)
-            agl = agl.replace(
-                "applyRadialDeadzone(rawRightX, rawRightY, stickDeadzone, rightStickCurveExponent, stickScratch);",
-                "applyRadialDeadzone(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, stickScratch);"
-            )
-            agl = agl.replace(
-                "computeStickResponse(rawRightX, rawRightY, stickDeadzone, rightStickCurveExponent, cameraSensitivity, stickScratch);",
-                "computeStickResponse(rawRightX, rawRightY, 0.0f, rightStickCurveExponent, cameraSensitivity, stickScratch);"
-            )
-
-            # B. Deadzone segura (minimo 0.15f) no Analogico Esquerdo para eliminar drift no Gears of War
-            agl = agl.replace(
-                "applyRadialDeadzone(rawLeftX, rawLeftY, stickDeadzone, 1.0f, stickScratch);",
-                "applyRadialDeadzone(rawLeftX, rawLeftY, Math.max(0.15f, stickDeadzone), 1.0f, stickScratch);"
-            )
-            agl = agl.replace(
-                "computeStickResponse(rawLeftX, rawLeftY, stickDeadzone, 1.0f, 1.0f, stickScratch);",
-                "computeStickResponse(rawLeftX, rawLeftY, Math.max(0.15f, stickDeadzone), 1.0f, 1.0f, stickScratch);"
-            )
-
-            # C. Consumir sempre L2/R2/Z/C no onKeyDown e onKeyUp para nao vazar para a WebView e nao apertar Start no Forza
-            agl = agl.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 1.0f;\n            sendReport(false);\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendReport(false); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
-            )
-            agl = agl.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 1.0f;\n            sendReport(false);\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendReport(false); } return true; }"
-            )
-            agl = agl.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 0f;\n            sendReport(false);\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_LEFT_TRIGGER] = 0f; sendReport(false); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
-            )
-            agl = agl.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 0f;\n            sendReport(false);\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { transitionFrame.axes[GamepadTransitionFrame.AXIS_RIGHT_TRIGGER] = 0f; sendReport(false); } return true; }"
-            )
-
-            # D. Garantir que hasChanges envie 0.0f quando o analogico zerar
-            agl = agl.replace(
-                "if (Math.abs(curr.axes[i] - prev.axes[i]) > 0.001f) return true;",
-                "if (Math.abs(curr.axes[i] - prev.axes[i]) > 0.0005f || (curr.axes[i] == 0f && prev.axes[i] != 0f)) return true;"
-            )
-
-            with open(agl_java, "w", encoding="utf-8") as f:
-                f.write(agl)
-
-        # 8. Patch cirurgico em AndroidControllerLe.java (Canal Classico: Zero deadzone na camera + bloqueio L2/R2/Z/C)
-        acle_java = "app/src/main/java/com/world/cloudxsolution/AndroidControllerLe.java"
-        if os.path.exists(acle_java):
-            with open(acle_java, "r", encoding="utf-8") as f:
-                acle = f.read()
-
-            acle = acle.replace(
-                "float rightX = applySensitivity(deadzone(event.getAxisValue(rightStickXAxis)));",
-                "float rightX = applySensitivity(event.getAxisValue(rightStickXAxis));"
-            )
-            acle = acle.replace(
-                "float rightY = applySensitivity(deadzone(event.getAxisValue(rightStickYAxis)));",
-                "float rightY = applySensitivity(event.getAxisValue(rightStickYAxis));"
-            )
-            acle = acle.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
-            )
-            acle = acle.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f;\n            sendIfChanged();\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 1.0f; sendIfChanged(); } return true; }"
-            )
-            acle = acle.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 && !leftTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) { if (!leftTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_LEFT_TRIGGER] = 0f; sendIfChanged(); } return true; }\n        if (keyCode == KeyEvent.KEYCODE_BUTTON_Z || keyCode == KeyEvent.KEYCODE_BUTTON_C) return true;"
-            )
-            acle = acle.replace(
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2 && !rightTriggerIsAnalog) {\n            frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f;\n            sendIfChanged();\n            return true;\n        }",
-                "if (keyCode == KeyEvent.KEYCODE_BUTTON_R2) { if (!rightTriggerIsAnalog) { frame.axes[GamepadFrame.AXIS_RIGHT_TRIGGER] = 0f; sendIfChanged(); } return true; }"
-            )
-
-            with open(acle_java, "w", encoding="utf-8") as f:
-                f.write(acle)
-
-        # 9. Atualizar MainActivity.java (1080HQ @ 20Mbps + PT-BR)
-        main_java = "app/src/main/java/com/world/cloudxsolution/MainActivity.java"
-        if os.path.exists(main_java):
-            with open(main_java, "r", encoding="utf-8") as f:
-                mj = f.read()
-
-            mj = mj.replace("https://www.xbox.com/fr-FR/play", "https://www.xbox.com/pt-BR/play")
-            mj = mj.replace("https://www.xbox.com/en-US/play", "https://www.xbox.com/pt-BR/play")
-            mj = mj.replace('prefs.getString(KEY_REGION, "us")', 'prefs.getString(KEY_REGION, "br")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "Auto")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
-            mj = mj.replace('prefs.getString(KEY_RESOLUTION, "1080")', 'prefs.getString(KEY_RESOLUTION, "1080HQ")')
-            mj = mj.replace('prefs.getInt(KEY_BITRATE, 0)', 'prefs.getInt(KEY_BITRATE, 20)')
-
-            mj = mj.replace('"Disable in game performance"', '"Ocultar desempenho no jogo"')
-            mj = mj.replace('"Show in game performance"', '"Mostrar desempenho no jogo"')
-            mj = mj.replace('"Microphone: Enabled"', '"Microfone: Ativado"')
-            mj = mj.replace('"Microphone: Disabled"', '"Microfone: Desativado"')
-
-            hook_target = "super.onPageStarted(view, url, favicon);"
-            redirect_hook = "\n".join([
-                "super.onPageStarted(view, url, favicon);",
-                "                if (url != null && (url.contains(\"/fr-FR\") || url.contains(\"/fr-fr\"))) {",
-                "                    view.stopLoading();",
-                "                    view.loadUrl(url.replace(\"/fr-FR\", \"/pt-BR\").replace(\"/fr-fr\", \"/pt-BR\"));",
-                "                    return;",
-                "                }"
-            ])
-            if 'url.contains("/fr-FR")' not in mj and hook_target in mj:
-                mj = mj.replace(hook_target, redirect_hook, 1)
-
-            old_toast = "\n".join([
-                "    public void showCustomToast(final String message) {",
-                "        runOnUiThread(() -> {",
-                "            if(message.isEmpty() || !debug && message.startsWith(\"[debug]\")){return;}"
-            ])
-            new_toast = "\n".join([
-                "    public void showCustomToast(final String message) {",
-                "        if (message == null || message.isEmpty() || (!debug && message.startsWith(\"[debug]\"))) { return; }",
-                "        runOnUiThread(() -> {"
-            ])
-            mj = mj.replace(old_toast, new_toast)
-
-            mj = mj.replace(
-                "Integer[] bitrateValues = {0, 5, 10, 15, 20, 30, 40, 50};",
-                "Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};"
-            )
-            mj = mj.replace(
-                'String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};',
-                'String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Qualidade Máxima)"};'
-            )
-
-            with open(main_java, "w", encoding="utf-8") as f:
-                f.write(mj)
-
-        # 10. Corrigir WebRtcReceiver.java: Chamar setVideoCodecPreferences ANTES do Offer
-        rtc_java = "app/src/main/java/com/world/cloudxsolution/WebRtcReceiver.java"
-        if os.path.exists(rtc_java):
-            with open(rtc_java, "r", encoding="utf-8") as f:
-                rj = f.read()
-
-            rj = rj.replace(".setEnableInternalTracer(true)", ".setEnableInternalTracer(false)")
-            rj = rj.replace('if (p.startsWith("6400")) return 3;', 'if (p.startsWith("6400")) return 0;')
-            rj = rj.replace('if (p.startsWith("4d00")) return 2;', 'if (p.startsWith("4d00")) return 1;')
-            rj = rj.replace('if (p.startsWith("42e0")) return 1;', 'if (p.startsWith("42e0")) return 4;')
-            rj = rj.replace('if (p.startsWith("4200")) return 0;', 'if (p.startsWith("4200")) return 3;')
-
-            transceiver_target = "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));"
-            transceiver_fix = "\n".join([
-                "RtpTransceiver transceiver = peerConnection.addTransceiver(mediaType, new RtpTransceiver.RtpTransceiverInit(transceiverDirection));",
-                "        if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {",
-                "            setVideoCodecPreferences(transceiver);",
-                "        }"
-            ])
-            if "if (mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)" not in rj and transceiver_target in rj:
-                rj = rj.replace(transceiver_target, transceiver_fix, 1)
-
-            with open(rtc_java, "w", encoding="utf-8") as f:
-                f.write(rj)
-
-        # 11. Traduzir todos os botoes dos layouts XML
-        replacements = {
-            "Exit Game": "Sair do Jogo",
-            "Exit the game": "Sair do Jogo",
-            "Controller Settings": "Configurações do Controle",
-            "Gamepad Settings": "Configurações do Controle",
-            "App Settings": "Configurações do App (Vídeo/Região)",
-            "Reload Xbox": "Recarregar Catálogo Xbox",
-            "Show in game performance": "Mostrar Desempenho no Jogo",
-            "Disable in game performance": "Ocultar Desempenho no Jogo",
-            "Open Nexus": "Botão Xbox (Guia Nexus)",
-            "Open Xbox Menu": "Botão Xbox (Guia Nexus)",
-            "Microphone: Disabled": "Microfone: Desativado",
-            "Microphone: Enabled": "Microfone: Ativado",
-            "Close Menu": "Fechar Menu",
-            "Close": "Fechar",
-            "Cancel": "Cancelar",
-            "Apply": "Aplicar",
-            "Submit": "Confirmar",
-            "Start Testing": "Testar Analógicos",
-            "Stop Testing": "Parar Teste",
-            "Use Unreliable Input": "Modo de Baixa Latência (Unreliable Input)",
-            "Unreliable Input (Low Latency)": "Modo de Baixa Latência (Unreliable Input)",
-            "Target Region": "Região do Servidor",
-            "Target Resolution": "Resolução Alvo",
-            "Target Bitrate": "Taxa de Bits (Bitrate Alvo)",
-            "User-Agent": "Perfil de Dispositivo (User-Agent)",
-            "Don't show again": "Não mostrar novamente",
-            "Got it": "Entendi"
-        }
-
-        xml_files = glob.glob("app/src/main/res/layout/*.xml") + glob.glob("app/src/main/res/values/*.xml")
-        for xml_path in xml_files:
-            try:
-                with open(xml_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                orig = content
-                for en_txt, pt_txt in replacements.items():
-                    content = content.replace(f'"{en_txt}"', f'"{pt_txt}"')
-                    content = content.replace(f'>{en_txt}<', f'>{pt_txt}<')
-                if content != orig:
-                    with open(xml_path, "w", encoding="utf-8") as f:
-                        f.write(content)
-            except Exception:
-                pass
-
-        # 12. Garantir extractNativeLibs="true" no AndroidManifest.xml
-        man_path = "app/src/main/AndroidManifest.xml"
-        if os.path.exists(man_path):
-            with open(man_path, "r", encoding="utf-8") as f:
-                man = f.read()
-            if 'android:extractNativeLibs="false"' in man:
-                man = man.replace('android:extractNativeLibs="false"', 'android:extractNativeLibs="true"')
-            elif 'android:extractNativeLibs' not in man:
-                man = man.replace('<application', '<application android:extractNativeLibs="true"')
-            with open(man_path, "w", encoding="utf-8") as f:
-                f.write(man)
-        PYEOF
-
-    - name: Compilar APK com Gradle 8.13
-      run: |
-        gradle assembleRelease -x lint -x test --no-configuration-cache || gradle assembleDebug -x lint -x test --no-configuration-cache
-
-    - name: Assinar e Gerar APKs Ultra-Leves (32-bit TV, 64-bit e Universal sem x86)
-      run: |
-        set +e
-        BT_DIR=$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
-        BT="$ANDROID_HOME/build-tools/$BT_DIR"
-        KS="/tmp/cloudx.keystore"
-        rm -f "$KS"
-        keytool -genkeypair -v -keystore "$KS" -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=BR"
-
-        RAW_APK=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
-        mkdir -p dist_apks
-
-        if [ -f "$RAW_APK" ]; then
-          cp "$RAW_APK" "dist_apks/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk"
-          cp "$RAW_APK" "dist_apks/CloudX-UltraLeve-64bit-arm64-v8a.apk"
-          cp "$RAW_APK" "dist_apks/CloudX-Universal-ARM.apk"
-
-          zip -q -d "dist_apks/CloudX-Universal-ARM.apk" "lib/x86/*" "lib/x86_64/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" 2>/dev/null || true
-          zip -q -d "dist_apks/CloudX-TV-UltraLeve-32bit-armeabi-v7a.apk" "lib/x86/*" "lib/x86_64/*" "lib/arm64-v8a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" 2>/dev/null || true
-          zip -q -d "dist_apks/CloudX-UltraLeve-64bit-arm64-v8a.apk" "lib/x86/*" "lib/x86_64/*" "lib/armeabi-v7a/*" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" 2>/dev/null || true
-
-          for apk in dist_apks/*.apk; do
-            "$BT/zipalign" -f -p 4 "$apk" "${apk}.aligned" && mv "${apk}.aligned" "$apk"
-            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android "$apk"
-            rm -f "${apk}.idsig"
-            echo "APK Pronto: $(basename "$apk") -> $(du -h "$apk" | cut -f1)"
-          done
-        fi
-        exit 0
-
-    - name: Upload APK artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: CloudX-AndroidTV-PTBR-APK
-        path: dist_apks/*.apk
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install pinned SDK packages
+        run: sdkmanager 'platforms;android-34' 'build-tools;35.0.0'
+      - name: Test, lint and build
+        run: ./gradlew --no-daemon --no-configuration-cache --max-workers=2 testDebugUnitTest lintDebug assembleDebug assembleRelease
+      - name: Sign verified ARM artifacts
+        if: github.event_name != 'pull_request'
+        env:
+          CLOUDX_KEYSTORE_BASE64: ${{ secrets.CLOUDX_KEYSTORE_BASE64 }}
+          CLOUDX_KEY_ALIAS: ${{ secrets.CLOUDX_KEY_ALIAS }}
+          CLOUDX_STORE_PASSWORD: ${{ secrets.CLOUDX_STORE_PASSWORD }}
+          CLOUDX_KEY_PASSWORD: ${{ secrets.CLOUDX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDX_KEYSTORE_BASE64:?Configure persistent signing secrets}"
+          export CLOUDX_KEYSTORE="$RUNNER_TEMP/cloudx-signing.jks"
+          trap 'rm -f "$CLOUDX_KEYSTORE"' EXIT
+          printf '%s' "$CLOUDX_KEYSTORE_BASE64" | base64 --decode > "$CLOUDX_KEYSTORE"
+          bash scripts/package-apks.sh
+          git rev-parse HEAD > dist_apks/COMMIT
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: CloudX-AndroidTV-ARM
+          path: dist_apks/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-reports
+          path: app/build/reports/
+          if-no-files-found: error

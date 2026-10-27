@@ -248,8 +248,8 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void createOffer() {
-            webRtcReceiver.createOffer(offer ->
+        public void createOffer(int bitrateKbps) {
+            webRtcReceiver.createOffer(bitrateKbps, offer ->
                     broadcast(cb -> safe(() -> cb.onOfferReady(offer.description))));
         }
 

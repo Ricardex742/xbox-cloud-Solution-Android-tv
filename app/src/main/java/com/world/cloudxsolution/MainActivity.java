@@ -153,7 +153,7 @@ public class MainActivity extends AppCompatActivity {
         @Override public void onIceGatheringChange(String state) {
             runOnUiThread(() -> {
                 if (webView == null) return;
-                String stateStr = state.toLowerCase();
+                String stateStr = state.toLowerCase(Locale.ROOT);
                 String script = "if (window.handleIceGatheringState) { window.handleIceGatheringState('" + stateStr + "'); }";
                 webView.evaluateJavascript(script, null);
             });
@@ -183,7 +183,7 @@ public class MainActivity extends AppCompatActivity {
                 if (legacyInputChannel != null) {
                     legacyInputChannel.onResolutionChange(w, h);
                 }
-                showCustomToast("Session Active: " + w + "x" + h);
+                showCustomToast("Sessão ativa: " + w + "x" + h);
                 if (webView != null) {
                     webView.setVisibility(View.INVISIBLE);
                 }
@@ -202,7 +202,7 @@ public class MainActivity extends AppCompatActivity {
 
             });
         }
-        @Override public void showToast(String message) { runOnUiThread(() -> showCustomToast(message)); }
+        @Override public void showToast(String message) { showCustomToast(message); }
         @Override public void onStreamingStateChanged(boolean streaming) {
             runOnUiThread(() -> setStreamingState(streaming));
         }
@@ -455,9 +455,9 @@ public class MainActivity extends AppCompatActivity {
                 view.evaluateJavascript(viewportJs, null);
 
                 android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-                String region = prefs.getString(KEY_REGION, "us");
-                String resolution = prefs.getString(KEY_RESOLUTION, "Auto");
-                int bitrate = prefs.getInt(KEY_BITRATE, 0); // 0 means Auto
+                String region = prefs.getString(KEY_REGION, "br");
+                String resolution = prefs.getString(KEY_RESOLUTION, "1080HQ");
+                int bitrate = prefs.getInt(KEY_BITRATE, 20); // 0 means Auto
                 boolean useUnreliable = prefs.getBoolean(KEY_USE_UNRELIABLE_INPUT, true);
 
                 @SuppressLint("DefaultLocale") String initJs = String.format("window.BX_TARGET_REGION = '%s'; window.BX_TARGET_RES = '%s'; window.BX_TARGET_BITRATE = %d; window.BX_USE_UNRELIABLE_INPUT = %b;",
@@ -484,6 +484,11 @@ public class MainActivity extends AppCompatActivity {
                 }
                 view.setVisibility(WebView.GONE);
                 super.onPageStarted(view, url, favicon);
+                if (url != null && (url.contains("/fr-FR") || url.contains("/fr-fr"))) {
+                    view.stopLoading();
+                    view.loadUrl(url.replace("/fr-FR", "/pt-BR").replace("/fr-fr", "/pt-BR"));
+                    return;
+                }
                 Log.i(TAG, "Page started: " + url);
                 if (webView != null && webView.getWebChromeClient() instanceof CustomWebChromeClient) {
                     ((CustomWebChromeClient) webView.getWebChromeClient()).resetInjection();
@@ -508,6 +513,7 @@ public class MainActivity extends AppCompatActivity {
     }
 private boolean debug=false;
     public void showCustomToast(final String message) {
+        if (message == null || message.isEmpty() || (!debug && message.startsWith("[debug]"))) return;
         runOnUiThread(() -> {
             if(message.isEmpty()){return;}
             if(!debug&&message.startsWith("[debug]")){return;}
@@ -567,7 +573,7 @@ private boolean debug=false;
                     webView.restoreState(webViewState);
                     if(webView.canGoBack()){webView.goBack();}
                 } else {
-                    webView.loadUrl("https://www.xbox.com/fr-FR/play");
+                    webView.loadUrl("https://www.xbox.com/pt-BR/play");
                 }
             }
             webView.setVisibility(WebView.VISIBLE);
@@ -929,7 +935,7 @@ private boolean debug=false;
             if (newProgress > 30 && !isScriptInjected && view.getUrl() != null && view.getUrl().contains("play")) {
                 isScriptInjected = true;
 
-                view.evaluateJavascript(loadScriptFromAssets(), null);
+                view.evaluateJavascript(webConfigurationScript() + loadScriptFromAssets(), null);
             }
         }
 
@@ -938,6 +944,14 @@ private boolean debug=false;
             Log.d(TAG, "WebView Console: " + consoleMessage.message());
             return true;
         }
+    }
+
+    private String webConfigurationScript() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        return "window.BX_TARGET_REGION=" + org.json.JSONObject.quote(prefs.getString(KEY_REGION, "br"))
+                + ";window.BX_TARGET_RES=" + org.json.JSONObject.quote(prefs.getString(KEY_RESOLUTION, "1080HQ"))
+                + ";window.BX_TARGET_BITRATE=" + prefs.getInt(KEY_BITRATE, 20)
+                + ";window.BX_USE_UNRELIABLE_INPUT=" + prefs.getBoolean(KEY_USE_UNRELIABLE_INPUT, true) + ";\n";
     }
 
     private String loadScriptFromAssets() {
@@ -981,7 +995,7 @@ private boolean debug=false;
         try {
             if (streamingService != null) micCurrentlyEnabled = streamingService.isMicrophoneEnabled();
         } catch (RemoteException ignored) {}
-        btnMic.setText(micCurrentlyEnabled ? "Microphone: Enabled" : "Microphone: Disabled");
+        btnMic.setText(micCurrentlyEnabled ? "Microfone: Ativado" : "Microfone: Desativado");
 
         btnMic.setOnClickListener(v -> {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -994,14 +1008,14 @@ private boolean debug=false;
                 if (streamingService != null) {
                     boolean newState = !streamingService.isMicrophoneEnabled();
                     streamingService.setMicrophoneEnabled(newState);
-                    btnMic.setText(newState ? "Microphone: Enabled" : "Microphone: Disabled");
-                    showCustomToast(newState ? "Microphone enabled" : "Microphone muted");
+                    btnMic.setText(newState ? "Microfone: Ativado" : "Microfone: Desativado");
+                    showCustomToast(newState ? "Microfone ativado" : "Microfone desativado");
                 }
             } catch (RemoteException e) {
                 Log.e(TAG, "Failed to toggle mic", e);
             }
         });
-        btnPerformanceToggle.setText(isPerformanceOverlayVisible ? "Disable in game performance" : "Show in game performance");
+        btnPerformanceToggle.setText(isPerformanceOverlayVisible ? "Ocultar desempenho no jogo" : "Mostrar desempenho no jogo");
         btnPerformanceToggle.setOnClickListener(v -> {
             isPerformanceOverlayVisible = !isPerformanceOverlayVisible;
             if (isPerformanceOverlayVisible) {
@@ -1151,8 +1165,9 @@ private boolean debug=false;
             btnStartTesting = findViewById(R.id.btn_start_testing);
 
             btnStartTesting.setOnClickListener(v -> {
+                if (controllerLe != null) controllerLe.releaseAll();
                 testingActive = !testingActive;
-                btnStartTesting.setText(testingActive ? "Stop Testing" : "Start Testing");
+                btnStartTesting.setText(testingActive ? "Encerrar teste" : "Testar analógicos");
                 if (gamepadListener != null) {
                     gamepadListener.setTestModeActive(testingActive);
                 }
@@ -1168,11 +1183,11 @@ private boolean debug=false;
                 float currentDeadzone = gamepadListener.getStickDeadzone();
                 float currentSensitivity = gamepadListener.getCameraSensitivity();
                 sbDeadzone.setProgress((int) (currentDeadzone * 100));
-                tvDeadzone.setText(String.format("Stick Deadzone: %.2f", currentDeadzone));
+                tvDeadzone.setText(String.format(Locale.getDefault(), "Zona morta esquerda: %.2f", currentDeadzone));
                 stickTestLeft.setDeadzone(currentDeadzone);
                 stickTestRight.setDeadzone(currentDeadzone);
                 sbSensitivity.setProgress((int) (currentSensitivity * 10));
-                tvSensitivity.setText(String.format("Camera Sensitivity: %.1f", currentSensitivity));
+                tvSensitivity.setText(String.format(Locale.getDefault(), "Sensibilidade da câmera: %.1f", currentSensitivity));
 
                 SharedPreferences gpPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
                 swUnreliableInput.setChecked(gpPrefs.getBoolean(KEY_USE_UNRELIABLE_INPUT, true));
@@ -1182,7 +1197,7 @@ private boolean debug=false;
                 @Override
                 public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                     float deadzone = progress / 100.0f;
-                    tvDeadzone.setText(String.format("Stick Deadzone: %.2f", deadzone));
+                    tvDeadzone.setText(String.format(Locale.getDefault(), "Zona morta esquerda: %.2f", deadzone));
                     stickTestLeft.setDeadzone(deadzone);
                     stickTestRight.setDeadzone(deadzone);
                 }
@@ -1193,7 +1208,7 @@ private boolean debug=false;
             sbSensitivity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                 @Override
                 public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                    tvSensitivity.setText(String.format("Camera Sensitivity: %.1f", progress / 10.0f));
+                    tvSensitivity.setText(String.format(Locale.getDefault(), "Sensibilidade da câmera: %.1f", progress / 10.0f));
                 }
                 @Override public void onStartTrackingTouch(SeekBar seekBar) {}
                 @Override public void onStopTrackingTouch(SeekBar seekBar) {}
@@ -1202,7 +1217,7 @@ private boolean debug=false;
             btnCancel.setOnClickListener(v -> dismiss());
 
             btnApply.setOnClickListener(v -> {
-                float newDeadzone = sbDeadzone.getProgress() / 100.0f;
+                float newDeadzone = InputMath.leftDeadzone(sbDeadzone.getProgress() / 100.0f);
                 float newSensitivity = sbSensitivity.getProgress() / 10.0f;
                 boolean useUnreliable = swUnreliableInput.isChecked();
 
@@ -1221,6 +1236,8 @@ private boolean debug=false;
                 editor.putBoolean(KEY_USE_UNRELIABLE_INPUT, useUnreliable);
                 editor.apply();
 
+                if (gamepadListener != null) gamepadListener.releaseAll();
+                if (controllerLe != null) controllerLe.releaseAll();
                 activeInputChannel = useUnreliable ? "unreliableinput" : "input";
                 if (webView != null) {
                     webView.evaluateJavascript("if (window.setUseUnreliableInput) { window.setUseUnreliableInput(" + useUnreliable + "); }", null);
@@ -1240,6 +1257,8 @@ private boolean debug=false;
         @Override
         public void dismiss() {
             testingActive = false;
+            if (gamepadListener != null) gamepadListener.setTestModeActive(false);
+            if (controllerLe != null) controllerLe.releaseAll();
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 Objects.requireNonNull(getWindow()).getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
             }
@@ -1286,11 +1305,11 @@ private boolean debug=false;
 
             // Left stick: deadzone only, no camera sensitivity (matches the real input path).
             AndroidGamepadListener.computeStickResponse(
-                    rawLeftX, rawLeftY, liveDeadzone, 1.0f, 1.0f, leftProcessed);
+                    rawLeftX, rawLeftY, InputMath.leftDeadzone(liveDeadzone), 1.0f, 1.0f, leftProcessed);
 
             // Right stick: deadzone + curve + the sensitivity value currently on the slider.
             AndroidGamepadListener.computeStickResponse(
-                    rawRightX, rawRightY, liveDeadzone, curveExponent, liveSensitivity, rightProcessed);
+                    rawRightX, rawRightY, 0f, curveExponent, liveSensitivity, rightProcessed);
 
             stickTestLeft.setPositions(rawLeftX, rawLeftY, leftProcessed[0], leftProcessed[1]);
             stickTestRight.setPositions(rawRightX, rawRightY, rightProcessed[0], rightProcessed[1]);
@@ -1321,7 +1340,7 @@ private boolean debug=false;
 
         // Region options
         String[] regions = {"us", "br", "kr", "jp", "pl", "es", "uk", "fr"};
-        String[] regionLabels = {"United States", "Brazil", "Korea", "Japan", "Poland", "Spain", "United Kingdom", "France"};
+        String[] regionLabels = {"Estados Unidos", "Brasil", "Coreia do Sul", "Japão", "Polônia", "Espanha", "Reino Unido", "França"};
         android.widget.ArrayAdapter<String> regionAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, regionLabels);
         regionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerRegion.setAdapter(regionAdapter);
@@ -1333,24 +1352,24 @@ private boolean debug=false;
         spinnerRes.setAdapter(resAdapter);
 
         // Bitrate options
-        Integer[] bitrateValues = {0, 5, 10, 15, 20, 30, 40, 50};
-        String[] bitrateLabels = {"Auto", "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "30 Mbps", "40 Mbps", "50 Mbps"};
+        Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};
+        String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Qualidade Máxima)"};
         android.widget.ArrayAdapter<String> bitrateAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bitrateLabels);
         bitrateAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerBitrate.setAdapter(bitrateAdapter);
 
         // User Agent options
         String[] uaKeys = {"default", "edge", "chrome", "tizen", "android_tv", "fire_tv", "xbox", "ps5", "android_mobile", "ios", "mac"};
-        String[] uaLabels = {"Default", "Edge (Desktop)", "Chrome (Desktop)", "Samsung TV (Tizen)", "Android TV", "Fire TV", "Xbox", "PlayStation 5", "Android Mobile", "iOS Phone", "macOS (Safari)"};
+        String[] uaLabels = {"Padrão", "Edge (Desktop)", "Chrome (Desktop)", "Samsung TV (Tizen)", "Android TV", "Fire TV", "Xbox", "PlayStation 5", "Android Mobile", "iOS Phone", "macOS (Safari)"};
         android.widget.ArrayAdapter<String> uaAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, uaLabels);
         uaAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerUA.setAdapter(uaAdapter);
 
         // Load current selection
         android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String currentRegion = prefs.getString(KEY_REGION, "us");
-        String currentRes = prefs.getString(KEY_RESOLUTION, "1080");
-        int currentBitrate = prefs.getInt(KEY_BITRATE, 0);
+        String currentRegion = prefs.getString(KEY_REGION, "br");
+        String currentRes = prefs.getString(KEY_RESOLUTION, "1080HQ");
+        int currentBitrate = prefs.getInt(KEY_BITRATE, 20);
         String currentUA = prefs.getString(KEY_USER_AGENT, "default");
         int currentScale = prefs.getInt(KEY_INITIAL_SCALE, 0);
 
@@ -1380,12 +1399,12 @@ private boolean debug=false;
         }
 
         sbScale.setProgress(currentScale);
-        tvScale.setText(currentScale == 0 ? "WebView Initial Scale: Auto" : "WebView Initial Scale: " + currentScale + "%");
+        tvScale.setText(currentScale == 0 ? "Escala inicial: automática" : "Escala inicial: " + currentScale + "%");
 
         sbScale.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                tvScale.setText(progress == 0 ? "WebView Initial Scale: Auto" : "WebView Initial Scale: " + progress + "%");
+                tvScale.setText(progress == 0 ? "Escala inicial: automática" : "Escala inicial: " + progress + "%");
                 webView.setInitialScale(progress);
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
@@ -1424,17 +1443,17 @@ private boolean debug=false;
                     if (uaChanged) {
                         String uaString = USER_AGENTS.get(selectedUA);
                         webView.getSettings().setUserAgentString(uaString);
-                        showCustomToast("User-Agent changed. Reloading...");
+                        showCustomToast("Perfil do navegador alterado. Recarregando...");
                         closeWebview();
                         showWebview();
                     } else {
                         webView.setInitialScale(selectedScale);
 
-                        showCustomToast("Scale changed.");
+                        showCustomToast("Escala alterada.");
                     }
 
                 } else {
-                    showCustomToast("Settings applied.");
+                    showCustomToast("Configurações aplicadas.");
                 }
             }
             dialog.dismiss();

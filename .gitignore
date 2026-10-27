@@ -30,3 +30,6 @@ keystore.properties
 # Project specific
 .artifacts/
 /app/libs/webrtc-modified.aar
+
+!gradle/wrapper/gradle-wrapper.jar
+/dist_apks/

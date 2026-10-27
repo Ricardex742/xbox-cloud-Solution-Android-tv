@@ -83,8 +83,8 @@ android {
         applicationId = "com.world.cloudxsolution"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = providers.environmentVariable("GITHUB_RUN_NUMBER").orElse("1").get().toInt() + 1
+        versionName = "1.1.$versionCode"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -101,7 +101,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            // Release is signed once, after ABI filtering, with the persistent CI key.
         }
     }
 

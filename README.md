@@ -63,3 +63,13 @@ Distributed under the **MIT License**. See `LICENSE` for more information.
 *Note: Tested on Mi Box TV.*
 
 *Disclaimer: This project is not affiliated with, endorsed by, or sponsored by Microsoft or Xbox.*
+
+## Desenvolvimento e validação
+
+Use JDK 17, Android SDK 34 e Build Tools 35.0.0. O wrapper incluído fixa Gradle 8.13 e verifica o checksum da distribuição. Java 17 atende ao AGP e ao daemon fixado no projeto; o código continua com compatibilidade Java 11.
+
+```bash
+./gradlew --no-configuration-cache testDebugUnitTest lintDebug assembleDebug assembleRelease
+```
+
+A release é gerada sem assinatura para receber a chave persistente após separar os ABIs. O workflow não modifica fontes nem substitui release por debug silenciosamente. Consulte [plano, assinatura e validação na TV](docs/PLANO-E-VALIDACAO.md).

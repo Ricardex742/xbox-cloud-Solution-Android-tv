@@ -21,7 +21,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="APP SETTINGS"
+            android:text="CONFIGURAÇÕES DO APLICATIVO"
             android:textColor="@color/selector_text_xbox"
             android:textSize="16sp"
             android:textStyle="bold"
@@ -31,7 +31,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Server Region"
+        android:text="Região do servidor"
         android:textColor="@color/xbox_text_primary"
         android:textSize="12sp"
         android:layout_marginBottom="4dp"/>
@@ -47,7 +47,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Stream Resolution"
+        android:text="Resolução do vídeo"
         android:textColor="@color/xbox_text_primary"
         android:textSize="12sp"
         android:layout_marginBottom="4dp"/>
@@ -63,7 +63,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Maximum Bitrate"
+        android:text="Taxa máxima de vídeo"
         android:textColor="@color/xbox_text_primary"
         android:textSize="12sp"
         android:layout_marginBottom="4dp"/>
@@ -79,7 +79,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="User Agent"
+        android:text="Perfil do navegador"
         android:textColor="@color/xbox_text_primary"
         android:textSize="12sp"
         android:layout_marginBottom="4dp"/>
@@ -96,7 +96,7 @@
         android:id="@+id/tv_initial_scale"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="WebView Initial Scale: Auto"
+        android:text="Escala inicial: automática"
         android:textColor="@color/xbox_text_primary"
         android:textSize="12sp"
         android:layout_marginBottom="4dp"/>
@@ -124,7 +124,7 @@
             android:id="@+id/btn_cancel"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Cancel"
+            android:text="Cancelar"
             android:textColor="@color/selector_text_xbox"
             android:background="@drawable/selector_button_xbox"
             android:paddingStart="20dp"
@@ -136,7 +136,7 @@
             android:id="@+id/btn_apply"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Apply"
+            android:text="Aplicar"
             android:textColor="@color/selector_text_xbox"
             android:background="@drawable/selector_button_xbox"
             android:paddingStart="20dp"

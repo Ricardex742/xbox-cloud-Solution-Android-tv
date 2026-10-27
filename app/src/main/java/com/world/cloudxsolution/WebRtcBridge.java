@@ -41,7 +41,7 @@ public class WebRtcBridge {
                     Log.i(TAG, "Keep-alive success");
                     if (!firstKeepAliveSuccess) {
                         firstKeepAliveSuccess = true;
-                        activity.showCustomToast("Experience boosting...");
+                        activity.showCustomToast("Preparando a sessão...");
                         activity.closeWebview();
                     }
                     keepAliveHandler.postDelayed(keepAliveRunnable, 60000);
@@ -88,11 +88,11 @@ public class WebRtcBridge {
     }
 
     @JavascriptInterface
-    public void onOfferRequested() {
+    public void onOfferRequested(int bitrateMbps) {
         activity.runOnUiThread(() -> {
             IStreamingService s = service();
             if (s == null) return;
-            try { s.createOffer(); } catch (Exception e) { Log.e(TAG, "createOffer", e); }
+            try { s.createOffer(Math.max(0, Math.min(20, bitrateMbps)) * 1000); } catch (Exception e) { Log.e(TAG, "createOffer", e); }
         });
     }
 
@@ -127,7 +127,7 @@ public class WebRtcBridge {
     @JavascriptInterface
     public void gamepadIndex(int idx) {
         activity.runOnUiThread(() -> activity.setGamepadIndex(idx));
-        activity.showCustomToast("gamepadIndex: " + idx);
+        activity.showCustomToast("Índice do controle: " + idx);
     }
 
     @JavascriptInterface
@@ -155,7 +155,7 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void setGamepadSettings(float deadzone, float sensitivity) {
-        activity.showCustomToast("Gamepad: deadzone=" + deadzone + ", sensitivity=" + sensitivity);
+        activity.showCustomToast("Controle: zona morta=" + deadzone + ", sensibilidade=" + sensitivity);
         activity.runOnUiThread(() -> activity.updateGamepadSettings(deadzone, sensitivity));
     }
 
