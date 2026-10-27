@@ -34,7 +34,14 @@ jobs:
           CLOUDX_KEY_PASSWORD: ${{ secrets.CLOUDX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          : "${CLOUDX_KEYSTORE_BASE64:?Configure persistent signing secrets}"
+          missing=0
+          for required_secret in CLOUDX_KEYSTORE_BASE64 CLOUDX_KEY_ALIAS CLOUDX_STORE_PASSWORD CLOUDX_KEY_PASSWORD; do
+            if [[ -z "${!required_secret}" ]]; then
+              echo "::error::Missing repository secret: $required_secret"
+              missing=1
+            fi
+          done
+          if (( missing )); then exit 1; fi
           export CLOUDX_KEYSTORE="$RUNNER_TEMP/cloudx-signing.jks"
           trap 'rm -f "$CLOUDX_KEYSTORE"' EXIT
           printf '%s' "$CLOUDX_KEYSTORE_BASE64" | base64 --decode > "$CLOUDX_KEYSTORE"
