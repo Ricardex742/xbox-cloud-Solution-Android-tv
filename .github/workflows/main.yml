@@ -15,10 +15,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
       - name: Install pinned SDK packages
-        run: sdkmanager 'platforms;android-34' 'build-tools;35.0.0'
+        run: |
+          set -euo pipefail
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          # Reuse the hosted SDK; newer command-line tools need Java 21.
+          JAVA_HOME="$JAVA_HOME_21_X64" "$sdkmanager" 'platforms;android-34' 'build-tools;35.0.0'
       - name: Test, lint and build
         run: ./gradlew --no-daemon --no-configuration-cache --max-workers=2 testDebugUnitTest lintDebug assembleDebug assembleRelease
       - name: Sign verified ARM artifacts
@@ -43,7 +47,7 @@ jobs:
           path: dist_apks/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && hashFiles('app/build/reports/**/*') != ''
         with:
           name: validation-reports
           path: app/build/reports/
