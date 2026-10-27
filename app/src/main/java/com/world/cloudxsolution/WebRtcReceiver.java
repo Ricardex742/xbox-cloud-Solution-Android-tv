@@ -9,7 +9,7 @@ import org.json.JSONObject;
 import org.webrtc.BuiltinAudioDecoderFactoryFactory;
 import org.webrtc.BuiltinAudioEncoderFactoryFactory;
 import org.webrtc.DataChannel;
-import org.webrtc.DefaultVideoDecoderFactory;
+import org.webrtc.CapabilityVideoDecoderFactory;
 import org.webrtc.DefaultVideoEncoderFactory;
 import org.webrtc.EglBase;
 import org.webrtc.IceCandidate;
@@ -55,8 +55,9 @@ public class WebRtcReceiver implements Loggable {
     private boolean isReleased = false;
 
     private boolean codecLogged = false;
-    private boolean preferHighProfile;
-    private final java.util.Set<String> hardwareH264Profiles = new java.util.HashSet<>();
+    private volatile boolean preferHighProfile;
+    private volatile boolean hardwareHighAvailable;
+    private volatile boolean highOffered;
     private final VideoStatsSampler videoStatsSampler = new VideoStatsSampler();
     private final android.os.Handler statsHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private boolean statsPending;
@@ -134,17 +135,9 @@ public class WebRtcReceiver implements Loggable {
 
         DefaultVideoEncoderFactory encoderFactory =
                 new DefaultVideoEncoderFactory(eglBase.getEglBaseContext(), true, true);
-        DefaultVideoDecoderFactory decoderFactory =
-                new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());
-
-        hardwareH264Profiles.clear();
-        for (org.webrtc.VideoCodecInfo codec : new org.webrtc.HardwareVideoDecoderFactory(
-                eglBase.getEglBaseContext()).getSupportedCodecs()) {
-            String profile = codec.params.get("profile-level-id");
-            if ("H264".equalsIgnoreCase(codec.name) && profile != null) {
-                hardwareH264Profiles.add(profile.toLowerCase(Locale.ROOT));
-            }
-        }
+        CapabilityVideoDecoderFactory decoderFactory =
+                new CapabilityVideoDecoderFactory(eglBase.getEglBaseContext());
+        hardwareHighAvailable = decoderFactory.hasHardwareHigh();
 
         peerConnectionFactory = PeerConnectionFactory.builder()
                 .setAudioDeviceModule(audioDeviceModule)
@@ -340,8 +333,7 @@ public class WebRtcReceiver implements Loggable {
     }
 
     private int profileRank(String profile) {
-        boolean hardware = profile != null && hardwareH264Profiles.contains(profile.toLowerCase(Locale.ROOT));
-        return VideoQualityPolicy.h264Rank(profile, preferHighProfile, hardware);
+        return VideoQualityPolicy.h264Rank(profile, preferHighProfile, hardwareHighAvailable);
     }
 
     public void handleRemoteOffer(SessionDescription offerSdp, AnswerReadyCallback callback) {
@@ -383,6 +375,7 @@ public class WebRtcReceiver implements Loggable {
             public void onCreateSuccess(SessionDescription sessionDescription) {
                 final SessionDescription configuredOffer = new SessionDescription(sessionDescription.type,
                         SdpPolicy.videoBandwidth(sessionDescription.description, bitrateKbps));
+                highOffered = VideoQualityPolicy.offersH264High(configuredOffer.description);
                 peerConnection.setLocalDescription(new SdpObserverAdapter() {
                     @Override public void onSetSuccess() { callback.onOfferReady(configuredOffer); }
                 }, configuredOffer);
@@ -554,6 +547,7 @@ public class WebRtcReceiver implements Loggable {
             Log.i(TAG, "Closing game session...");
             codecLogged = false;
             preferHighProfile = false;
+            highOffered = false;
             PeerConnection closingConnection = peerConnection;
             peerConnection = null;
             synchronized (statsLock) {
@@ -614,6 +608,8 @@ public class WebRtcReceiver implements Loggable {
                         if (!members.containsKey("framesDecoded") && !members.containsKey("frameWidth")) continue;
                         RTCStats codec = report.getStatsMap().get(members.get("codecId"));
                         String summary = videoStatsSampler.sample(stat.getId(), stat.getTimestampUs(), members,
+                                codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
+                        summary += "\n" + VideoStatsSampler.profileStatus(preferHighProfile, hardwareHighAvailable, highOffered,
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
                         if (signalingListener != null) {
                             signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary);

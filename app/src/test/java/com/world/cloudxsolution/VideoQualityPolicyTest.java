@@ -27,4 +27,12 @@ public class VideoQualityPolicyTest {
         assertEquals(7500, VideoQualityPolicy.startKbps(15000));
         assertEquals(4000, VideoQualityPolicy.startKbps(8000));
     }
+
+    @Test public void detectsHighInTheActualVideoOfferWithoutConfusingAudioOrRtx() {
+        String header = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 H264/90000\r\na=rtpmap:97 rtx/90000\r\n";
+        assertTrue(VideoQualityPolicy.offersH264High(header + "a=fmtp:96 packetization-mode=1;profile-level-id=640c1f\r\n"));
+        assertFalse(VideoQualityPolicy.offersH264High(header + "a=fmtp:96 profile-level-id=42e01f\r\na=fmtp:97 profile-level-id=640c1f\r\n"));
+        assertFalse(VideoQualityPolicy.offersH264High("m=audio 9 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=640c1f\r\n"));
+        assertFalse(VideoQualityPolicy.offersH264High(header.replace("m=video 9", "m=video 0") + "a=fmtp:96 profile-level-id=640c1f\r\n"));
+    }
 }

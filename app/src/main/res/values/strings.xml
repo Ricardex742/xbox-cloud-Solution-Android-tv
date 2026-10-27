@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">cloudxSolution</string>
     <string name="video_quality_label">Qualidade e desempenho</string>
-    <string name="video_quality_help">Mais detalhes depende do suporte da TV e pode causar travamentos. As alterações de vídeo valem ao reabrir o jogo.</string>
+    <string name="video_quality_help">High depende do suporte da TV e da negociação com o servidor. Pode causar travamentos. Encerre e reabra o jogo para aplicar; confira o perfil efetivo no painel.</string>
 </resources>

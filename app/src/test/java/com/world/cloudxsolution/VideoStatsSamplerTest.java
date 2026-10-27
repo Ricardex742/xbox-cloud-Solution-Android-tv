@@ -34,4 +34,17 @@ public class VideoStatsSamplerTest {
         stats.put("bytesReceived", 1L);
         assertTrue(sampler.sample("v", 3, stats, stats).contains("medindo..."));
     }
+
+    @Test public void distinguishesRequestAvailabilityOfferAndNegotiatedProfile() {
+        Map<String, Object> codec = new HashMap<>();
+        codec.put("sdpFmtpLine", "profile-level-id=42e01f");
+        assertTrue(VideoStatsSampler.profileStatus(true, false, false, codec).contains("não confirmado para este app"));
+        assertTrue(VideoStatsSampler.profileStatus(true, true, false, codec).contains("High não entrou na oferta nativa"));
+        assertTrue(VideoStatsSampler.profileStatus(true, true, true, codec).contains("sessão negociou outro perfil"));
+        codec.put("sdpFmtpLine", "PROFILE-LEVEL-ID = 640C2A;packetization-mode=1");
+        String result = VideoStatsSampler.profileStatus(true, true, true, codec);
+        assertTrue(result.contains("Perfil negociado: H.264 High"));
+        assertFalse(result.contains("outro perfil"));
+        assertTrue(VideoStatsSampler.profileStatus(false, true, true, codec).contains("solicitado nesta sessão: Baseline"));
+    }
 }

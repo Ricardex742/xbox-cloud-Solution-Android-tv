@@ -1346,7 +1346,7 @@ private boolean debug=false;
         androidx.appcompat.widget.AppCompatSpinner spinnerBitrate = dialog.findViewById(R.id.spinner_bitrate);
         androidx.appcompat.widget.AppCompatSpinner spinnerUA = dialog.findViewById(R.id.spinner_user_agent);
         androidx.appcompat.widget.AppCompatSpinner spinnerVideoProfile = dialog.findViewById(R.id.spinner_video_profile);
-        String[] profileLabels = {"Estável (recomendado)", "Mais detalhes (experimental)"};
+        String[] profileLabels = {"Preferir Baseline (estável)", "Preferir High (experimental)"};
         android.widget.ArrayAdapter<String> profileAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, profileLabels);
         profileAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerVideoProfile.setAdapter(profileAdapter);
