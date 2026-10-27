@@ -45,7 +45,7 @@ public class WebRtcReceiver implements Loggable {
     private final EglBase eglBase;
 
     private PeerConnectionFactory peerConnectionFactory;
-    private PeerConnection peerConnection;
+    private volatile PeerConnection peerConnection;
     private AudioDeviceModule audioDeviceModule;
     private final java.util.concurrent.ConcurrentHashMap<String, DataChannel> dataChannels = new java.util.concurrent.ConcurrentHashMap<>();
     private long lastSendWarningMs;
@@ -55,6 +55,12 @@ public class WebRtcReceiver implements Loggable {
     private boolean isReleased = false;
 
     private boolean codecLogged = false;
+    private boolean preferHighProfile;
+    private final java.util.Set<String> hardwareH264Profiles = new java.util.HashSet<>();
+    private final VideoStatsSampler videoStatsSampler = new VideoStatsSampler();
+    private final android.os.Handler statsHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private boolean statsPending;
+    private final Object statsLock = new Object();
 
     private VideoTrack remoteVideoTrack;
     private org.webrtc.AudioSource audioSource;
@@ -65,9 +71,12 @@ public class WebRtcReceiver implements Loggable {
     public VideoTrack getRemoteVideoTrack() {
         return remoteVideoTrack;
     }
-private boolean showStats=false;
-    public void enablePerfStats(boolean enablestats) {
-        this.showStats=enablestats;
+    private volatile boolean showStats = false;
+    public void enablePerfStats(boolean enabled) {
+        synchronized (statsLock) {
+            showStats = enabled;
+            videoStatsSampler.reset();
+        }
     }
 
     public interface SignalingListener {
@@ -127,6 +136,15 @@ private boolean showStats=false;
                 new DefaultVideoEncoderFactory(eglBase.getEglBaseContext(), true, true);
         DefaultVideoDecoderFactory decoderFactory =
                 new DefaultVideoDecoderFactory(eglBase.getEglBaseContext());
+
+        hardwareH264Profiles.clear();
+        for (org.webrtc.VideoCodecInfo codec : new org.webrtc.HardwareVideoDecoderFactory(
+                eglBase.getEglBaseContext()).getSupportedCodecs()) {
+            String profile = codec.params.get("profile-level-id");
+            if ("H264".equalsIgnoreCase(codec.name) && profile != null) {
+                hardwareH264Profiles.add(profile.toLowerCase(Locale.ROOT));
+            }
+        }
 
         peerConnectionFactory = PeerConnectionFactory.builder()
                 .setAudioDeviceModule(audioDeviceModule)
@@ -254,7 +272,6 @@ private boolean showStats=false;
 
                     if (track instanceof VideoTrack) {
                         Log.i(TAG, "Configuring video track: " + track.id());
-                        setVideoCodecPreferences(transceiver);
                         remoteVideoTrack = (VideoTrack) track;
                         if (pendingRenderTarget != null) {
                             remoteVideoTrack.addSink(pendingRenderTarget);
@@ -310,7 +327,7 @@ private boolean showStats=false;
         h264Codecs.sort((c1, c2) -> {
             String p1 = c1.parameters.get("profile-level-id");
             String p2 = c2.parameters.get("profile-level-id");
-            return Integer.compare(getH264ProfileRank(p2), getH264ProfileRank(p1));
+            return Integer.compare(profileRank(p2), profileRank(p1));
         });
 
         List<RtpCapabilities.CodecCapability> finalSelection = new ArrayList<>(h264Codecs);
@@ -322,14 +339,9 @@ private boolean showStats=false;
                 .collect(Collectors.joining(", ")));
     }
 
-    private int getH264ProfileRank(String profileLevelId) {
-        if (profileLevelId == null) return -1;
-        String p = profileLevelId.toLowerCase(Locale.ROOT);
-        if (p.startsWith("6400")) return 0;
-        if (p.startsWith("4d00")) return 1;
-        if (p.startsWith("42e0")) return 4;
-        if (p.startsWith("4200")) return 3;
-        return -1;
+    private int profileRank(String profile) {
+        boolean hardware = profile != null && hardwareH264Profiles.contains(profile.toLowerCase(Locale.ROOT));
+        return VideoQualityPolicy.h264Rank(profile, preferHighProfile, hardware);
     }
 
     public void handleRemoteOffer(SessionDescription offerSdp, AnswerReadyCallback callback) {
@@ -357,7 +369,15 @@ private boolean showStats=false;
         }, answerSdp);
     }
 
-    public void createOffer(int bitrateKbps, OfferReadyCallback callback) {
+    public void createOffer(int bitrateKbps, boolean preferHigh, OfferReadyCallback callback) {
+        preferHighProfile = preferHigh;
+        for (RtpTransceiver transceiver : peerConnection.getTransceivers()) {
+            if (!transceiver.isStopped() && transceiver.getMediaType() == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {
+                setVideoCodecPreferences(transceiver);
+            }
+        }
+        Log.i(TAG, "Video request: " + VideoQualityPolicy.maxKbps(bitrateKbps)
+                + " kbps, prefer hardware High=" + preferHigh);
         peerConnection.createOffer(new SdpObserverAdapter() {
             @Override
             public void onCreateSuccess(SessionDescription sessionDescription) {
@@ -533,16 +553,23 @@ private boolean showStats=false;
         synchronized (this) {
             Log.i(TAG, "Closing game session...");
             codecLogged = false;
+            preferHighProfile = false;
+            PeerConnection closingConnection = peerConnection;
+            peerConnection = null;
+            synchronized (statsLock) {
+                statsHandler.removeCallbacksAndMessages(null);
+                statsPending = false;
+                videoStatsSampler.reset();
+            }
 
             for (DataChannel channel : dataChannels.values()) {
                 channel.dispose();
             }
             dataChannels.clear();
 
-            if (peerConnection != null) {
-                peerConnection.close();
-                peerConnection.dispose();
-                peerConnection = null;
+            if (closingConnection != null) {
+                closingConnection.close();
+                closingConnection.dispose();
             }
 
             remoteVideoTrack = null;
@@ -554,10 +581,50 @@ private boolean showStats=false;
     public void onLogMessage(String message, Logging.Severity severity, String tag) {
 
         if (showStats && message != null && message.startsWith("stream-rendererDuration:")) {
-            String stats = message.substring("stream-rendererDuration: ".length());
-            if (signalingListener != null) {
-                signalingListener.onPerformanceStatsReceived(stats);
+            String stats = message.substring("stream-rendererDuration:".length()).trim();
+            if (signalingListener != null) signalingListener.onPerformanceStatsReceived(stats);
+            synchronized (statsLock) {
+                if (!statsPending) {
+                    statsPending = true;
+                    statsHandler.post(() -> reportVideoStats(stats));
+                }
             }
+        }
+    }
+
+    // Sample only when the existing renderer telemetry arrives and the overlay is visible.
+    // No timer, frame processing, readback or extra rendering pass is added.
+    private synchronized void reportVideoStats(String rendererStats) {
+        PeerConnection connection = peerConnection;
+        if (!showStats || connection == null) {
+            synchronized (statsLock) { statsPending = false; }
+            return;
+        }
+        try {
+            connection.getStats(report -> {
+                // Do not take the lifecycle lock: dispose may wait for this native callback.
+                synchronized (statsLock) {
+                    if (peerConnection != connection) return;
+                    statsPending = false;
+                    if (!showStats) return;
+                    for (RTCStats stat : report.getStatsMap().values()) {
+                        java.util.Map<String, Object> members = stat.getMembers();
+                        if (!"inbound-rtp".equals(stat.getType()) ||
+                                !("video".equals(members.get("kind")) || "video".equals(members.get("mediaType")))) continue;
+                        if (!members.containsKey("framesDecoded") && !members.containsKey("frameWidth")) continue;
+                        RTCStats codec = report.getStatsMap().get(members.get("codecId"));
+                        String summary = videoStatsSampler.sample(stat.getId(), stat.getTimestampUs(), members,
+                                codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
+                        if (signalingListener != null) {
+                            signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary);
+                        }
+                        break;
+                    }
+                }
+            });
+        } catch (RuntimeException e) {
+            synchronized (statsLock) { statsPending = false; }
+            Log.w(TAG, "Video stats unavailable", e);
         }
     }
 

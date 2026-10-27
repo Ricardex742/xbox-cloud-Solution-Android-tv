@@ -30,7 +30,7 @@ interface IStreamingService {
     // process to here) ---
     void handleRemoteOffer(String sdp);
     void handleRemoteAnswer(String sdp);
-    void createOffer(int bitrateKbps);
+    void createOffer(int bitrateKbps, boolean preferHighProfile);
     void addIceCandidate(String sdpMid, int sdpMLineIndex, String candidate);
     void createDataChannel(String label);
     void addTransceiver(String trackOrKind, String direction);

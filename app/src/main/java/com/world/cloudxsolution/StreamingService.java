@@ -196,8 +196,15 @@ public class StreamingService extends Service implements StreamHost {
 
             org.webrtc.VideoSink wrapperSink = new org.webrtc.VideoSink() {
                 private boolean firstFrameSeen = false;
+                private int lastWidth, lastHeight;
                 @Override
                 public void onFrame(org.webrtc.VideoFrame frame) {
+                    int w = frame.getRotatedWidth(), h = frame.getRotatedHeight();
+                    if (w != lastWidth || h != lastHeight) {
+                        lastWidth = w;
+                        lastHeight = h;
+                        broadcast(cb -> safe(() -> cb.onVideoSizeChanged(w, h)));
+                    }
                     if (!firstFrameSeen) {
                         firstFrameSeen = true;
                         Log.i(TAG, "First frame detected in service! " + frame.getRotatedWidth() + "x" + frame.getRotatedHeight());
@@ -248,8 +255,8 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void createOffer(int bitrateKbps) {
-            webRtcReceiver.createOffer(bitrateKbps, offer ->
+        public void createOffer(int bitrateKbps, boolean preferHighProfile) {
+            webRtcReceiver.createOffer(bitrateKbps, preferHighProfile, offer ->
                     broadcast(cb -> safe(() -> cb.onOfferReady(offer.description))));
         }
 

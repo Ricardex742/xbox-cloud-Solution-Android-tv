@@ -20,6 +20,7 @@ oneway interface IStreamingCallback {
     // --- misc activity-facing side effects (replace old activity.X calls
     // that used to run directly inside WebRtcReceiver) ---
     void onFirstFrameRendered(int width, int height);
+    void onVideoSizeChanged(int width, int height);
     void showToast(String message);
     void onStreamingStateChanged(boolean isStreaming);
     void setWebViewVisibility(int visibility); // View.VISIBLE / INVISIBLE / GONE

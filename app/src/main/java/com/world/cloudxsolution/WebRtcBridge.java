@@ -92,7 +92,7 @@ public class WebRtcBridge {
         activity.runOnUiThread(() -> {
             IStreamingService s = service();
             if (s == null) return;
-            try { s.createOffer(Math.max(0, Math.min(20, bitrateMbps)) * 1000); } catch (Exception e) { Log.e(TAG, "createOffer", e); }
+            try { s.createOffer(Math.max(0, Math.min(20, bitrateMbps)) * 1000, activity.prefersHighVideoProfile()); } catch (Exception e) { Log.e(TAG, "createOffer", e); }
         });
     }
 

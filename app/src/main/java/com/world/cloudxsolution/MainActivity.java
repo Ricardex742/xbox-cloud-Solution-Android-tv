@@ -25,6 +25,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -52,8 +53,6 @@ import androidx.core.splashscreen.SplashScreen;
 
 import org.json.JSONObject;
 import org.webrtc.IceCandidate;
-import org.webrtc.RendererCommon;
-import org.webrtc.SurfaceViewRenderer;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -68,7 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "XboxFramesMain";
 
     public WebView webView;
-    private SurfaceViewRenderer surfaceView;
+    private SurfaceView surfaceView;
     private View loadingLayout;
     private TextView loadingText;
     private PerformanceDialog performanceDialog;
@@ -89,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_REGION = "target_region";
     private static final String KEY_RESOLUTION = "target_resolution";
     private static final String KEY_BITRATE = "target_bitrate";
+    private static final String KEY_HIGH_VIDEO_PROFILE = "prefer_high_video_profile";
     private static final String KEY_USER_AGENT = "target_user_agent";
     private static final String KEY_INITIAL_SCALE = "target_initial_scale";
     private static final String KEY_SHOW_HELP = "show_intro_help";
@@ -171,7 +171,19 @@ public class MainActivity extends AppCompatActivity {
         @Override public void onPerformanceStatsReceived(String stats) {
             runOnUiThread(() -> {
                 if (performanceDialog != null && performanceDialog.isShowing()) {
-                    performanceDialog.updateStats(stats);
+                    android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
+                    performanceDialog.updateStats(stats + "\nSuperfície: " + size.width() + "x" + size.height());
+                }
+            });
+        }
+
+        @Override public void onVideoSizeChanged(int w, int h) {
+            runOnUiThread(() -> {
+                if (surfaceView == null || w <= 0 || h <= 0 || w > 3840 || h > 2160) return;
+                android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
+                if (size.width() != w || size.height() != h) {
+                    // Avoid downscaling 1080p video to a 720p TV launcher surface.
+                    surfaceView.getHolder().setFixedSize(w, h);
                 }
             });
         }
@@ -373,15 +385,11 @@ public class MainActivity extends AppCompatActivity {
     }
     private void pushSurfaceIfReady() {
         if (streamingService == null) return;
-        surfaceView.disableFpsReduction();
-        surfaceView.setEnableHardwareScaler(true);
         surfaceView.setKeepScreenOn(true);
-        surfaceView.setEnableHardwareScaler(true);
-        surfaceView.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT);
 
         Surface s = surfaceView.getHolder().getSurface();
         if (s == null || !s.isValid()) return;
-        try { streamingService.setRenderSurface(s, surfaceView.getWidth(), surfaceView.getHeight()); }
+        try { streamingService.setRenderSurface(s, surfaceView.getHolder().getSurfaceFrame().width(), surfaceView.getHolder().getSurfaceFrame().height()); }
         catch (RemoteException e) { Log.e(TAG, "setRenderSurface", e); }
     }
     private void showIntroHelpDialog() {
@@ -1324,6 +1332,10 @@ private boolean debug=false;
         dialog.show();
     }
 
+    public boolean prefersHighVideoProfile() {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_HIGH_VIDEO_PROFILE, false);
+    }
+
     private void showAppSettingsDialog() {
         Dialog dialog = new Dialog(this, R.style.XboxDialogTheme);
         dialog.setContentView(R.layout.dialog_app_settings);
@@ -1333,6 +1345,12 @@ private boolean debug=false;
         androidx.appcompat.widget.AppCompatSpinner spinnerRes = dialog.findViewById(R.id.spinner_resolution);
         androidx.appcompat.widget.AppCompatSpinner spinnerBitrate = dialog.findViewById(R.id.spinner_bitrate);
         androidx.appcompat.widget.AppCompatSpinner spinnerUA = dialog.findViewById(R.id.spinner_user_agent);
+        androidx.appcompat.widget.AppCompatSpinner spinnerVideoProfile = dialog.findViewById(R.id.spinner_video_profile);
+        String[] profileLabels = {"Estável (recomendado)", "Mais detalhes (experimental)"};
+        android.widget.ArrayAdapter<String> profileAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, profileLabels);
+        profileAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerVideoProfile.setAdapter(profileAdapter);
+        spinnerVideoProfile.setSelection(prefersHighVideoProfile() ? 1 : 0);
         TextView tvScale = dialog.findViewById(R.id.tv_initial_scale);
         SeekBar sbScale = dialog.findViewById(R.id.sb_initial_scale);
         Button btnCancel = dialog.findViewById(R.id.btn_cancel);
@@ -1353,7 +1371,7 @@ private boolean debug=false;
 
         // Bitrate options
         Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};
-        String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (Qualidade Máxima)"};
+        String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (teto recomendado)"};
         android.widget.ArrayAdapter<String> bitrateAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bitrateLabels);
         bitrateAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerBitrate.setAdapter(bitrateAdapter);
@@ -1426,6 +1444,7 @@ private boolean debug=false;
                     .putString(KEY_REGION, selectedRegion)
                     .putString(KEY_RESOLUTION, selectedRes)
                     .putInt(KEY_BITRATE, selectedBitrate)
+                    .putBoolean(KEY_HIGH_VIDEO_PROFILE, spinnerVideoProfile.getSelectedItemPosition() == 1)
                     .putString(KEY_USER_AGENT, selectedUA)
                     .putInt(KEY_INITIAL_SCALE, selectedScale)
                     .apply();
@@ -1453,7 +1472,7 @@ private boolean debug=false;
                     }
 
                 } else {
-                    showCustomToast("Configurações aplicadas.");
+                    showCustomToast("Configurações salvas. Encerre e reabra o jogo para aplicar o vídeo.");
                 }
             }
             dialog.dismiss();
