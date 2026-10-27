@@ -9,6 +9,8 @@ oneway interface IStreamingCallback {
     // --- signaling replies, to forward into the WebView JS bridge ---
     void onAnswerReady(String sdp);
     void onOfferReady(String sdp);
+    void onRemoteDescriptionSet();
+    void onSignalingError(String operation);
 
     // --- ICE / connection state, mirrors WebRtcReceiver.SignalingListener ---
     void onLocalIceCandidate(String sdpMid, int sdpMLineIndex, String candidate);
@@ -21,6 +23,7 @@ oneway interface IStreamingCallback {
     // that used to run directly inside WebRtcReceiver) ---
     void onFirstFrameRendered(int width, int height);
     void onVideoSizeChanged(int width, int height);
+    void onRenderSurfaceRequested();
     void showToast(String message);
     void onStreamingStateChanged(boolean isStreaming);
     void setWebViewVisibility(int visibility); // View.VISIBLE / INVISIBLE / GONE

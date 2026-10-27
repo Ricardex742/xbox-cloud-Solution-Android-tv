@@ -8,25 +8,62 @@
 })();
 "use strict";
 
-// Bridge for Native Android WebRTC
-window.handleAnswer = function(sdp) {
-    console.log("[BxC] handleAnswer from Java, sdp length: " + (sdp ? sdp.length : 0));
-    if (window.pendingAnswerResolver) {
-        window.pendingAnswerResolver({ type: 'answer', sdp: sdp });
-        window.pendingAnswerResolver = null;
-    } else {
-        console.warn("[BxC] No pendingAnswerResolver found");
-    }
+// Pending native operations must settle even if SDP fails or a session closes.
+window.bxNativePending = Object.create(null);
+window.bxNativeOperation = function(name, action) {
+    if (window.bxNativePending[name]) return Promise.reject(new Error('Operation already pending: ' + name));
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => window.handleSignalingError('timeout-' + name), 30000);
+        window.bxNativePending[name] = { resolve, reject, timer };
+        try { if (action) action(); } catch (error) { window.handleSignalingError(name); }
+    });
 };
-
-window.handleOffer = function(sdp) {
-    console.log("[BxC] handleOffer from Java, sdp length: " + (sdp ? sdp.length : 0));
-    if (window.pendingOfferResolver) {
-        window.pendingOfferResolver({ type: 'offer', sdp: sdp });
-        window.pendingOfferResolver = null;
-    } else {
-        console.warn("[BxC] No pendingOfferResolver found");
+window.bxSettleNative = function(name, value) {
+    const pending = window.bxNativePending[name];
+    if (!pending) return;
+    delete window.bxNativePending[name];
+    clearTimeout(pending.timer);
+    pending.resolve(value);
+};
+window.handleSignalingError = function(operation) {
+    window.bxEarlyAnswer = null;
+    for (const name of Object.keys(window.bxNativePending)) {
+        const pending = window.bxNativePending[name];
+        delete window.bxNativePending[name];
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Native signaling: ' + operation));
     }
+    console.warn('[BxC] Native signaling:', operation);
+};
+window.handleAnswer = function(sdp) {
+    if (!window.peer || window.peer.signalingState === 'closed') return;
+    const answer = { type: 'answer', sdp };
+    if (window.bxNativePending.answer) window.bxSettleNative('answer', answer);
+    else window.bxEarlyAnswer = answer;
+};
+window.handleOffer = function(sdp) {
+    window.bxSettleNative('offer', { type: 'offer', sdp });
+};
+window.handleRemoteDescriptionSet = function() { window.bxSettleNative('remote'); };
+
+window.bxKeepAliveTimer = null;
+window.bxKeepAliveStarted = false;
+window.bxStartKeepAlive = function() {
+    if (window.bxKeepAliveStarted) return;
+    window.bxKeepAliveStarted = true;
+    let attempts = 0;
+    function start() {
+        window.bxKeepAliveTimer = null;
+        if (!window.peer || window.peer.signalingState === 'closed') return;
+        const session = window.BX_EXPOSED && window.BX_EXPOSED.streamSession;
+        if (session && session.gsToken && session.sessionPath && session.domainName && window.AndroidBridge) {
+            window.AndroidBridge.keepalive(session.domainName + '/' + session.sessionPath + '/keepalive', session.gsToken);
+            return;
+        }
+        if (++attempts < 120) window.bxKeepAliveTimer = setTimeout(start, 250);
+        else console.warn('[BxC] Native keepalive metadata unavailable; retaining browser session');
+    }
+    start();
 };
 
 window.handleIceCandidate = function(sdpMid, sdpMLineIndex, sdp) {
@@ -55,21 +92,7 @@ window.handleDataChannelMessage = function(label, binaryData, textData, isBinary
         }
 
         if (label === 'message' && typeof data === 'string' && data.includes('HandshakeAck')) {
-            async function CXkeepalive() {
-                let CXtoken = window.BX_EXPOSED.streamSession.gsToken;
-                let CXsessionPath = window.BX_EXPOSED.streamSession.sessionPath;
-                let CXendPoint = window.BX_EXPOSED.streamSession.domainName;
-                if (CXtoken && CXtoken.length > 0 && CXsessionPath && CXsessionPath.length > 0 && CXendPoint && CXendPoint.length > 0) {
-                    let CXurl = CXendPoint + '/' + CXsessionPath + '/keepalive';
-                    console.log("[BxC] Keepalive URL:", CXurl);
-                    if (window.AndroidBridge && window.AndroidBridge.keepalive) {
-                        window.AndroidBridge.keepalive(CXurl, CXtoken);
-                    }
-                    return;
-                }
-                return setTimeout(CXkeepalive, 50);
-            }
-            setTimeout(CXkeepalive, 50);
+            window.bxStartKeepAlive();
         }
 
         const event = new MessageEvent('message', {
@@ -77,7 +100,6 @@ window.handleDataChannelMessage = function(label, binaryData, textData, isBinary
             origin: window.location.origin
         });
         dc.dispatchEvent(event);
-        if (dc.onmessage) dc.onmessage(event);
     }
 };
 
@@ -86,8 +108,8 @@ window.handleDataChannelState = function(label, state) {
     const dc = window.proxyDataChannels && window.proxyDataChannels[label];
     if (dc) {
         dc.readyState = state.toLowerCase();
-        if (dc.onopen && dc.readyState === 'open') dc.onopen();
-        if (dc.onclose && dc.readyState === 'closed') dc.onclose();
+        if (dc.readyState === 'open') dc.dispatchEvent(new Event('open'));
+        if (dc.readyState === 'closed') dc.dispatchEvent(new Event('close'));
     }
 };
 
@@ -95,6 +117,12 @@ window.handleIceConnectionState = function(state) {
     console.log("[BxC] handleIceConnectionState: " + state);
     if (window.peer) {
         window.peer.iceConnectionState = state.toLowerCase();
+        const ice = window.peer.iceConnectionState;
+        const connectionState = ice === 'completed' ? 'connected' : ice === 'checking' ? 'connecting' : ice;
+        if (window.peer.connectionState !== connectionState) {
+            window.peer.connectionState = connectionState;
+            window.peer.dispatchEvent(new Event('connectionstatechange'));
+        }
         if (window.peer.oniceconnectionstatechange) window.peer.oniceconnectionstatechange();
         if (window.peer._listeners && window.peer._listeners['iceconnectionstatechange']) {
             window.peer._listeners['iceconnectionstatechange'].forEach(l => l());
@@ -190,6 +218,7 @@ function getOsNameFromResolution(resolution) {
 
 function generateMsDeviceInfo(osName, resolution) {
     const isQhd = (resolution === "1440");
+    const isHd = (resolution === "720" || resolution === "720p" || resolution === "720HQ");
     return {
         appInfo: {
             env: {
@@ -207,8 +236,8 @@ function generateMsDeviceInfo(osName, resolution) {
             browser: { browserName: "chrome", browserVersion: "140.0.3485.54" },
             displayInfo: {
                 dimensions: {
-                    widthInPixels: isQhd ? 2560 : 1920,
-                    heightInPixels: isQhd ? 1440 : 1080
+                    widthInPixels: isQhd ? 2560 : isHd ? 1280 : 1920,
+                    heightInPixels: isQhd ? 1440 : isHd ? 720 : 1080
                 },
                 pixelDensity: { dpiX: 1, dpiY: 1 }
             }
@@ -325,7 +354,7 @@ class XcloudInterceptor {
                 }
                 const url = typeof request === "string" ? request : request.url;
                 window.BX_EXPOSED.streamSession.domainName = new URL(url).origin;
-                BxLogger.info("streamSession", "Captured sessionPath and domainName:", window.BX_EXPOSED.streamSession);
+                BxLogger.info("streamSession", "Captured session endpoint");
             }
         } catch (e) {
             BxLogger.error("XcloudInterceptor", "Session info capture failed", e);
@@ -498,6 +527,8 @@ class Patcher {
 }
 
 function patchRtcPeerConnection() {
+    if (window.__cloudxRtcPatched) return;
+    window.__cloudxRtcPatched = true;
     let OrgRTCPeerConnection = window.RTCPeerConnection;
 
     window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
@@ -530,11 +561,12 @@ function patchRtcPeerConnection() {
         try { navigator.getGamepads = function() { return []; }; } catch (e) {}
         console.log("[BxC] Simulating lightweight ontrack for " + kind);
 
+        if (!window.peer || window.peer.signalingState === 'closed') return;
         let stream;
         let track;
 
         if (kind === 'video') {
-            // OTIMIZADO: Canvas minimo de 2x2 a 1 FPS (Zero uso de GPU/RAM em segundo plano na TV)
+            // A tiny placeholder keeps the browser player lifecycle alive; real video is rendered natively.
             const canvas = document.createElement('canvas');
             canvas.width = 2;
             canvas.height = 2;
@@ -546,11 +578,13 @@ function patchRtcPeerConnection() {
             track = stream.getVideoTracks()[0];
         } else {
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            window.peer._auxAudioContexts.push(audioCtx);
             const destination = audioCtx.createMediaStreamDestination();
             stream = destination.stream;
             track = stream.getAudioTracks()[0];
         }
 
+        window.peer._auxStreams.push(stream);
         let event = new Event('track');
         event.track = track;
         event.streams = [stream];
@@ -591,10 +625,13 @@ function patchRtcPeerConnection() {
     };
 
     window.RTCPeerConnection = function(config) {
-        console.log("[BxC] RTCPeerConnection constructor called", JSON.stringify(config));
+        if (window.peer && window.peer.signalingState !== 'closed') window.peer.close();
+        window.bxEarlyAnswer = null;
+        window.bxKeepAliveStarted = false;
+        console.log("[BxC] Native RTCPeerConnection constructor");
 
-        if (window.AndroidBridge && config) {
-            window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config));
+        if (window.AndroidBridge) {
+            window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config || {}));
         }
 
         const pc = {
@@ -606,6 +643,8 @@ function patchRtcPeerConnection() {
             signalingState: 'stable',
             _listeners: {},
             _transceivers: [],
+            _auxStreams: [],
+            _auxAudioContexts: [],
 
             createDataChannel: function(label, options) {
                 console.log("[BxC] Proxy createDataChannel: " + label);
@@ -627,12 +666,11 @@ function patchRtcPeerConnection() {
                     send: function(data) {
                         if (label === 'input' || label === 'unreliableinput' || label === 'reliableinput') return;
                         if (window.AndroidBridge) {
-                            if (label === 'message' && typeof data === 'string' && !data.includes('Handshake')) {
-                                return;
-                            }
                             let isBinary = typeof data !== 'string';
                             if (isBinary) {
-                                window.AndroidBridge.onDataChannelSend(label, new Uint8Array(data), null, true);
+                                const bytes = ArrayBuffer.isView(data)
+                                    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
+                                window.AndroidBridge.onDataChannelSend(label, Array.from(bytes), null, true);
                                 return;
                             } else {
                                 if (label === 'control' && data.includes('resolutionAlias')) {
@@ -660,7 +698,7 @@ function patchRtcPeerConnection() {
                     addEventListener: function(type, listener) {
                         if (!this._listeners) this._listeners = {};
                         if (!this._listeners[type]) this._listeners[type] = [];
-                        this._listeners[type].push(listener);
+                        if (!this._listeners[type].includes(listener)) this._listeners[type].push(listener);
                     },
                     removeEventListener: function(type, listener) {
                         if (this._listeners && this._listeners[type]) {
@@ -668,12 +706,13 @@ function patchRtcPeerConnection() {
                         }
                     },
                     dispatchEvent: function(event) {
-                        if (event.type === 'message') {
-                            if (this.onmessage) this.onmessage(event);
-                            if (this._listeners && this._listeners['message']) {
-                                this._listeners['message'].forEach(l => l(event));
-                            }
+                        const handler = this['on' + event.type];
+                        if (typeof handler === 'function') handler.call(this, event);
+                        for (const listener of (this._listeners && this._listeners[event.type] || []).slice()) {
+                            if (typeof listener === 'function') listener.call(this, event);
+                            else if (listener && listener.handleEvent) listener.handleEvent(event);
                         }
+                        return true;
                     }
                 };
 
@@ -708,35 +747,34 @@ function patchRtcPeerConnection() {
             getSenders: function() { return (this._transceivers || []).map(t => t.sender); },
 
             setRemoteDescription: function(description) {
-                this.remoteDescription = description;
-                if (description && window.AndroidBridge) {
-                    if (description.type === 'offer') {
-                        window.AndroidBridge.onOfferReceived(description.sdp);
-                    } else if (description.type === 'answer') {
-                        window.AndroidBridge.onAnswerReceived(description.sdp);
-                    }
+                if (!description || !['offer', 'answer'].includes(description.type)) {
+                    return Promise.reject(new Error('Unsupported remote description'));
                 }
-                return Promise.resolve();
-            },
-
-            createAnswer: function() {
-                return new Promise((resolve) => {
-                    window.pendingAnswerResolver = (answer) => {
-                        this.localDescription = answer;
-                        resolve(answer);
-                    };
+                if (description.type === 'offer') window.bxEarlyAnswer = null;
+                return window.bxNativeOperation('remote', () => {
+                    if (!window.AndroidBridge) throw new Error('Native bridge unavailable');
+                    if (description.type === 'offer') window.AndroidBridge.onOfferReceived(description.sdp);
+                    else window.AndroidBridge.onAnswerReceived(description.sdp);
+                }).then(() => {
+                    this.remoteDescription = description;
+                    this.signalingState = description.type === 'offer' ? 'have-remote-offer' : 'stable';
+                    this.dispatchEvent(new Event('signalingstatechange'));
                 });
             },
 
+            createAnswer: function() {
+                if (window.bxEarlyAnswer) {
+                    const answer = window.bxEarlyAnswer;
+                    window.bxEarlyAnswer = null;
+                    return Promise.resolve(answer);
+                }
+                return window.bxNativeOperation('answer');
+            },
+
             createOffer: function() {
-                return new Promise((resolve) => {
-                    window.pendingOfferResolver = (offer) => {
-                        this.localDescription = offer;
-                        resolve(offer);
-                    };
-                    if (window.AndroidBridge) {
-                        window.AndroidBridge.onOfferRequested(getTargetBitrate());
-                    }
+                return window.bxNativeOperation('offer', () => {
+                    if (!window.AndroidBridge) throw new Error('Native bridge unavailable');
+                    window.AndroidBridge.onOfferRequested(getTargetBitrate());
                 });
             },
 
@@ -756,7 +794,7 @@ function patchRtcPeerConnection() {
             setConfiguration: function(config) {
                 this.config = config;
                 if (window.AndroidBridge && config) {
-                    window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config));
+                    window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config || {}));
                 }
             },
 
@@ -769,8 +807,21 @@ function patchRtcPeerConnection() {
 
             addEventListener: function(type, listener) {
                 if (!this._listeners[type]) this._listeners[type] = [];
-                this._listeners[type].push(listener);
-                this['on' + type] = listener;
+                if (!this._listeners[type].includes(listener)) this._listeners[type].push(listener);
+            },
+
+            removeEventListener: function(type, listener) {
+                if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(l => l !== listener);
+            },
+
+            dispatchEvent: function(event) {
+                const handler = this['on' + event.type];
+                if (typeof handler === 'function') handler.call(this, event);
+                for (const listener of (this._listeners[event.type] || []).slice()) {
+                    if (typeof listener === 'function') listener.call(this, event);
+                    else if (listener && listener.handleEvent) listener.handleEvent(event);
+                }
+                return true;
             },
 
             getStats: function() {
@@ -778,9 +829,25 @@ function patchRtcPeerConnection() {
             },
 
             close: function() {
-                if (window.AndroidBridge) {
-                    window.AndroidBridge.onPeerConnectionClose();
+                if (this.signalingState === 'closed') return;
+                this.signalingState = 'closed';
+                this.connectionState = 'closed';
+                this.iceConnectionState = 'closed';
+                window.handleSignalingError('session-closed');
+                clearTimeout(window.bxKeepAliveTimer);
+                window.bxKeepAliveTimer = null;
+                window.bxKeepAliveStarted = false;
+                for (const stream of this._auxStreams) stream.getTracks().forEach(track => track.stop());
+                for (const context of this._auxAudioContexts) context.close().catch(() => {});
+                this._auxStreams = [];
+                this._auxAudioContexts = [];
+                for (const dc of Object.values(window.proxyDataChannels || {})) {
+                    dc.readyState = 'closed';
+                    dc.dispatchEvent(new Event('close'));
                 }
+                window.proxyDataChannels = {};
+                if (window.AndroidBridge) window.AndroidBridge.onPeerConnectionClose();
+                this.dispatchEvent(new Event('connectionstatechange'));
             }
         };
 
@@ -794,16 +861,8 @@ function patchRtcPeerConnection() {
     }
 }
 
-window.addEventListener("load", () => {
-    window.setTimeout(() => {
-        patchRtcPeerConnection();
-        if (document.body && document.body.classList.contains("legacyBackground")) {
-            window.stop();
-            window.location.reload(true);
-        }
-    }, 300);
-    InitBc();
-});
+patchRtcPeerConnection();
+InitBc();
 
 function InitBc() {
     window.worker = null;

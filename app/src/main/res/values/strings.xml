@@ -2,4 +2,9 @@
     <string name="app_name">cloudxSolution</string>
     <string name="video_quality_label">Qualidade e desempenho</string>
     <string name="video_quality_help">Mais detalhes depende do suporte da TV e pode causar travamentos. As alterações de vídeo valem ao reabrir o jogo.</string>
+    <string name="tl042_preset">Usar perfil Multilaser TL042 (720p / 8 Mbps)</string>
+    <string name="preparing_video_service">Preparando serviço de vídeo…</string>
+    <string name="browser_stopped_title">Navegador da TV encerrado</string>
+    <string name="browser_stopped_message">O processo do navegador foi encerrado pelo sistema ou apresentou uma falha. Você pode reabrir o catálogo para iniciar outra sessão.</string>
+    <string name="reopen_catalog">Reabrir catálogo</string>
 </resources>

@@ -23,6 +23,11 @@ jobs:
           test -x "$sdkmanager"
           # Reuse the hosted SDK; newer command-line tools need Java 21.
           JAVA_HOME="$JAVA_HOME_21_X64" "$sdkmanager" 'platforms;android-34' 'build-tools;35.0.0'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test session bridge
+        run: node --test tests/session-bridge.test.cjs
       - name: Test, lint and build
         run: ./gradlew --no-daemon --no-configuration-cache --max-workers=2 testDebugUnitTest lintDebug assembleDebug assembleRelease
       - name: Sign verified ARM artifacts

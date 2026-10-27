@@ -6,10 +6,6 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -71,47 +67,6 @@ public class StreamingService extends Service implements StreamHost {
         startForegroundWithNotification();
         webRtcReceiver = new WebRtcReceiver(this /* StreamHost */);
         setupSignalingRelay();
-        setupNetworkBinding();
-    }
-
-    private void setupNetworkBinding() {
-        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (cm == null) return;
-
-        // 1. Immediate sync check for active connection at startup
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Network activeNetwork = cm.getActiveNetwork();
-            if (activeNetwork != null) {
-                NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);
-                if (caps != null && (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-                        || caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))) {
-                    cm.bindProcessToNetwork(activeNetwork);
-                    Log.i(TAG, "Immediately locked background process to active network: " + activeNetwork);
-                }
-            }
-        }
-
-        // 2. Reactive listener for preferred network changes
-        NetworkRequest request = new NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
-                .build();
-
-        cm.registerNetworkCallback(request, new ConnectivityManager.NetworkCallback() {
-            @Override
-            public void onAvailable(Network network) {
-                cm.bindProcessToNetwork(network);
-                Log.i(TAG, "Locked background process to Ethernet network: " + network);
-            }
-
-            @Override
-            public void onLost(Network network) {
-                if (network.equals(cm.getBoundNetworkForProcess())) {
-                    cm.bindProcessToNetwork(null);
-                    Log.w(TAG, "Bound background network lost, unbound process");
-                }
-            }
-        });
     }
 
     private void setupSignalingRelay() {
@@ -139,6 +94,14 @@ public class StreamingService extends Service implements StreamHost {
             @Override
             public void onTrackReceived(String kind, String id) {
                 broadcast(cb -> safe(() -> cb.onTrackReceived(kind, id)));
+            }
+            @Override
+            public void onRemoteDescriptionSet() {
+                broadcast(cb -> safe(cb::onRemoteDescriptionSet));
+            }
+            @Override
+            public void onSignalingError(String operation) {
+                broadcast(cb -> safe(() -> cb.onSignalingError(operation)));
             }
             @Override
             public void onPerformanceStatsReceived(String stats) {
@@ -170,6 +133,7 @@ public class StreamingService extends Service implements StreamHost {
         public void releaseSession() {
             clearRenderSurface();
             webRtcReceiver.closeSession();
+            StreamingService.this.setStreamingState(false);
         }
 
         @Override
@@ -278,12 +242,14 @@ public class StreamingService extends Service implements StreamHost {
         @Override
         public void createPeerConnection(String iceServersJson) {
             webRtcReceiver.createPeerConnection(iceServersJson);
+            if (eglRenderer == null) broadcast(cb -> safe(cb::onRenderSurfaceRequested));
         }
 
         @Override
         public void closeSession() {
             clearRenderSurface();
             webRtcReceiver.closeSession();
+            StreamingService.this.setStreamingState(false);
         }
 
         @Override

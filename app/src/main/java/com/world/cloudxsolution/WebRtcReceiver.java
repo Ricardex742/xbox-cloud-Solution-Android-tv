@@ -46,6 +46,7 @@ public class WebRtcReceiver implements Loggable {
 
     private PeerConnectionFactory peerConnectionFactory;
     private volatile PeerConnection peerConnection;
+    private volatile long connectionGeneration;
     private AudioDeviceModule audioDeviceModule;
     private final java.util.concurrent.ConcurrentHashMap<String, DataChannel> dataChannels = new java.util.concurrent.ConcurrentHashMap<>();
     private long lastSendWarningMs;
@@ -85,6 +86,8 @@ public class WebRtcReceiver implements Loggable {
         void onIceGatheringChange(PeerConnection.IceGatheringState state);
         void onTrackReceived(String kind, String id);
         void onPerformanceStatsReceived(String stats);
+        void onRemoteDescriptionSet();
+        void onSignalingError(String operation);
     }
 
     public WebRtcReceiver(StreamHost host) {
@@ -112,7 +115,8 @@ public class WebRtcReceiver implements Loggable {
     }
 
 
-    public void initPeerConnectionFactory() {
+    public synchronized void initPeerConnectionFactory() {
+        if (peerConnectionFactory != null) return;
         Log.i(TAG, "Initializing PeerConnectionFactory");
 
         PeerConnectionFactory.InitializationOptions initOptions =
@@ -234,28 +238,31 @@ public class WebRtcReceiver implements Loggable {
 
     public void createPeerConnection(List<PeerConnection.IceServer> iceServers) {
         synchronized (this) {
-            if (peerConnection != null) {
-                peerConnection.close();
-                peerConnection.dispose();
-            }
-
             PeerConnection.RTCConfiguration rtcConfig = new PeerConnection.RTCConfiguration(iceServers);
             rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
-            rtcConfig.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE;
+            rtcConfig.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY;
             rtcConfig.bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE;
             rtcConfig.rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE;
-            rtcConfig.tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED;
-            rtcConfig.candidateNetworkPolicy = PeerConnection.CandidateNetworkPolicy.LOW_COST;
+            rtcConfig.tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED;
+            rtcConfig.candidateNetworkPolicy = PeerConnection.CandidateNetworkPolicy.ALL;
             rtcConfig.keyType = PeerConnection.KeyType.ECDSA;
             rtcConfig.audioJitterBufferFastAccelerate= true;
+            if (peerConnection != null) {
+                // setConfiguration must not discard the transceivers and data channels.
+                if (!peerConnection.setConfiguration(rtcConfig)) reportSignalingError("configuration");
+                return;
+            }
+            final long generation = ++connectionGeneration;
             peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, new PeerConnection.Observer() {
                 @Override
                 public void onIceCandidate(IceCandidate candidate) {
+                    if (generation != connectionGeneration) return;
                     if (signalingListener != null) signalingListener.onLocalIceCandidate(candidate);
                 }
 
                 @Override
                 public void onIceConnectionChange(PeerConnection.IceConnectionState state) {
+                    if (generation != connectionGeneration) return;
                     if (signalingListener != null) signalingListener.onIceConnectionChange(state);
                     if (state == PeerConnection.IceConnectionState.CONNECTED && !codecLogged) {
                         codecLogged = true;
@@ -265,6 +272,7 @@ public class WebRtcReceiver implements Loggable {
 
                 @Override
                 public void onTrack(RtpTransceiver transceiver) {
+                    if (generation != connectionGeneration) return;
                     MediaStreamTrack track = transceiver.getReceiver().track();
                     if (track == null) return;
                     Log.i(TAG, "onTrack: kind=" + track.kind() + ", id=" + track.id());
@@ -289,12 +297,14 @@ public class WebRtcReceiver implements Loggable {
 
                 @Override
                 public void onDataChannel(DataChannel dataChannel) {
+                    if (generation != connectionGeneration) return;
                     Log.i(TAG, "Remote peer opened data channel: " + dataChannel.label());
                 }
 
                 @Override public void onSignalingChange(PeerConnection.SignalingState state) {}
                 @Override public void onIceConnectionReceivingChange(boolean receiving) {}
                 @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state) {
+                    if (generation != connectionGeneration) return;
                     if (state == PeerConnection.IceGatheringState.COMPLETE && signalingListener != null) {
                         signalingListener.onLocalIceCandidate(null);
                     }
@@ -344,17 +354,36 @@ public class WebRtcReceiver implements Loggable {
         return VideoQualityPolicy.h264Rank(profile, preferHighProfile, hardware);
     }
 
+    private void reportSignalingError(String operation) {
+        Log.w(TAG, "Native signaling failed: " + operation);
+        if (signalingListener != null) signalingListener.onSignalingError(operation);
+    }
+
+    private abstract class ReportingSdpObserver extends SdpObserverAdapter {
+        private final String operation;
+        private final PeerConnection connection = peerConnection;
+        ReportingSdpObserver(String operation) { this.operation = operation; }
+        @Override public void onCreateFailure(String error) {
+            if (peerConnection == connection) reportSignalingError(operation);
+        }
+        @Override public void onSetFailure(String error) {
+            if (peerConnection == connection) reportSignalingError(operation);
+        }
+    }
+
     public void handleRemoteOffer(SessionDescription offerSdp, AnswerReadyCallback callback) {
-        peerConnection.setRemoteDescription(new SdpObserverAdapter() {
-            @Override
-            public void onSetSuccess() {
-                peerConnection.createAnswer(new SdpObserverAdapter() {
-                    @Override
-                    public void onCreateSuccess(SessionDescription answerSdp) {
-                        peerConnection.setLocalDescription(new SdpObserverAdapter() {
-                            @Override
-                            public void onSetSuccess() {
-                                callback.onAnswerReady(answerSdp);
+        final PeerConnection connection = peerConnection;
+        if (connection == null) { reportSignalingError("remote-offer"); return; }
+        connection.setRemoteDescription(new ReportingSdpObserver("remote-offer") {
+            @Override public void onSetSuccess() {
+                if (peerConnection != connection) return;
+                if (signalingListener != null) signalingListener.onRemoteDescriptionSet();
+                connection.createAnswer(new ReportingSdpObserver("create-answer") {
+                    @Override public void onCreateSuccess(SessionDescription answerSdp) {
+                        if (peerConnection != connection) return;
+                        connection.setLocalDescription(new ReportingSdpObserver("local-answer") {
+                            @Override public void onSetSuccess() {
+                                if (peerConnection == connection) callback.onAnswerReady(answerSdp);
                             }
                         }, answerSdp);
                     }
@@ -364,27 +393,33 @@ public class WebRtcReceiver implements Loggable {
     }
 
     public void handleRemoteAnswer(SessionDescription answerSdp) {
-        peerConnection.setRemoteDescription(new SdpObserverAdapter() {
-            @Override public void onSetSuccess() { Log.i(TAG, "Remote answer set successfully"); }
+        final PeerConnection connection = peerConnection;
+        if (connection == null) { reportSignalingError("remote-answer"); return; }
+        connection.setRemoteDescription(new ReportingSdpObserver("remote-answer") {
+            @Override public void onSetSuccess() {
+                if (peerConnection == connection && signalingListener != null) signalingListener.onRemoteDescriptionSet();
+            }
         }, answerSdp);
     }
 
     public void createOffer(int bitrateKbps, boolean preferHigh, OfferReadyCallback callback) {
+        final PeerConnection connection = peerConnection;
+        if (connection == null) { reportSignalingError("create-offer"); return; }
         preferHighProfile = preferHigh;
-        for (RtpTransceiver transceiver : peerConnection.getTransceivers()) {
+        for (RtpTransceiver transceiver : connection.getTransceivers()) {
             if (!transceiver.isStopped() && transceiver.getMediaType() == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {
                 setVideoCodecPreferences(transceiver);
             }
         }
-        Log.i(TAG, "Video request: " + VideoQualityPolicy.maxKbps(bitrateKbps)
-                + " kbps, prefer hardware High=" + preferHigh);
-        peerConnection.createOffer(new SdpObserverAdapter() {
-            @Override
-            public void onCreateSuccess(SessionDescription sessionDescription) {
-                final SessionDescription configuredOffer = new SessionDescription(sessionDescription.type,
-                        SdpPolicy.videoBandwidth(sessionDescription.description, bitrateKbps));
-                peerConnection.setLocalDescription(new SdpObserverAdapter() {
-                    @Override public void onSetSuccess() { callback.onOfferReady(configuredOffer); }
+        connection.createOffer(new ReportingSdpObserver("create-offer") {
+            @Override public void onCreateSuccess(SessionDescription description) {
+                if (peerConnection != connection) return;
+                final SessionDescription configuredOffer = new SessionDescription(description.type,
+                        SdpPolicy.videoBandwidth(description.description, bitrateKbps));
+                connection.setLocalDescription(new ReportingSdpObserver("local-offer") {
+                    @Override public void onSetSuccess() {
+                        if (peerConnection == connection) callback.onOfferReady(configuredOffer);
+                    }
                 }, configuredOffer);
             }
         }, new org.webrtc.MediaConstraints());
@@ -457,6 +492,7 @@ public class WebRtcReceiver implements Loggable {
         channel.registerObserver(new DataChannel.Observer() {
             @Override
             public void onBufferedAmountChange(long previousAmount) {
+                if (dataChannels.get(label) != channel) return;
                 if (channel.bufferedAmount() > 1024) {
                     Log.w(TAG, "DataChannel network buffer backing up! Current: " + channel.bufferedAmount());
                 }
@@ -464,6 +500,7 @@ public class WebRtcReceiver implements Loggable {
 
             @Override
             public void onStateChange() {
+                if (dataChannels.get(label) != channel) return;
                 //host.showToast("[debug]:Data channel " + label + " state change: " + channel.state().toString());
                 Log.i(TAG, "Data channel " + label + " state change: " + channel.state());
                 
@@ -484,6 +521,7 @@ public class WebRtcReceiver implements Loggable {
 
             @Override
             public void onMessage(DataChannel.Buffer buffer) {
+                if (dataChannels.get(label) != channel) return;
                 //Log.i(TAG, "received data from (" + label + "): " + (buffer.binary?"binary":"data"));
 
                 if ("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) {
@@ -553,6 +591,7 @@ public class WebRtcReceiver implements Loggable {
         synchronized (this) {
             Log.i(TAG, "Closing game session...");
             codecLogged = false;
+            connectionGeneration++;
             preferHighProfile = false;
             PeerConnection closingConnection = peerConnection;
             peerConnection = null;
@@ -562,10 +601,9 @@ public class WebRtcReceiver implements Loggable {
                 videoStatsSampler.reset();
             }
 
-            for (DataChannel channel : dataChannels.values()) {
-                channel.dispose();
-            }
+            List<DataChannel> closingChannels = new ArrayList<>(dataChannels.values());
             dataChannels.clear();
+            for (DataChannel channel : closingChannels) channel.dispose();
 
             if (closingConnection != null) {
                 closingConnection.close();

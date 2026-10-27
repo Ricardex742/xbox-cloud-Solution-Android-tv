@@ -67,6 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "XboxFramesMain";
 
     public WebView webView;
+    private WebRtcBridge webRtcBridge;
     private SurfaceView surfaceView;
     private View loadingLayout;
     private TextView loadingText;
@@ -125,9 +126,13 @@ public class MainActivity extends AppCompatActivity {
             try {
                 streamingService.registerCallback(streamingCallback);
                 streamingService.initPeerConnectionFactory();
-                streamingService.createPeerConnection(null); // Initial empty config (STUN only)
-            } catch (RemoteException ignored) {}
+            } catch (RemoteException e) {
+                showCustomToast("Falha ao iniciar o serviço de vídeo. Feche e reabra o aplicativo.");
+                Log.e(TAG, "Streaming service initialization failed", e);
+                return;
+            }
             pushSurfaceIfReady();
+            showWebview();
         }
         @Override public void onServiceDisconnected(ComponentName name) {
             streamingService = null;
@@ -138,6 +143,14 @@ public class MainActivity extends AppCompatActivity {
     private final IStreamingCallback.Stub streamingCallback = new IStreamingCallback.Stub() {
         @Override public void onAnswerReady(String sdp) { runOnUiThread(() -> sendAnswerToJs(sdp)); }
         @Override public void onOfferReady(String sdp) { runOnUiThread(() -> sendOfferToJs(sdp)); }
+
+        @Override public void onRemoteDescriptionSet() {
+            runOnUiThread(() -> {
+                if (webView != null) webView.evaluateJavascript(
+                        "if(window.handleRemoteDescriptionSet) window.handleRemoteDescriptionSet();", null);
+            });
+        }
+        @Override public void onSignalingError(String operation) { reportSignalingError(operation); }
 
         @Override public void onLocalIceCandidate(String mid, int idx, String cand) {
             runOnUiThread(() -> {
@@ -175,6 +188,10 @@ public class MainActivity extends AppCompatActivity {
                     performanceDialog.updateStats(stats + "\nSuperfície: " + size.width() + "x" + size.height());
                 }
             });
+        }
+
+        @Override public void onRenderSurfaceRequested() {
+            runOnUiThread(MainActivity.this::pushSurfaceIfReady);
         }
 
         @Override public void onVideoSizeChanged(int w, int h) {
@@ -241,6 +258,13 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         android.content.SharedPreferences gpPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (TvCompatibilityProfile.isTl042(Build.MODEL)) {
+            SharedPreferences.Editor defaults = gpPrefs.edit();
+            if (!gpPrefs.contains(KEY_RESOLUTION)) defaults.putString(KEY_RESOLUTION, TvCompatibilityProfile.RESOLUTION);
+            if (!gpPrefs.contains(KEY_BITRATE)) defaults.putInt(KEY_BITRATE, TvCompatibilityProfile.BITRATE_MBPS);
+            if (!gpPrefs.contains(KEY_HIGH_VIDEO_PROFILE)) defaults.putBoolean(KEY_HIGH_VIDEO_PROFILE, false);
+            defaults.apply();
+        }
         float dz = gpPrefs.getFloat("camera_deadzone", 0.12f);
         float sens = gpPrefs.getFloat("gamepad_sensitivity", 1.5f);
         boolean useUnreliable = gpPrefs.getBoolean(KEY_USE_UNRELIABLE_INPUT, true);
@@ -357,7 +381,8 @@ public class MainActivity extends AppCompatActivity {
         });
 
 
-        showWebview();
+        loadingLayout.setVisibility(View.VISIBLE);
+        loadingText.setText(R.string.preparing_video_service);
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -486,6 +511,26 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
+            public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
+                setStreamingState(false);
+                if (streamingService != null) {
+                    try { streamingService.releaseSession(); } catch (RemoteException ignored) {}
+                }
+                if (view.getParent() instanceof ViewGroup) ((ViewGroup) view.getParent()).removeView(view);
+                view.destroy();
+                if (webView == view) webView = null;
+                webViewState = null;
+                new androidx.appcompat.app.AlertDialog.Builder(MainActivity.this)
+                        .setTitle(R.string.browser_stopped_title)
+                        .setMessage(R.string.browser_stopped_message)
+                        .setPositiveButton(R.string.reopen_catalog, (d, which) -> showWebview())
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .show();
+                return true;
+            }
+
+            @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 if (loadingLayout != null) {
                     loadingLayout.setVisibility(View.VISIBLE);
@@ -504,8 +549,8 @@ public class MainActivity extends AppCompatActivity {
             }
 
         });
-        WebRtcBridge bridge = new WebRtcBridge(this);
-        webView.addJavascriptInterface(bridge, "AndroidBridge");
+        webRtcBridge = new WebRtcBridge(this);
+        webView.addJavascriptInterface(webRtcBridge, "AndroidBridge");
         webView.setWebChromeClient(new CustomWebChromeClient());
     }
 
@@ -595,6 +640,7 @@ private boolean debug=false;
 
     public void closeWebview() {
         runOnUiThread(() -> {
+            if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
             if (webView != null) {
                 webViewState = new Bundle();
                 webView.saveState(webViewState);
@@ -604,7 +650,7 @@ private boolean debug=false;
                 //rootLayout.requestUnbufferedDispatch(InputDevice.SOURCE_JOYSTICK);
                 rootLayout.removeView(webView);
                 webView.stopLoading();
-                webView.clearCache(true);
+                // Keep the catalog cache; it reduces startup downloads on slower TVs.
                 webView.loadUrl("about:blank");
                 webView.onPause();
                 webView.pauseTimers();
@@ -636,6 +682,14 @@ private boolean debug=false;
             } catch (RemoteException e) {
                 Log.e(TAG, "createPeerConnection", e);
             }
+        });
+    }
+
+    public void reportSignalingError(String operation) {
+        runOnUiThread(() -> {
+            showCustomToast("Falha na conexão de vídeo (" + operation + "). Encerre e reabra o jogo.");
+            if (webView != null) webView.evaluateJavascript(
+                    "if(window.handleSignalingError) window.handleSignalingError(" + JSONObject.quote(operation) + ");", null);
         });
     }
 
@@ -770,7 +824,6 @@ private boolean debug=false;
     public void onDataChannelSend(String label, byte[] binary, String data, boolean isBinary) {
         if (streamingService == null) return;
         try {
-            Log.e(TAG, "onDataChannelSend:"+label);
 
             streamingService.onDataChannelSend(label, binary, data, isBinary);
         } catch (RemoteException e) {
@@ -899,6 +952,7 @@ private boolean debug=false;
 
     @Override
     protected void onDestroy() {
+        if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
         if (performanceDialog != null) {
             performanceDialog.dismiss();
             performanceDialog = null;
@@ -914,7 +968,10 @@ private boolean debug=false;
         }
 
         if (streamingService != null) {
-            try { streamingService.unregisterCallback(streamingCallback); } catch (RemoteException ignored) {}
+            try {
+                streamingService.releaseSession();
+                streamingService.unregisterCallback(streamingCallback);
+            } catch (RemoteException ignored) {}
         }
 
         try { unbindService(serviceConnection); } catch (Exception ignored) {}
@@ -1044,6 +1101,9 @@ private boolean debug=false;
         });
 
         btnExit.setOnClickListener(v -> {
+            if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
+            if (webView != null) webView.evaluateJavascript(
+                    "if(window.peer) window.peer.close(); window.location.href='https://www.xbox.com/pt-BR/play';", null);
             isStreaming = false;
             resetGamepadDispatch();
             if (legacyInputChannel != null) {
@@ -1082,6 +1142,7 @@ private boolean debug=false;
         });
 
         btnReloadXbox.setOnClickListener(v -> {
+            if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
             if (webView != null) {
                 webView.reload();
             }
@@ -1415,6 +1476,13 @@ private boolean debug=false;
                 break;
             }
         }
+
+        dialog.findViewById(R.id.btn_tl042_preset).setOnClickListener(v -> {
+            spinnerRes.setSelection(java.util.Arrays.asList(resolutions).indexOf(TvCompatibilityProfile.RESOLUTION));
+            spinnerBitrate.setSelection(java.util.Arrays.asList(bitrateValues).indexOf(TvCompatibilityProfile.BITRATE_MBPS));
+            spinnerVideoProfile.setSelection(0);
+            showCustomToast("Perfil TL042: 720p, até 8 Mbps e modo Estável. Selecione Aplicar e reabra o jogo.");
+        });
 
         sbScale.setProgress(currentScale);
         tvScale.setText(currentScale == 0 ? "Escala inicial: automática" : "Escala inicial: " + currentScale + "%");

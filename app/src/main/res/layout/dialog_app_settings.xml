@@ -32,6 +32,16 @@
             android:letterSpacing="0.05"/>
     </LinearLayout>
 
+    <androidx.appcompat.widget.AppCompatButton
+        android:id="@+id/btn_tl042_preset"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/tl042_preset"
+        android:textColor="@color/selector_text_xbox"
+        android:background="@drawable/selector_button_xbox"
+        android:layout_marginBottom="12dp"
+        android:focusable="true"/>
+
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
