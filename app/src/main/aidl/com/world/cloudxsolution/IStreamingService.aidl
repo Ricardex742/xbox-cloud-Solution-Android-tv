@@ -42,6 +42,8 @@ interface IStreamingService {
     // parses out of onPeerConnectionConfigReceived and let WebRtcReceiver do
     // the org.json parsing itself (see WebRtcReceiver.createPeerConnection(String)).
     void createPeerConnection(String iceServersJson);
+    void updatePeerConfiguration(String iceServersJson);
+    oneway void requestInputChannelSnapshot();
 
     // --- gamepad input: forwarded from MainActivity's Window.Callback.
     // oneway = fire-and-forget, does not block the input-dispatch thread

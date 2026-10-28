@@ -86,6 +86,10 @@ public class MainActivity extends AppCompatActivity {
     private boolean gamepadAnnounced;
     private WebRtcBridge webRtcBridge;
     private int nativeGamepadIndex;
+    private boolean acceptSessionCallbacks = true;
+    private long handledControllerEvents;
+    private boolean documentStartInjection;
+    private static final String KEY_LOW_LATENCY = "prefer_minimal_post_processing";
     private GamepadRumbleHandler rumbleHandler;
 
     private static final String PREFS_NAME = "CloudXPrefs";
@@ -129,7 +133,8 @@ public class MainActivity extends AppCompatActivity {
             try {
                 streamingService.registerCallback(streamingCallback);
                 streamingService.initPeerConnectionFactory();
-                streamingService.createPeerConnection(null); // Initial empty config (STUN only)
+                // The page creates the only session connection.
+                showWebview();
             } catch (RemoteException ignored) {}
             pushSurfaceIfReady();
         }
@@ -176,7 +181,8 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 if (performanceDialog != null && performanceDialog.isShowing()) {
                     android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
-                    performanceDialog.updateStats(stats + "\nSuperfície: " + size.width() + "x" + size.height() + "\n" + displayLatencyStatus());
+                    performanceDialog.updateStats(stats + "\nControle: " + (activeInputChannel.isEmpty() ? "aguardando canal" : activeInputChannel)
+                            + " | Eventos tratados: " + handledControllerEvents + "\nSuperfície: " + size.width() + "x" + size.height() + "\n" + displayLatencyStatus());
                 }
             });
         }
@@ -194,6 +200,8 @@ public class MainActivity extends AppCompatActivity {
 
         @Override public void onFirstFrameRendered(int w, int h) {
             runOnUiThread(() -> {
+                if (!acceptSessionCallbacks) return;
+                requestInputSnapshot();
                 Log.i(TAG, "onFirstFrameRendered callback received: " + w + "x" + h);
                 setStreamingState(true);
                 gamepadAnnounced = false;
@@ -214,15 +222,28 @@ public class MainActivity extends AppCompatActivity {
                         parent.requestLayout();
                         parent.invalidate();
                     }
-                    if (webView!=null&&Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        webView.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
                     }
 
             });
         }
         @Override public void showToast(String message) { showCustomToast(message); }
         @Override public void onStreamingStateChanged(boolean streaming) {
-            runOnUiThread(() -> setStreamingState(streaming));
+            runOnUiThread(() -> { if (acceptSessionCallbacks) setStreamingState(streaming); });
+        }
+        @Override public void onRenderSurfaceRequested() {
+            runOnUiThread(() -> { if (acceptSessionCallbacks) pushSurfaceIfReady(); });
+        }
+        @Override public void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control) {
+            runOnUiThread(() -> {
+                if (!acceptSessionCallbacks) return;
+                // Open may have preceded observer registration. Enable sending before metadata/neutral bootstrap.
+                if (legacy || modern) setStreamingState(true);
+                inputSession.snapshot(legacy, modern, control);
+                updateInputRoute();
+                announceNativeGamepad();
+            });
         }
         @Override public void setWebViewVisibility(int visibility) {
             runOnUiThread(() -> { if (webView != null) webView.setVisibility(visibility); });
@@ -301,10 +322,10 @@ public class MainActivity extends AppCompatActivity {
                 if (isStreaming) {
                     if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) {
                         showCustomToast(gamepadListener.prepare(event.getDevice()));
-                        if (gamepadListener.onGenericMotion(event)) return true;
+                        if (gamepadListener.onGenericMotion(event)) { handledControllerEvents++; return true; }
                     } else if ("input".equals(activeInputChannel) && controllerLe != null) {
                         controllerLe.detectAxisLayout(event.getDevice());
-                        if (controllerLe.onGenericMotion(event)) return true;
+                        if (controllerLe.onGenericMotion(event)) { handledControllerEvents++; return true; }
                     }
                 }
                 return super.dispatchGenericMotionEvent(event);
@@ -324,16 +345,16 @@ public class MainActivity extends AppCompatActivity {
                     if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) {
                         showCustomToast(gamepadListener.prepare(event.getDevice()));
                         if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                            if (gamepadListener.onKeyDown(event.getKeyCode(), event)) return true;
+                            if (gamepadListener.onKeyDown(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                            if (gamepadListener.onKeyUp(event.getKeyCode(), event)) return true;
+                            if (gamepadListener.onKeyUp(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         }
                     } else if ("input".equals(activeInputChannel) && controllerLe != null) {
                         controllerLe.detectAxisLayout(event.getDevice());
                         if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                            if (controllerLe.onKeyDown(event.getKeyCode(), event)) return true;
+                            if (controllerLe.onKeyDown(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                            if (controllerLe.onKeyUp(event.getKeyCode(), event)) return true;
+                            if (controllerLe.onKeyUp(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         }
                     }
                 }
@@ -515,9 +536,21 @@ public class MainActivity extends AppCompatActivity {
         webRtcBridge = new WebRtcBridge(this);
         webView.addJavascriptInterface(webRtcBridge, "AndroidBridge");
         webView.setWebChromeClient(new CustomWebChromeClient());
+        documentStartInjection = androidx.webkit.WebViewFeature.isFeatureSupported(
+                androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT);
+        if (documentStartInjection) {
+            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView,
+                    webConfigurationScript() + loadScriptFromAssets(),
+                    java.util.Collections.singleton("https://www.xbox.com"));
+        }
     }
 
     public void setWebviewVisible(){
+       if (isStreaming) {
+           if (webView != null) webView.setVisibility(View.INVISIBLE);
+           if (loadingLayout != null) loadingLayout.setVisibility(View.GONE);
+           return;
+       }
        if(webView!=null){
            webView.setVisibility(WebView.VISIBLE);
            webView.requestFocus();}
@@ -579,6 +612,7 @@ private boolean debug=false;
     private Bundle webViewState;
 
     public void showWebview() {
+        if (streamingService == null) return;
         if (audioManager != null) {
             audioManager.setMode(AudioManager.MODE_NORMAL);
         }
@@ -642,9 +676,12 @@ private boolean debug=false;
         runOnUiThread(() -> {
             if (streamingService == null) return;
             try {
+                acceptSessionCallbacks = true;
                 inputSession.reset();
                 activeInputChannel = "";
                 gamepadAnnounced = false;
+                handledControllerEvents = 0;
+                surfaceView.setVisibility(View.VISIBLE);
                 streamingService.createPeerConnection(configJson);
             } catch (RemoteException e) {
                 Log.e(TAG, "createPeerConnection", e);
@@ -735,6 +772,9 @@ private boolean debug=false;
     }
 
     public void onDataChannelStateChanged(String label, String state) {
+        if (!acceptSessionCallbacks) return;
+        if (("input".equalsIgnoreCase(label) || "unreliableinput".equalsIgnoreCase(label))
+                && "OPEN".equalsIgnoreCase(state)) setStreamingState(true);
         inputSession.channel(label, state);
         updateInputRoute();
         if (!inputSession.canAnnounce()) gamepadAnnounced = false;
@@ -745,6 +785,12 @@ private boolean debug=false;
         runOnUiThread(() -> {
             if (webView != null) webView.evaluateJavascript(script, null);
         });
+    }
+
+    private void requestInputSnapshot() {
+        if (streamingService == null || !acceptSessionCallbacks) return;
+        try { streamingService.requestInputChannelSnapshot(); }
+        catch (RemoteException e) { Log.w(TAG, "Cannot refresh input channels", e); }
     }
 
     private void updateInputRoute() {
@@ -759,6 +805,13 @@ private boolean debug=false;
         }
     }
 
+    public void onControlAuthorizationSent() {
+        if (!acceptSessionCallbacks) return;
+        gamepadAnnounced = false;
+        requestInputSnapshot();
+        announceNativeGamepad();
+    }
+
     private void announceNativeGamepad() {
         if (gamepadAnnounced || !inputSession.canAnnounce() || streamingService == null) return;
         try {
@@ -767,6 +820,10 @@ private boolean debug=false;
             streamingService.onDataChannelSend("control",
                     message.getBytes(java.nio.charset.StandardCharsets.UTF_8), null, false);
             gamepadAnnounced = true;
+            // Earlier neutral frames may have preceded registration. Resend the actual
+            // state now, including neutral when idle; never clear a held button here.
+            if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) gamepadListener.sendCurrentState();
+            if ("input".equals(activeInputChannel) && controllerLe != null) controllerLe.sendCurrentState();
         } catch (RemoteException | org.json.JSONException e) { Log.w(TAG, "Native gamepad announcement failed", e); }
     }
 
@@ -831,7 +888,7 @@ private boolean debug=false;
         this.isStreaming = isStreaming;
         runOnUiThread(() -> {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                getWindow().setPreferMinimalPostProcessing(isStreaming);
+                getWindow().setPreferMinimalPostProcessing(isStreaming && prefersMinimalPostProcessing());
             }
             if (!isStreaming) {
                 if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
@@ -842,11 +899,15 @@ private boolean debug=false;
         });
     }
 
+    private boolean prefersMinimalPostProcessing() {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_LOW_LATENCY, false);
+    }
+
     private String displayLatencyStatus() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return "Baixa latência da tela: API indisponível";
         android.view.Display display = surfaceView.getDisplay();
         boolean supported = display != null && display.isMinimalPostProcessingSupported();
-        return "Baixa latência da tela: " + (isStreaming ? "solicitada" : "inativa")
+        return "Baixa latência da tela: " + (isStreaming && prefersMinimalPostProcessing() ? "solicitada" : "desativada")
                 + " | Suporte: " + (supported ? "sim" : "não informado")
                 + "\nJogo Mestre TCL: ativação não verificável pelo app";
     }
@@ -907,6 +968,8 @@ private boolean debug=false;
 
     @Override
     protected void onDestroy() {
+        acceptSessionCallbacks = false;
+        if (webRtcBridge != null) webRtcBridge.dispose();
         setStreamingState(false);
         if (performanceDialog != null) {
             performanceDialog.dismiss();
@@ -949,7 +1012,7 @@ private boolean debug=false;
             if (loadingText != null) {
                 loadingText.setText(newProgress + "%");
             }
-            if (newProgress > 30 && !isScriptInjected && view.getUrl() != null && view.getUrl().contains("play")) {
+            if (!documentStartInjection && newProgress > 0 && !isScriptInjected && view.getUrl() != null && view.getUrl().contains("play")) {
                 isScriptInjected = true;
 
                 view.evaluateJavascript(webConfigurationScript() + loadScriptFromAssets(), null);
@@ -1053,31 +1116,8 @@ private boolean debug=false;
         });
 
         btnExit.setOnClickListener(v -> {
-            setStreamingState(false);
-            resetGamepadDispatch();
-            if (legacyInputChannel != null) {
-                legacyInputChannel.shutdown();
-            }
-            if (streamingService != null) {
-                try {
-                    streamingService.closeSession();
-
-                        if(surfaceView!=null){
-                            ViewGroup parent = (ViewGroup) surfaceView.getParent();
-                            surfaceView.setZOrderOnTop(false);
-                            parent.removeView(surfaceView);
-                            parent.addView(surfaceView, 0);
-                        }
-                        resetGamepadDispatch();
-                        if (webView != null) {
-                            webView.setVisibility(View.VISIBLE);
-                        }
-
-                } catch (RemoteException e) { Log.e(TAG, "closeSession", e); }
-            }
-
-            showWebview();
             dialog.dismiss();
+            exitGameToCatalog();
         });
 
         btnSettings.setOnClickListener(v -> {
@@ -1091,10 +1131,8 @@ private boolean debug=false;
         });
 
         btnReloadXbox.setOnClickListener(v -> {
-            if (webView != null) {
-                webView.reload();
-            }
             dialog.dismiss();
+            exitGameToCatalog();
         });
 
         btnNexus.setOnClickListener(v -> {
@@ -1112,6 +1150,34 @@ private boolean debug=false;
         btnExit.requestFocus();
     }
 
+
+    /** Exit is a new catalog navigation, never a restore of the old game page. */
+    private void exitGameToCatalog() {
+        acceptSessionCallbacks = false;
+        if (webRtcBridge != null) webRtcBridge.dispose();
+        setStreamingState(false);
+        isPerformanceOverlayVisible = false;
+        if (performanceDialog != null) performanceDialog.dismiss();
+        if (legacyInputChannel != null) legacyInputChannel.shutdown();
+        if (streamingService != null) {
+            try { streamingService.closeSession(); }
+            catch (RemoteException e) { Log.w(TAG, "Session close failed; returning to catalog", e); }
+        }
+        surfaceView.setZOrderOnTop(false);
+        surfaceView.setVisibility(View.GONE);
+        webViewState = null;
+        if (webView != null) {
+            rootLayout.removeView(webView);
+            webView.removeJavascriptInterface("AndroidBridge");
+            webView.stopLoading();
+            webView.setWebViewClient(null);
+            webView.setWebChromeClient(null);
+            webView.destroy();
+            webView = null;
+        }
+        // CookieManager is untouched, so the Xbox login is retained.
+        showWebview();
+    }
 
     private class PerformanceDialog extends Dialog {
         private TextView tvStats;
@@ -1356,6 +1422,9 @@ private boolean debug=false;
         androidx.appcompat.widget.AppCompatSpinner spinnerBitrate = dialog.findViewById(R.id.spinner_bitrate);
         androidx.appcompat.widget.AppCompatSpinner spinnerUA = dialog.findViewById(R.id.spinner_user_agent);
         androidx.appcompat.widget.AppCompatSpinner spinnerVideoProfile = dialog.findViewById(R.id.spinner_video_profile);
+        androidx.appcompat.widget.SwitchCompat lowLatencySwitch = dialog.findViewById(R.id.switch_low_latency);
+        lowLatencySwitch.setChecked(prefersMinimalPostProcessing());
+        lowLatencySwitch.setEnabled(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R);
         String[] profileLabels = {"Preferir Baseline (estável)", "Preferir High (experimental)"};
         android.widget.ArrayAdapter<String> profileAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, profileLabels);
         profileAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
@@ -1455,10 +1524,14 @@ private boolean debug=false;
                     .putString(KEY_RESOLUTION, selectedRes)
                     .putInt(KEY_BITRATE, selectedBitrate)
                     .putBoolean(KEY_HIGH_VIDEO_PROFILE, spinnerVideoProfile.getSelectedItemPosition() == 1)
+                    .putBoolean(KEY_LOW_LATENCY, lowLatencySwitch.isChecked())
                     .putString(KEY_USER_AGENT, selectedUA)
                     .putInt(KEY_INITIAL_SCALE, selectedScale)
                     .apply();
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                getWindow().setPreferMinimalPostProcessing(isStreaming && lowLatencySwitch.isChecked());
+            }
             if (webView != null) {
                 @SuppressLint("DefaultLocale") String js = String.format("window.BX_TARGET_REGION = '%s'; window.BX_TARGET_RES = '%s'; window.BX_TARGET_BITRATE = %d;",
                         selectedRegion, selectedRes, selectedBitrate);

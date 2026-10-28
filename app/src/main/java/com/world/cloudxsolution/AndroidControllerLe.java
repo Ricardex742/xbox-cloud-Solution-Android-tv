@@ -221,6 +221,12 @@ public final class AndroidControllerLe {
         }
     }
 
+    /** A new server registration needs a frame even if nothing has moved locally. */
+    public synchronized void sendCurrentState() {
+        lastSent = null;
+        sendIfChanged();
+    }
+
     public synchronized void releaseAll() {
         java.util.Arrays.fill(frame.axes, 0f);
         frame.buttons = 0;

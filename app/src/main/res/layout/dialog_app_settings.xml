@@ -120,6 +120,15 @@
         android:textSize="12sp"
         android:layout_marginBottom="16dp"/>
 
+    <androidx.appcompat.widget.SwitchCompat
+        android:id="@+id/switch_low_latency"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/low_latency_experimental"
+        android:textColor="@color/xbox_text_primary"
+        android:layout_marginBottom="16dp"
+        android:focusable="true"/>
+
     <TextView
         android:id="@+id/tv_initial_scale"
         android:layout_width="match_parent"

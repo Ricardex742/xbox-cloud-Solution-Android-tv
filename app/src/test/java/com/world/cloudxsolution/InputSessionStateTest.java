@@ -42,4 +42,16 @@ public class InputSessionStateTest {
         state.channel("control", "OPEN");
         assertTrue(state.canAnnounce());
     }
+    @Test public void nativeSnapshotRecoversMissedOpenEventsWithoutPhysicalMovement() {
+        InputSessionState state = new InputSessionState();
+        assertEquals("", state.activeChannel());
+        state.snapshot(false, true, true);
+        assertEquals("unreliableinput", state.activeChannel());
+        assertTrue(state.canAnnounce());
+        state.snapshot(true, false, true);
+        assertEquals("input", state.activeChannel());
+        state.snapshot(false, false, false);
+        assertEquals("", state.activeChannel());
+        assertFalse(state.canAnnounce());
+    }
 }

@@ -14,6 +14,12 @@ final class InputSessionState {
         if ("control".equalsIgnoreCase(label)) control = open;
     }
 
+    void snapshot(boolean legacy, boolean modern, boolean control) {
+        this.legacy = legacy;
+        this.modern = modern;
+        this.control = control;
+    }
+
     String activeChannel() {
         if (modern && (preferModern || !legacy)) return "unreliableinput";
         return legacy ? "input" : "";

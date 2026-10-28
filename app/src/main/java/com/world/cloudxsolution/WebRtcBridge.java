@@ -16,6 +16,7 @@ import java.util.HashMap;
 public class WebRtcBridge {
     private static final String TAG = "WebRtcBridge";
     private final MainActivity activity;
+    private volatile boolean active = true;
     private String keepAliveUrl;
     private String keepAliveToken;
     private boolean keepAliveActive;
@@ -64,7 +65,17 @@ public class WebRtcBridge {
         // proxy) instead. See MainActivity ServiceConnection changes.
     }
 
+    private void runIfActive(Runnable action) {
+        activity.runOnUiThread(() -> { if (active) action.run(); });
+    }
+
+    public void dispose() {
+        active = false;
+        stopKeepAlive();
+    }
+
     private IStreamingService service() {
+        if (!active) return null;
         IStreamingService s = activity.getStreamingService();
         if (s == null) Log.w(TAG, "StreamingService not bound yet, dropping call");
         return s;
@@ -72,7 +83,8 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onOfferReceived(final String sdp) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.handleRemoteOffer(sdp); } catch (Exception e) { Log.e(TAG, "onOfferReceived", e); }
@@ -81,7 +93,8 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onIceCandidateReceived(String sdpMid, int sdpMLineIndex, String candidate) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.addIceCandidate(sdpMid, sdpMLineIndex, candidate); } catch (Exception e) { Log.e(TAG, "iceCandidate", e); }
@@ -90,7 +103,8 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onOfferRequested(int bitrateMbps) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.createOffer(Math.max(0, Math.min(20, bitrateMbps)) * 1000, activity.prefersHighVideoProfile()); } catch (Exception e) { Log.e(TAG, "createOffer", e); }
@@ -99,12 +113,25 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onPeerConnectionConfig(String configJson) {
-        activity.onPeerConnectionConfigReceived(configJson);
+        if (!active) return;
+        runIfActive(() -> activity.onPeerConnectionConfigReceived(configJson));
+    }
+
+    @JavascriptInterface
+    public void onPeerConnectionConfigurationUpdate(String configJson) {
+        if (!active) return;
+        runIfActive(() -> {
+            IStreamingService s = service();
+            if (s == null) return;
+            try { s.updatePeerConfiguration(configJson); }
+            catch (Exception e) { Log.e(TAG, "updatePeerConfiguration", e); }
+        });
     }
 
     @JavascriptInterface
     public void onAnswerReceived(String sdp) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.handleRemoteAnswer(sdp); } catch (Exception e) { Log.e(TAG, "onAnswerReceived", e); }
@@ -113,7 +140,8 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onDataChannelCreate(String label) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.createDataChannel(label); } catch (Exception e) { Log.e(TAG, "createDataChannel", e); }
@@ -122,23 +150,33 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onDataChannelSend(String label, byte[] binary, String data, boolean isBinary) {
+        if (!active) return;
         activity.onDataChannelSend(label, binary, data, isBinary);
     }
 
     @JavascriptInterface
+    public void onControlAuthorizationSent() {
+        if (!active) return;
+        runIfActive(activity::onControlAuthorizationSent);
+    }
+
+    @JavascriptInterface
     public void gamepadIndex(int idx) {
-        activity.runOnUiThread(() -> activity.setGamepadIndex(idx));
+        if (!active) return;
+        runIfActive(() -> activity.setGamepadIndex(idx));
         activity.showCustomToast("Índice do controle: " + idx);
     }
 
     @JavascriptInterface
     public void setNativeGamepadEnabled(boolean enabled) {
-        activity.runOnUiThread(() -> activity.setNativeGamepadEnabled(enabled));
+        if (!active) return;
+        runIfActive(() -> activity.setNativeGamepadEnabled(enabled));
     }
 
     @JavascriptInterface
     public void onAddTransceiver(String trackOrKind, String direction) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.addTransceiver(trackOrKind, direction); } catch (Exception e) { Log.e(TAG, "addTransceiver", e); }
@@ -147,7 +185,8 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void onPeerConnectionClose() {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             activity.setStreamingState(false);
@@ -157,13 +196,15 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void setGamepadSettings(float deadzone, float sensitivity) {
+        if (!active) return;
         activity.showCustomToast("Controle: zona morta=" + deadzone + ", sensibilidade=" + sensitivity);
-        activity.runOnUiThread(() -> activity.updateGamepadSettings(deadzone, sensitivity));
+        runIfActive(() -> activity.updateGamepadSettings(deadzone, sensitivity));
     }
 
     @JavascriptInterface
     public void setStreamingState(boolean isStreaming) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             activity.setStreamingState(isStreaming);
             IStreamingService s = service();
             if (s == null) return;
@@ -173,19 +214,23 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void reloadWebview() {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
+            stopKeepAlive();
             if (activity.webView != null) activity.webView.reload();
         });
     }
 
     @JavascriptInterface
     public void setWebviewVisible() {
-        activity.runOnUiThread(activity::setWebviewVisible);
+        if (!active) return;
+        runIfActive(activity::setWebviewVisible);
     }
 
     @JavascriptInterface
     public void keepalive(String url, String token) {
-        activity.runOnUiThread(() -> {
+        if (!active) return;
+        runIfActive(() -> {
             if (url == null || token == null || token.isEmpty()) return;
             if (keepAliveActive && url.equals(keepAliveUrl) && token.equals(keepAliveToken)) return;
             stopKeepAlive();

@@ -1,3 +1,7 @@
+(function cloudxDocument() {
+    if (window.__cloudxDocumentInstalled || window.top !== window) return;
+    if (!/\/play(?:\/|$)/i.test(window.location.pathname)) return;
+    window.__cloudxDocumentInstalled = true;
 (function forcePtBrLocale() {
     try {
         if (window.location && window.location.pathname && /^\/(fr-fr|en-us|es-es|fr)\b/i.test(window.location.pathname)) {
@@ -90,6 +94,7 @@ window.handleDataChannelState = function(label, state) {
     console.log("[BxC] handleDataChannelState: " + label + " -> " + state);
     const dc = window.proxyDataChannels && window.proxyDataChannels[label];
     if (dc) {
+        if (dc.readyState === state.toLowerCase()) return;
         dc.readyState = state.toLowerCase();
         if (dc.readyState === 'open') dc.dispatchEvent(new Event('open'));
         if (dc.readyState === 'closed') dc.dispatchEvent(new Event('close'));
@@ -330,7 +335,7 @@ class XcloudInterceptor {
                 }
                 const url = typeof request === "string" ? request : request.url;
                 window.BX_EXPOSED.streamSession.domainName = new URL(url).origin;
-                BxLogger.info("streamSession", "Captured sessionPath and domainName:", window.BX_EXPOSED.streamSession);
+                BxLogger.info("streamSession", "Session metadata captured");
             }
         } catch (e) {
             BxLogger.error("XcloudInterceptor", "Session info capture failed", e);
@@ -503,6 +508,16 @@ class Patcher {
 }
 
 function patchRtcPeerConnection() {
+    if (window.__cloudxRtcInstalled) return;
+    window.__cloudxRtcInstalled = true;
+    // Keep catalog navigation working. Only a live native session owns game input.
+    const browserGamepads = navigator.getGamepads && navigator.getGamepads.bind(navigator);
+    try {
+        navigator.getGamepads = function() {
+            return window.peer && window.peer.signalingState !== 'closed'
+                ? [] : (browserGamepads ? browserGamepads() : []);
+        };
+    } catch (e) {}
     let OrgRTCPeerConnection = window.RTCPeerConnection;
 
     window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
@@ -532,14 +547,14 @@ function patchRtcPeerConnection() {
     };
 
     window.simulateOnTrack = function(kind, id) {
-        try { navigator.getGamepads = function() { return []; }; } catch (e) {}
+        if (!window.peer || window.peer.signalingState === 'closed') return;
         console.log("[BxC] Simulating lightweight ontrack for " + kind);
 
         let stream;
         let track;
 
         if (kind === 'video') {
-            // OTIMIZADO: Canvas minimo de 2x2 a 1 FPS (Zero uso de GPU/RAM em segundo plano na TV)
+            // Minimal placeholder track; the native surface renders the real video.
             const canvas = document.createElement('canvas');
             canvas.width = 2;
             canvas.height = 2;
@@ -551,11 +566,13 @@ function patchRtcPeerConnection() {
             track = stream.getVideoTracks()[0];
         } else {
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            window.peer._auxAudioContexts.push(audioCtx);
             const destination = audioCtx.createMediaStreamDestination();
             stream = destination.stream;
             track = stream.getAudioTracks()[0];
         }
 
+        window.peer._auxStreams.push(stream);
         let event = new Event('track');
         event.track = track;
         event.streams = [stream];
@@ -596,10 +613,11 @@ function patchRtcPeerConnection() {
     };
 
     window.RTCPeerConnection = function(config) {
-        console.log("[BxC] RTCPeerConnection constructor called", JSON.stringify(config));
+        if (window.peer && window.peer.signalingState !== 'closed') window.peer.close();
+        console.log("[BxC] RTCPeerConnection constructor called");
 
-        if (window.AndroidBridge && config) {
-            window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config));
+        if (window.AndroidBridge) {
+            window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config || {}));
         }
 
         clearTimeout(window.bxKeepAliveTimer);
@@ -614,6 +632,8 @@ function patchRtcPeerConnection() {
             signalingState: 'stable',
             _listeners: {},
             _transceivers: [],
+            _auxStreams: [],
+            _auxAudioContexts: [],
 
             createDataChannel: function(label, options) {
                 console.log("[BxC] Proxy createDataChannel: " + label);
@@ -633,6 +653,7 @@ function patchRtcPeerConnection() {
                     onclose: null,
 
                     send: function(data) {
+                        if (pc.signalingState === 'closed' || window.peer !== pc) return;
                         if (label === 'input' || label === 'unreliableinput') return;
                         if (window.AndroidBridge) {
                             let isBinary = typeof data !== 'string';
@@ -640,11 +661,14 @@ function patchRtcPeerConnection() {
                                 window.AndroidBridge.onDataChannelSend(label, (ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data)), null, true);
                                 return;
                             } else {
+                                let authorizationSent = false;
                                 if (label === 'control') {
                                     try {
                                         // Native code owns the virtual controller. The hidden browser
                                         // sees no physical gamepads and must not remove that slot.
-                                        if (JSON.parse(data).message === 'gamepadChanged') return;
+                                        const message = JSON.parse(data).message;
+                                        if (message === 'gamepadChanged') return;
+                                        authorizationSent = message === 'authorizationRequest';
                                     } catch (e) {}
                                 }
                                 if (label === 'control' && data.includes('resolutionAlias')) {
@@ -663,6 +687,10 @@ function patchRtcPeerConnection() {
                                 }
                                 let base64 = window.btoa(unescape(encodeURIComponent(data)));
                                 window.AndroidBridge.onDataChannelSend(label, null, base64, false);
+                                // control is ordered: enqueue native gamepad registration after authorization.
+                                if (authorizationSent && window.AndroidBridge.onControlAuthorizationSent) {
+                                    window.AndroidBridge.onControlAuthorizationSent();
+                                }
                             }
                         }
                     },
@@ -767,8 +795,9 @@ function patchRtcPeerConnection() {
 
             setConfiguration: function(config) {
                 this.config = config;
+                if (this.signalingState === 'closed' || window.peer !== this) throw new Error('Peer connection closed');
                 if (window.AndroidBridge && config) {
-                    window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config));
+                    window.AndroidBridge.onPeerConnectionConfigurationUpdate(JSON.stringify(config));
                 }
             },
 
@@ -791,6 +820,11 @@ function patchRtcPeerConnection() {
             close: function() {
                 if (this.signalingState === 'closed') return;
                 this.signalingState = 'closed';
+                for (const stream of this._auxStreams) stream.getTracks().forEach(track => track.stop());
+                for (const audio of this._auxAudioContexts) { try { audio.close(); } catch (e) {} }
+                this._auxStreams = []; this._auxAudioContexts = [];
+                if (window.peer !== this) return;
+                window.proxyDataChannels = {};
                 clearTimeout(window.bxKeepAliveTimer);
                 window.bxKeepAliveStarted = false;
                 if (window.AndroidBridge) {
@@ -809,16 +843,9 @@ function patchRtcPeerConnection() {
     }
 }
 
-window.addEventListener("load", () => {
-    window.setTimeout(() => {
-        patchRtcPeerConnection();
-        if (document.body && document.body.classList.contains("legacyBackground")) {
-            window.stop();
-            window.location.reload(true);
-        }
-    }, 300);
-    InitBc();
-});
+// Install synchronously at document start; waiting for load may miss the SDK's first peer.
+patchRtcPeerConnection();
+InitBc();
 
 function InitBc() {
     window.worker = null;
@@ -847,3 +874,5 @@ function main() {
 }
 
 main();
+
+})();

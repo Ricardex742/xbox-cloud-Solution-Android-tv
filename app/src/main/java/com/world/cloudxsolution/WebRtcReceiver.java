@@ -48,7 +48,9 @@ public class WebRtcReceiver implements Loggable {
     private volatile PeerConnection peerConnection;
     private AudioDeviceModule audioDeviceModule;
     private final java.util.concurrent.ConcurrentHashMap<String, DataChannel> dataChannels = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, DataChannel.State> channelStates = new java.util.concurrent.ConcurrentHashMap<>();
     private long lastSendWarningMs;
+    private volatile long acceptedInputPackets, rejectedInputPackets;
 
     private SurfaceViewRenderer remoteRenderer;
     private SignalingListener signalingListener;
@@ -190,6 +192,18 @@ public class WebRtcReceiver implements Loggable {
     }
 
     public void createPeerConnection(String iceServersJson) {
+        createPeerConnection(parseIceServers(iceServersJson));
+    }
+
+    public synchronized void updatePeerConfiguration(String iceServersJson) {
+        if (peerConnection == null) return;
+        if (!peerConnection.setConfiguration(rtcConfiguration(parseIceServers(iceServersJson)))) {
+            Log.w(TAG, "Peer configuration update rejected; keeping the current session");
+        }
+        requestInputChannelSnapshot();
+    }
+
+    private List<PeerConnection.IceServer> parseIceServers(String iceServersJson) {
         List<PeerConnection.IceServer> iceServers = new ArrayList<>();
         try {
             if (iceServersJson != null && !iceServersJson.equals("null") && !iceServersJson.isEmpty()) {
@@ -223,25 +237,27 @@ public class WebRtcReceiver implements Loggable {
         if (iceServers.isEmpty()) {
             iceServers.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
         }
-        createPeerConnection(iceServers);
+        return iceServers;
+    }
+
+    private PeerConnection.RTCConfiguration rtcConfiguration(List<PeerConnection.IceServer> iceServers) {
+        PeerConnection.RTCConfiguration rtcConfig = new PeerConnection.RTCConfiguration(iceServers);
+        rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
+        rtcConfig.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE;
+        rtcConfig.bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE;
+        rtcConfig.rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE;
+        rtcConfig.tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED;
+        rtcConfig.candidateNetworkPolicy = PeerConnection.CandidateNetworkPolicy.LOW_COST;
+        rtcConfig.keyType = PeerConnection.KeyType.ECDSA;
+        rtcConfig.audioJitterBufferFastAccelerate= true;
+        return rtcConfig;
     }
 
     public void createPeerConnection(List<PeerConnection.IceServer> iceServers) {
         synchronized (this) {
-            if (peerConnection != null) {
-                peerConnection.close();
-                peerConnection.dispose();
-            }
-
-            PeerConnection.RTCConfiguration rtcConfig = new PeerConnection.RTCConfiguration(iceServers);
-            rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
-            rtcConfig.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE;
-            rtcConfig.bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE;
-            rtcConfig.rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE;
-            rtcConfig.tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED;
-            rtcConfig.candidateNetworkPolicy = PeerConnection.CandidateNetworkPolicy.LOW_COST;
-            rtcConfig.keyType = PeerConnection.KeyType.ECDSA;
-            rtcConfig.audioJitterBufferFastAccelerate= true;
+            if (peerConnection != null) closeSession();
+            acceptedInputPackets = rejectedInputPackets = 0;
+            PeerConnection.RTCConfiguration rtcConfig = rtcConfiguration(iceServers);
             peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, new PeerConnection.Observer() {
                 @Override
                 public void onIceCandidate(IceCandidate candidate) {
@@ -338,16 +354,20 @@ public class WebRtcReceiver implements Loggable {
     }
 
     public void handleRemoteOffer(SessionDescription offerSdp, AnswerReadyCallback callback) {
-        peerConnection.setRemoteDescription(new SdpObserverAdapter() {
+        final PeerConnection connection = peerConnection;
+        if (connection == null) return;
+        connection.setRemoteDescription(new SdpObserverAdapter() {
             @Override
             public void onSetSuccess() {
-                peerConnection.createAnswer(new SdpObserverAdapter() {
+                if (peerConnection != connection) return;
+                connection.createAnswer(new SdpObserverAdapter() {
                     @Override
                     public void onCreateSuccess(SessionDescription answerSdp) {
-                        peerConnection.setLocalDescription(new SdpObserverAdapter() {
+                        if (peerConnection != connection) return;
+                        connection.setLocalDescription(new SdpObserverAdapter() {
                             @Override
                             public void onSetSuccess() {
-                                callback.onAnswerReady(answerSdp);
+                                if (peerConnection == connection) callback.onAnswerReady(answerSdp);
                             }
                         }, answerSdp);
                     }
@@ -357,8 +377,11 @@ public class WebRtcReceiver implements Loggable {
     }
 
     public void handleRemoteAnswer(SessionDescription answerSdp) {
-        peerConnection.setRemoteDescription(new SdpObserverAdapter() {
+        final PeerConnection connection = peerConnection;
+        if (connection == null) return;
+        connection.setRemoteDescription(new SdpObserverAdapter() {
             @Override public void onSetSuccess() {
+                if (peerConnection != connection) return;
                 answeredProfiles = VideoQualityPolicy.h264Profiles(answerSdp.description).toString();
                 Log.i(TAG, "Remote answer set successfully");
             }
@@ -366,23 +389,26 @@ public class WebRtcReceiver implements Loggable {
     }
 
     public void createOffer(int bitrateKbps, boolean preferHigh, OfferReadyCallback callback) {
+        final PeerConnection connection = peerConnection;
+        if (connection == null) return;
         preferHighProfile = preferHigh;
-        for (RtpTransceiver transceiver : peerConnection.getTransceivers()) {
+        for (RtpTransceiver transceiver : connection.getTransceivers()) {
             if (!transceiver.isStopped() && transceiver.getMediaType() == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) {
                 setVideoCodecPreferences(transceiver);
             }
         }
         Log.i(TAG, "Video request: " + VideoQualityPolicy.maxKbps(bitrateKbps)
                 + " kbps, prefer hardware High=" + preferHigh);
-        peerConnection.createOffer(new SdpObserverAdapter() {
+        connection.createOffer(new SdpObserverAdapter() {
             @Override
             public void onCreateSuccess(SessionDescription sessionDescription) {
+                if (peerConnection != connection) return;
                 final SessionDescription configuredOffer = new SessionDescription(sessionDescription.type,
                         SdpPolicy.videoBandwidth(sessionDescription.description, bitrateKbps));
                 highOffered = VideoQualityPolicy.offersH264High(configuredOffer.description);
                 offeredProfiles = VideoQualityPolicy.h264Profiles(configuredOffer.description).toString();
-                peerConnection.setLocalDescription(new SdpObserverAdapter() {
-                    @Override public void onSetSuccess() { callback.onOfferReady(configuredOffer); }
+                connection.setLocalDescription(new SdpObserverAdapter() {
+                    @Override public void onSetSuccess() { if (peerConnection == connection) callback.onOfferReady(configuredOffer); }
                 }, configuredOffer);
             }
         }, new org.webrtc.MediaConstraints());
@@ -448,9 +474,18 @@ public class WebRtcReceiver implements Loggable {
             setupDataChannel(channel);
         }
     }
+    private boolean channelOpen(String label) {
+        return channelStates.get(label) == DataChannel.State.OPEN;
+    }
+
+    public void requestInputChannelSnapshot() {
+        host.onInputChannelSnapshot(channelOpen("input"), channelOpen("unreliableinput"), channelOpen("control"));
+    }
+
     private void setupDataChannel(DataChannel channel) {
         String label = channel.label();
         dataChannels.put(label, channel);
+        channelStates.put(label, channel.state());
 
         channel.registerObserver(new DataChannel.Observer() {
             @Override
@@ -463,19 +498,19 @@ public class WebRtcReceiver implements Loggable {
             @Override
             public void onStateChange() {
                 if (dataChannels.get(label) != channel) return;
+                channelStates.put(label, channel.state());
                 //host.showToast("[debug]:Data channel " + label + " state change: " + channel.state().toString());
                 Log.i(TAG, "Data channel " + label + " state change: " + channel.state());
                 
                 boolean isInputChannel = "unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label);
                 
                 if (isInputChannel) {
-                    boolean anyInputOpen = dataChannels.entrySet().stream().anyMatch(entry ->
-                            ("input".equalsIgnoreCase(entry.getKey()) || "unreliableinput".equalsIgnoreCase(entry.getKey()))
-                                    && entry.getValue().state() == DataChannel.State.OPEN);
+                    boolean anyInputOpen = channelOpen("input") || channelOpen("unreliableinput");
                     if (anyInputOpen) host.setStreamingState(true);
                     host.setNativeGamepadEnabled(anyInputOpen);
                 }
                 host.onDataChannelStateChanged(label, channel.state().toString());
+                requestInputChannelSnapshot();
             }
 
             @Override
@@ -505,18 +540,24 @@ public class WebRtcReceiver implements Loggable {
                 host.onDataChannelMessageReceived(label, null,dataStr, false);
             }
         });
+        host.onDataChannelStateChanged(label, channel.state().toString());
+        requestInputChannelSnapshot();
     }
 
     public synchronized void sendDataChannelMessage(String label, byte[] data, boolean isBinary) {
         DataChannel channel = dataChannels.get(label);
-        if (channel != null && channel.state() == DataChannel.State.OPEN) {
-
-            if (!channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary))) {
-                long now = android.os.SystemClock.elapsedRealtime();
-                if (now - lastSendWarningMs >= 1000) {
-                    lastSendWarningMs = now;
-                    Log.w(TAG, "DataChannel rejected send: " + label);
-                }
+        boolean input = "input".equals(label) || "unreliableinput".equals(label);
+        boolean accepted = channel != null && channel.state() == DataChannel.State.OPEN
+                && channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary));
+        if (input) {
+            if (accepted) acceptedInputPackets++;
+            else rejectedInputPackets++;
+        }
+        if (!accepted) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastSendWarningMs >= 1000) {
+                lastSendWarningMs = now;
+                Log.w(TAG, "DataChannel not ready or rejected send: " + label);
             }
         }
     }
@@ -560,6 +601,7 @@ public class WebRtcReceiver implements Loggable {
 
             List<DataChannel> closingChannels = new ArrayList<>(dataChannels.values());
             dataChannels.clear();
+            channelStates.clear();
             for (DataChannel channel : closingChannels) channel.dispose();
             host.setNativeGamepadEnabled(false);
             host.setStreamingState(false);
@@ -614,6 +656,7 @@ public class WebRtcReceiver implements Loggable {
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
                         summary += "\n" + VideoStatsSampler.profileStatus(preferHighProfile, hardwareHighAvailable, highOffered,
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
+                        summary += "\nControle enviado: " + acceptedInputPackets + " | Recusado localmente: " + rejectedInputPackets;
                         summary += "\nPerfis na oferta: " + offeredProfiles + "\nPerfis na resposta: " + answeredProfiles;
                         if (signalingListener != null) {
                             signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary);

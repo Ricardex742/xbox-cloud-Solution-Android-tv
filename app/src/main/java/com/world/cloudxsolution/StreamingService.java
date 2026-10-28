@@ -278,6 +278,15 @@ public class StreamingService extends Service implements StreamHost {
         @Override
         public void createPeerConnection(String iceServersJson) {
             webRtcReceiver.createPeerConnection(iceServersJson);
+            broadcast(cb -> safe(cb::onRenderSurfaceRequested));
+        }
+
+        @Override public void updatePeerConfiguration(String iceServersJson) {
+            webRtcReceiver.updatePeerConfiguration(iceServersJson);
+        }
+
+        @Override public void requestInputChannelSnapshot() {
+            webRtcReceiver.requestInputChannelSnapshot();
         }
 
         @Override
@@ -292,7 +301,7 @@ public class StreamingService extends Service implements StreamHost {
                // Log.i(TAG, "streamingService send data to: " + label + " (" + binary.length + " bytes)");
                 webRtcReceiver.sendDataChannelMessage(label, binary, isBinary);
             } else if (data != null) {
-                Log.i(TAG, "streamingService send data to: " + label + " (String length: " + data.length() + ")");
+
                 webRtcReceiver.sendDataChannelMessage(label, data, isBinary);
             }
         }
@@ -426,6 +435,10 @@ public class StreamingService extends Service implements StreamHost {
     @Override
     public boolean isNativeGamepadEnabled() {
         return nativeGamepadEnabledMirror && isStreamingMirror;
+    }
+
+    @Override public void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control) {
+        broadcast(cb -> safe(() -> cb.onInputChannelSnapshot(legacy, modern, control)));
     }
 
     @Override

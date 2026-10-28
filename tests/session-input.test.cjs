@@ -9,7 +9,7 @@ function setup() {
     let nextTimer = 0;
     const c = {console: {log() {}, warn() {}, error() {}}, URL,
         location: {pathname: '/pt-BR/play', href: 'https://www.xbox.com/pt-BR/play', origin: 'https://www.xbox.com'},
-        navigator: {}, localStorage: {getItem() {return null;}, setItem() {}},
+        navigator: {getGamepads() {return ['physical-pad'];}}, localStorage: {getItem() {return null;}, setItem() {}},
         Event: class {constructor(type) {this.type = type;}},
         MessageEvent: class {constructor(type, options) {this.type = type; Object.assign(this, options);}},
         setTimeout(fn, ms) {const id = ++nextTimer; timers.set(id, {fn, ms}); return id;},
@@ -17,15 +17,14 @@ function setup() {
         btoa(s) {return Buffer.from(s, 'binary').toString('base64');},
         atob(s) {return Buffer.from(s, 'base64').toString('binary');},
         getTargetResolution: () => '720', getTargetBitrate: () => 8,
+        document: {body: null, readyState: 'loading'},
+        fetch: async () => {throw new Error('unexpected fetch');},
+        WebSocket: function OriginalSocket() {},
         RTCPeerConnection: function OriginalPeer() {},
         AndroidBridge: new Proxy({}, {get: (_, name) => (...args) => calls.push([name, ...args])})};
-    c.window = c;
+    c.window = c; c.top = c;
     vm.createContext(c);
-    vm.runInContext(source.slice(0, source.indexOf('const BypassServerIps')), c);
-    const patchStart = source.indexOf('function patchRtcPeerConnection()');
-    const patchEnd = source.indexOf('\n}', patchStart) + 2;
-    vm.runInContext(source.slice(patchStart, patchEnd), c);
-    c.patchRtcPeerConnection();
+    vm.runInContext(source, c);
     const pc = new c.RTCPeerConnection({iceServers: []});
     return {c, pc, calls, timers};
 }
@@ -98,4 +97,72 @@ test('missing metadata polling is bounded and stops when session closes', () => 
     assert.equal(timers.size, 1);
     second.close();
     assert.equal(timers.size, 0);
+});
+
+test('proxy is installed before load and reinjection does not wrap it a second time', () => {
+    const {c, calls} = setup();
+    assert.equal(c.document.readyState, 'loading');
+    assert.equal(c.__cloudxRtcInstalled, true);
+    const installed = c.RTCPeerConnection;
+    vm.runInContext(source, c);
+    assert.equal(c.RTCPeerConnection, installed);
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfig').length, 1);
+});
+
+test('configuration update preserves the peer, channels and session input', () => {
+    const {c, pc, calls} = setup();
+    const input = pc.createDataChannel('unreliableinput');
+    c.handleDataChannelState('unreliableinput', 'OPEN');
+    pc.setConfiguration({iceServers: [{urls: 'stun:example.test'}]});
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfig').length, 1);
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionClose').length, 0);
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfigurationUpdate').length, 1);
+    assert.equal(c.proxyDataChannels.unreliableinput, input);
+    assert.equal(input.readyState, 'open');
+});
+
+test('exit stops auxiliary media and stale peers cannot close or send into the next session', () => {
+    const {c, pc, calls} = setup();
+    const oldChannel = pc.createDataChannel('control');
+    let stopped = 0, audioClosed = 0;
+    pc._auxStreams.push({getTracks: () => [{stop() {stopped++;}}]});
+    pc._auxAudioContexts.push({close() {audioClosed++;}});
+    const next = new c.RTCPeerConnection({});
+    assert.deepEqual([stopped, audioClosed], [1, 1]);
+    const before = calls.length;
+    pc.close(); oldChannel.send('{"message":"late"}');
+    assert.equal(calls.length, before);
+    assert.equal(next.signalingState, 'stable');
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionClose').length, 1);
+});
+
+test('duplicate OPEN notifications do not restart the SDK channel handshake', () => {
+    const {c, pc} = setup();
+    let opens = 0;
+    const dc = pc.createDataChannel('control');
+    dc.onopen = () => opens++;
+    c.handleDataChannelState('control', 'OPEN');
+    c.handleDataChannelState('control', 'OPEN');
+    assert.equal(opens, 1);
+});
+
+test('controller registration hook runs after control authorization has been sent', () => {
+    const {pc, calls} = setup();
+    const dc = pc.createDataChannel('control');
+    dc.send('{"message":"authorizationRequest","accessKey":"test"}');
+    const send = calls.findIndex(x => x[0] === 'onDataChannelSend');
+    const announce = calls.findIndex(x => x[0] === 'onControlAuthorizationSent');
+    assert.ok(send >= 0 && announce > send);
+    assert.equal(Buffer.from(calls[send][3], 'base64').toString(), '{"message":"authorizationRequest","accessKey":"test"}');
+    dc.send('{"message":"other"}');
+    assert.equal(calls.filter(x => x[0] === 'onControlAuthorizationSent').length, 1);
+});
+
+test('browser keeps the physical controller for catalog navigation after a session closes', () => {
+    const {c, pc} = setup();
+    assert.equal(c.navigator.getGamepads().length, 0);
+    pc.close();
+    assert.deepEqual(Array.from(c.navigator.getGamepads()), ['physical-pad']);
+    new c.RTCPeerConnection({});
+    assert.equal(c.navigator.getGamepads().length, 0);
 });

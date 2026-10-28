@@ -210,6 +210,13 @@ public final class AndroidGamepadListener {
         return true;
     }
 
+    /** Register the current state after session authorization without releasing held inputs. */
+    public void sendCurrentState() {
+        synchronized (stateLock) {
+            sendUnreliableIfChanged(TYPE_MOTION);
+        }
+    }
+
     public void releaseAll() {
         synchronized (stateLock) {
             transitionFrame.resetAllHeldButtons();
