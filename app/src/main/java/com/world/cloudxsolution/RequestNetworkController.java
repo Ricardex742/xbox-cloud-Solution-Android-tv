@@ -1,25 +1,13 @@
 package com.world.cloudxsolution;
 
-import android.annotation.SuppressLint;
-
 import androidx.annotation.NonNull;
 
 import com.google.gson.Gson;
 
 import java.io.IOException;
-import java.security.SecureRandom;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
 import java.util.HashMap;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
-
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSession;
-import javax.net.ssl.SSLSocketFactory;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -55,52 +43,14 @@ public class RequestNetworkController {
         return mInstance;
     }
 
-    private OkHttpClient getClient() {
+    private synchronized OkHttpClient getClient() {
         if (client == null) {
-            OkHttpClient.Builder builder = new OkHttpClient.Builder();
-
-            try {
-                @SuppressLint("CustomX509TrustManager") final TrustManager[] trustAllCerts = new TrustManager[]{
-                        new X509TrustManager() {
-                            @SuppressLint("TrustAllX509TrustManager")
-                            @Override
-                            public void checkClientTrusted(X509Certificate[] chain, String authType)
-                                    throws CertificateException {
-                            }
-
-                            @SuppressLint("TrustAllX509TrustManager")
-                            @Override
-                            public void checkServerTrusted(X509Certificate[] chain, String authType)
-                                    throws CertificateException {
-                            }
-
-                            @Override
-                            public X509Certificate[] getAcceptedIssuers() {
-                                return new X509Certificate[]{};
-                            }
-                        }
-                };
-
-                final SSLContext sslContext = SSLContext.getInstance("TLS");
-                sslContext.init(null, trustAllCerts, new SecureRandom());
-                final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
-                builder.sslSocketFactory(sslSocketFactory, (X509TrustManager) trustAllCerts[0]);
-                builder.connectTimeout(SOCKET_TIMEOUT, TimeUnit.MILLISECONDS);
-                builder.readTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS);
-                builder.writeTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS);
-                builder.hostnameVerifier(new HostnameVerifier() {
-                    @SuppressLint("BadHostnameVerifier")
-                    @Override
-                    public boolean verify(String hostname, SSLSession session) {
-                        return true;
-                    }
-                });
-            } catch (Exception ignored) {
-            }
-
-            client = builder.build();
+            client = new OkHttpClient.Builder()
+                    .connectTimeout(SOCKET_TIMEOUT, TimeUnit.MILLISECONDS)
+                    .readTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS)
+                    .writeTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS)
+                    .build();
         }
-
         return client;
     }
 
@@ -175,18 +125,19 @@ public class RequestNetworkController {
 
                 @Override
                 public void onResponse(@NonNull Call call, @NonNull final Response response) throws IOException {
-                    final String responseBody = response.body().string().trim();
-                    requestNetwork.getActivity().runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            Headers b = response.headers();
-                            HashMap<String, Object> map = new HashMap<>();
-                            for (String s : b.names()) {
-                                map.put(s, b.get(s) != null ? b.get(s) : "null");
-                            }
-                            requestListener.onResponse(tag, responseBody, map);
+                    try (Response closedResponse = response) {
+                        if (!response.isSuccessful()) {
+                            final String error = "HTTP " + response.code();
+                            requestNetwork.getActivity().runOnUiThread(() -> requestListener.onErrorResponse(tag, error));
+                            return;
                         }
-                    });
+                        final String responseBody = response.body() == null ? "" : response.body().string().trim();
+                        HashMap<String, Object> headers = new HashMap<>();
+                        for (String name : response.headers().names()) headers.put(name, response.header(name));
+                        requestNetwork.getActivity().runOnUiThread(() -> requestListener.onResponse(tag, responseBody, headers));
+                    } catch (IOException e) {
+                        requestNetwork.getActivity().runOnUiThread(() -> requestListener.onErrorResponse(tag, "Network read failed"));
+                    }
                 }
             });
         } catch (Exception e) {

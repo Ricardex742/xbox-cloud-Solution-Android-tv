@@ -29,6 +29,26 @@ window.handleOffer = function(sdp) {
     }
 };
 
+window.bxKeepAliveTimer = null;
+window.bxKeepAliveStarted = false;
+window.bxStartKeepAlive = function() {
+    if (window.bxKeepAliveStarted) return;
+    window.bxKeepAliveStarted = true;
+    let attempts = 0;
+    function start() {
+        window.bxKeepAliveTimer = null;
+        if (!window.peer || window.peer.signalingState === 'closed') return;
+        const session = window.BX_EXPOSED && window.BX_EXPOSED.streamSession;
+        if (session && session.gsToken && session.sessionPath && session.domainName && window.AndroidBridge) {
+            window.AndroidBridge.keepalive(session.domainName + '/' + session.sessionPath + '/keepalive', session.gsToken);
+            return;
+        }
+        if (++attempts < 120) window.bxKeepAliveTimer = setTimeout(start, 250);
+        else console.warn('[BxC] Native keepalive metadata unavailable; retaining browser session');
+    }
+    start();
+};
+
 window.handleIceCandidate = function(sdpMid, sdpMLineIndex, sdp) {
     console.log("[BxC] handleIceCandidate from Java: " + sdpMid + " sdp length: " + (sdp ? sdp.length : 0));
     if (window.peer && window.peer.onicecandidate) {
@@ -55,21 +75,7 @@ window.handleDataChannelMessage = function(label, binaryData, textData, isBinary
         }
 
         if (label === 'message' && typeof data === 'string' && data.includes('HandshakeAck')) {
-            async function CXkeepalive() {
-                let CXtoken = window.BX_EXPOSED.streamSession.gsToken;
-                let CXsessionPath = window.BX_EXPOSED.streamSession.sessionPath;
-                let CXendPoint = window.BX_EXPOSED.streamSession.domainName;
-                if (CXtoken && CXtoken.length > 0 && CXsessionPath && CXsessionPath.length > 0 && CXendPoint && CXendPoint.length > 0) {
-                    let CXurl = CXendPoint + '/' + CXsessionPath + '/keepalive';
-                    console.log("[BxC] Keepalive URL:", CXurl);
-                    if (window.AndroidBridge && window.AndroidBridge.keepalive) {
-                        window.AndroidBridge.keepalive(CXurl, CXtoken);
-                    }
-                    return;
-                }
-                return setTimeout(CXkeepalive, 50);
-            }
-            setTimeout(CXkeepalive, 50);
+            window.bxStartKeepAlive();
         }
 
         const event = new MessageEvent('message', {
@@ -77,7 +83,6 @@ window.handleDataChannelMessage = function(label, binaryData, textData, isBinary
             origin: window.location.origin
         });
         dc.dispatchEvent(event);
-        if (dc.onmessage) dc.onmessage(event);
     }
 };
 
@@ -86,8 +91,8 @@ window.handleDataChannelState = function(label, state) {
     const dc = window.proxyDataChannels && window.proxyDataChannels[label];
     if (dc) {
         dc.readyState = state.toLowerCase();
-        if (dc.onopen && dc.readyState === 'open') dc.onopen();
-        if (dc.onclose && dc.readyState === 'closed') dc.onclose();
+        if (dc.readyState === 'open') dc.dispatchEvent(new Event('open'));
+        if (dc.readyState === 'closed') dc.dispatchEvent(new Event('close'));
     }
 };
 
@@ -597,6 +602,9 @@ function patchRtcPeerConnection() {
             window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config));
         }
 
+        clearTimeout(window.bxKeepAliveTimer);
+        window.bxKeepAliveStarted = false;
+        window.proxyDataChannels = {};
         const pc = {
             config: config,
             localDescription: null,
@@ -625,16 +633,20 @@ function patchRtcPeerConnection() {
                     onclose: null,
 
                     send: function(data) {
-                        if (label === 'input' || label === 'unreliableinput' || label === 'reliableinput') return;
+                        if (label === 'input' || label === 'unreliableinput') return;
                         if (window.AndroidBridge) {
-                            if (label === 'message' && typeof data === 'string' && !data.includes('Handshake')) {
-                                return;
-                            }
                             let isBinary = typeof data !== 'string';
                             if (isBinary) {
-                                window.AndroidBridge.onDataChannelSend(label, new Uint8Array(data), null, true);
+                                window.AndroidBridge.onDataChannelSend(label, (ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data)), null, true);
                                 return;
                             } else {
+                                if (label === 'control') {
+                                    try {
+                                        // Native code owns the virtual controller. The hidden browser
+                                        // sees no physical gamepads and must not remove that slot.
+                                        if (JSON.parse(data).message === 'gamepadChanged') return;
+                                    } catch (e) {}
+                                }
                                 if (label === 'control' && data.includes('resolutionAlias')) {
                                     try {
                                         let overridesData = JSON.parse(data);
@@ -660,7 +672,7 @@ function patchRtcPeerConnection() {
                     addEventListener: function(type, listener) {
                         if (!this._listeners) this._listeners = {};
                         if (!this._listeners[type]) this._listeners[type] = [];
-                        this._listeners[type].push(listener);
+                        if (!this._listeners[type].includes(listener)) this._listeners[type].push(listener);
                     },
                     removeEventListener: function(type, listener) {
                         if (this._listeners && this._listeners[type]) {
@@ -668,12 +680,12 @@ function patchRtcPeerConnection() {
                         }
                     },
                     dispatchEvent: function(event) {
-                        if (event.type === 'message') {
-                            if (this.onmessage) this.onmessage(event);
-                            if (this._listeners && this._listeners['message']) {
-                                this._listeners['message'].forEach(l => l(event));
-                            }
+                        const handler = this['on' + event.type];
+                        if (handler) handler.call(this, event);
+                        if (this._listeners && this._listeners[event.type]) {
+                            this._listeners[event.type].slice().forEach(l => l.call(this, event));
                         }
+                        return true;
                     }
                 };
 
@@ -769,8 +781,7 @@ function patchRtcPeerConnection() {
 
             addEventListener: function(type, listener) {
                 if (!this._listeners[type]) this._listeners[type] = [];
-                this._listeners[type].push(listener);
-                this['on' + type] = listener;
+                if (!this._listeners[type].includes(listener)) this._listeners[type].push(listener);
             },
 
             getStats: function() {
@@ -778,6 +789,10 @@ function patchRtcPeerConnection() {
             },
 
             close: function() {
+                if (this.signalingState === 'closed') return;
+                this.signalingState = 'closed';
+                clearTimeout(window.bxKeepAliveTimer);
+                window.bxKeepAliveStarted = false;
                 if (window.AndroidBridge) {
                     window.AndroidBridge.onPeerConnectionClose();
                 }

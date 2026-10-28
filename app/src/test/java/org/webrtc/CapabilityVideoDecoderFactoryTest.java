@@ -67,4 +67,14 @@ public class CapabilityVideoDecoderFactoryTest {
         assertFalse(CapabilityVideoDecoderFactory.supportsHighLevel31(CodecProfileLevel.AVCProfileHigh10, CodecProfileLevel.AVCLevel52));
         assertFalse(CapabilityVideoDecoderFactory.supportsHighLevel31(CodecProfileLevel.AVCProfileHigh, CodecProfileLevel.AVCLevel3));
     }
+    @Test public void fullHighAddsDistinctProfilesButConstrainedHardwareDoesNotOverclaim() {
+        VideoCodecInfo[] full = CapabilityVideoDecoderFactory.highCodecs(true);
+        assertEquals(2, full.length);
+        assertEquals("64001f", full[0].params.get("profile-level-id"));
+        assertEquals("640c1f", full[1].params.get("profile-level-id"));
+        assertEquals("1", full[0].params.get("packetization-mode"));
+        VideoCodecInfo[] constrained = CapabilityVideoDecoderFactory.highCodecs(false);
+        assertEquals(1, constrained.length);
+        assertEquals("640c1f", constrained[0].params.get("profile-level-id"));
+    }
 }

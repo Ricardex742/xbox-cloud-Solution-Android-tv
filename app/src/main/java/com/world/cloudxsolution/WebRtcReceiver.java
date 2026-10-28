@@ -58,6 +58,7 @@ public class WebRtcReceiver implements Loggable {
     private volatile boolean preferHighProfile;
     private volatile boolean hardwareHighAvailable;
     private volatile boolean highOffered;
+    private volatile String offeredProfiles = "n/d", answeredProfiles = "n/d";
     private final VideoStatsSampler videoStatsSampler = new VideoStatsSampler();
     private final android.os.Handler statsHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private boolean statsPending;
@@ -357,7 +358,10 @@ public class WebRtcReceiver implements Loggable {
 
     public void handleRemoteAnswer(SessionDescription answerSdp) {
         peerConnection.setRemoteDescription(new SdpObserverAdapter() {
-            @Override public void onSetSuccess() { Log.i(TAG, "Remote answer set successfully"); }
+            @Override public void onSetSuccess() {
+                answeredProfiles = VideoQualityPolicy.h264Profiles(answerSdp.description).toString();
+                Log.i(TAG, "Remote answer set successfully");
+            }
         }, answerSdp);
     }
 
@@ -376,6 +380,7 @@ public class WebRtcReceiver implements Loggable {
                 final SessionDescription configuredOffer = new SessionDescription(sessionDescription.type,
                         SdpPolicy.videoBandwidth(sessionDescription.description, bitrateKbps));
                 highOffered = VideoQualityPolicy.offersH264High(configuredOffer.description);
+                offeredProfiles = VideoQualityPolicy.h264Profiles(configuredOffer.description).toString();
                 peerConnection.setLocalDescription(new SdpObserverAdapter() {
                     @Override public void onSetSuccess() { callback.onOfferReady(configuredOffer); }
                 }, configuredOffer);
@@ -457,20 +462,18 @@ public class WebRtcReceiver implements Loggable {
 
             @Override
             public void onStateChange() {
+                if (dataChannels.get(label) != channel) return;
                 //host.showToast("[debug]:Data channel " + label + " state change: " + channel.state().toString());
                 Log.i(TAG, "Data channel " + label + " state change: " + channel.state());
                 
                 boolean isInputChannel = "unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label);
                 
                 if (isInputChannel) {
-                    if (channel.state() == DataChannel.State.OPEN) {
-                        host.setStreamingState(true);
-                        host.setNativeGamepadEnabled(true);
-                    } else if (channel.state() == DataChannel.State.CLOSING) {
-                        // Don't force streaming state to false immediately if we might switch channels
-                        // MainActivity will handle the logic based on which channels are available
-                        host.setNativeGamepadEnabled(false);
-                    }
+                    boolean anyInputOpen = dataChannels.entrySet().stream().anyMatch(entry ->
+                            ("input".equalsIgnoreCase(entry.getKey()) || "unreliableinput".equalsIgnoreCase(entry.getKey()))
+                                    && entry.getValue().state() == DataChannel.State.OPEN);
+                    if (anyInputOpen) host.setStreamingState(true);
+                    host.setNativeGamepadEnabled(anyInputOpen);
                 }
                 host.onDataChannelStateChanged(label, channel.state().toString());
             }
@@ -479,14 +482,12 @@ public class WebRtcReceiver implements Loggable {
             public void onMessage(DataChannel.Buffer buffer) {
                 //Log.i(TAG, "received data from (" + label + "): " + (buffer.binary?"binary":"data"));
 
-                if ("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) {
-                    return;
-                }
-                if ("reliableinput".equalsIgnoreCase(label)) {
-//                    byte[] data = new byte[buffer.data.remaining()];
-//                    buffer.data.get(data);
-//                    host.onDataChannelMessageReceived(label, data,null, true);
-
+                if (dataChannels.get(label) != channel) return;
+                if ("unreliableinput".equalsIgnoreCase(label)) return;
+                if ("input".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label)) {
+                    byte[] payload = new byte[buffer.data.remaining()];
+                    buffer.data.get(payload);
+                    host.onDataChannelMessageReceived(label, payload, null, buffer.binary);
                     return;
                 }
 
@@ -521,7 +522,7 @@ public class WebRtcReceiver implements Loggable {
     }
 
     public synchronized void sendDataChannelMessage(String label, String dataStr, boolean isBinary) {
-        if (("unreliableinput".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) 
+        if (("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label))
                 && host.isNativeGamepadEnabled()) {
             return;
         }
@@ -548,6 +549,7 @@ public class WebRtcReceiver implements Loggable {
             codecLogged = false;
             preferHighProfile = false;
             highOffered = false;
+            offeredProfiles = answeredProfiles = "n/d";
             PeerConnection closingConnection = peerConnection;
             peerConnection = null;
             synchronized (statsLock) {
@@ -556,10 +558,11 @@ public class WebRtcReceiver implements Loggable {
                 videoStatsSampler.reset();
             }
 
-            for (DataChannel channel : dataChannels.values()) {
-                channel.dispose();
-            }
+            List<DataChannel> closingChannels = new ArrayList<>(dataChannels.values());
             dataChannels.clear();
+            for (DataChannel channel : closingChannels) channel.dispose();
+            host.setNativeGamepadEnabled(false);
+            host.setStreamingState(false);
 
             if (closingConnection != null) {
                 closingConnection.close();
@@ -611,6 +614,7 @@ public class WebRtcReceiver implements Loggable {
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
                         summary += "\n" + VideoStatsSampler.profileStatus(preferHighProfile, hardwareHighAvailable, highOffered,
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
+                        summary += "\nPerfis na oferta: " + offeredProfiles + "\nPerfis na resposta: " + answeredProfiles;
                         if (signalingListener != null) {
                             signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary);
                         }

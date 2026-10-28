@@ -57,6 +57,7 @@ public final class CapabilityVideoDecoderFactory implements VideoDecoderFactory 
     }
 
     private static VideoDecoderFactory findHardwareHigh(EglBase.Context context) {
+        VideoDecoderFactory constrainedOnly = null;
         try {
             for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
                 try {
@@ -70,7 +71,10 @@ public final class CapabilityVideoDecoderFactory implements VideoDecoderFactory 
                     for (MediaCodecInfo.CodecProfileLevel profile : caps.profileLevels) {
                         if (!supportsHighLevel31(profile.profile, profile.level)) continue;
                         Log.i("RTC-Codec", "Android declares hardware H264 High: " + info.getName());
-                        return new PinnedHighDecoderFactory(info.getName(), color, context);
+                        boolean fullHigh = profile.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh;
+                        VideoDecoderFactory candidate = new PinnedHighDecoderFactory(info.getName(), color, context, fullHigh);
+                        if (fullHigh) return candidate;
+                        if (constrainedOnly == null) constrainedOnly = candidate;
                     }
                 } catch (RuntimeException e) {
                     Log.w("RTC-Codec", "Cannot inspect a decoder; skipping it");
@@ -79,26 +83,42 @@ public final class CapabilityVideoDecoderFactory implements VideoDecoderFactory 
         } catch (RuntimeException e) {
             Log.w("RTC-Codec", "Hardware High capabilities unavailable");
         }
-        return null;
+        return constrainedOnly;
+    }
+
+    static VideoCodecInfo[] highCodecs(boolean fullHigh) {
+        List<VideoCodecInfo> codecs = new ArrayList<>();
+        if (fullHigh) {
+            java.util.Map<String, String> params = new java.util.HashMap<>(
+                    MediaCodecUtils.getCodecProperties(VideoCodecMimeType.H264, true));
+            // High and Constrained High are distinct SDP profiles. Expose genuine
+            // decoder capabilities before native negotiation; never relabel an SDP payload.
+            params.put("profile-level-id", "64001f");
+            codecs.add(new VideoCodecInfo("H264", params, new ArrayList<>()));
+        }
+        codecs.add(new VideoCodecInfo("H264",
+                MediaCodecUtils.getCodecProperties(VideoCodecMimeType.H264, true), new ArrayList<>()));
+        return codecs.toArray(new VideoCodecInfo[0]);
     }
 
     private static final class PinnedHighDecoderFactory implements VideoDecoderFactory {
         private final String name;
         private final int color;
         private final EglBase.Context context;
-        PinnedHighDecoderFactory(String name, int color, EglBase.Context context) {
+        private final boolean fullHigh;
+        PinnedHighDecoderFactory(String name, int color, EglBase.Context context, boolean fullHigh) {
             this.name = name;
             this.color = color;
             this.context = context;
+            this.fullHigh = fullHigh;
         }
         @Override public VideoCodecInfo[] getSupportedCodecs() {
-            // Stock WebRTC Constrained High parameters (640c1f, level asymmetry allowed).
-            // Only advertised after validating at least this level in Android's capabilities.
-            return new VideoCodecInfo[]{new VideoCodecInfo("H264",
-                    MediaCodecUtils.getCodecProperties(VideoCodecMimeType.H264, true), new ArrayList<>())};
+            return highCodecs(fullHigh);
         }
         @Override public VideoDecoder createDecoder(VideoCodecInfo codec) {
             if (!isHigh(codec)) return null;
+            String profile = codec.params.get("profile-level-id").toLowerCase(Locale.ROOT);
+            if (!profile.startsWith("640c") && !(fullHigh && profile.startsWith("6400"))) return null;
             // Pin to the same decoder whose capabilities we inspected, not the first AVC codec.
             return new AndroidVideoDecoder(new MediaCodecWrapperFactoryImpl(), name,
                     VideoCodecMimeType.H264, color, context);

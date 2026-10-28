@@ -11,24 +11,22 @@ import java.util.HashMap;
  * move to :stream. What changes: instead of calling `webRtcReceiver.*` /
  * `activity.*` directly, every method now relays across AIDL to whichever
  * IStreamingService is currently bound. Keep-alive logic (HTTP polling) is
- * unrelated to WebRTC/gamepad load and stays exactly as-is.
+ * scoped to the current session, without destroying its WebView.
  */
 public class WebRtcBridge {
     private static final String TAG = "WebRtcBridge";
     private final MainActivity activity;
     private String keepAliveUrl;
     private String keepAliveToken;
-    private boolean firstKeepAliveSuccess = false;
+    private boolean keepAliveActive;
+    private int keepAliveGeneration;
     private final android.os.Handler keepAliveHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 
     private final Runnable keepAliveRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!activity.isStreaming()) {
-                Log.i(TAG, "Keep-alive stopped: not streaming");
-                return;
-            }
-            if (keepAliveUrl == null || keepAliveToken == null) return;
+            if (!keepAliveActive || keepAliveUrl == null || keepAliveToken == null) return;
+            final int generation = keepAliveGeneration;
 
             RequestNetwork request = new RequestNetwork(activity);
             HashMap<String, Object> headers = new HashMap<>();
@@ -38,18 +36,21 @@ public class WebRtcBridge {
             request.startRequestNetwork(RequestNetworkController.POST, keepAliveUrl, "keepalive", new RequestNetwork.RequestListener() {
                 @Override
                 public void onResponse(String tag, String response, HashMap<String, Object> responseHeaders) {
-                    Log.i(TAG, "Keep-alive success");
-                    if (!firstKeepAliveSuccess) {
-                        firstKeepAliveSuccess = true;
-                        activity.showCustomToast("Preparando a sessão...");
-                        activity.closeWebview();
-                    }
+                    if (!keepAliveActive || generation != keepAliveGeneration) return;
+                    Log.i(TAG, "Keep-alive success; retaining session WebView");
                     keepAliveHandler.postDelayed(keepAliveRunnable, 60000);
                 }
                 @Override
                 public void onErrorResponse(String tag, String message) {
-                    Log.e(TAG, "Keep-alive error: " + message);
-                    keepAliveHandler.postDelayed(keepAliveRunnable, 60000);
+                    if (!keepAliveActive || generation != keepAliveGeneration) return;
+                    if ("HTTP 401".equals(message) || "HTTP 403".equals(message)
+                            || "HTTP 404".equals(message) || "HTTP 410".equals(message)) {
+                        stopKeepAlive();
+                        activity.showCustomToast("A sessão não aceitou a renovação. Encerre e reabra o jogo.");
+                        return;
+                    }
+                    Log.w(TAG, "Keep-alive request failed; retrying");
+                    keepAliveHandler.postDelayed(keepAliveRunnable, 15000);
                 }
             });
         }
@@ -149,6 +150,7 @@ public class WebRtcBridge {
         activity.runOnUiThread(() -> {
             IStreamingService s = service();
             if (s == null) return;
+            activity.setStreamingState(false);
             try { s.closeSession(); } catch (Exception e) { Log.e(TAG, "closeSession", e); }
         });
     }
@@ -183,10 +185,23 @@ public class WebRtcBridge {
 
     @JavascriptInterface
     public void keepalive(String url, String token) {
-        this.keepAliveUrl = url;
-        this.keepAliveToken = token;
-        this.firstKeepAliveSuccess = false;
+        activity.runOnUiThread(() -> {
+            if (url == null || token == null || token.isEmpty()) return;
+            if (keepAliveActive && url.equals(keepAliveUrl) && token.equals(keepAliveToken)) return;
+            stopKeepAlive();
+            keepAliveUrl = url;
+            keepAliveToken = token;
+            keepAliveActive = true;
+            keepAliveHandler.post(keepAliveRunnable);
+        });
+    }
+
+    // Called on the UI thread; stale HTTP callbacks cannot resurrect a stopped session.
+    public void stopKeepAlive() {
+        keepAliveActive = false;
+        keepAliveGeneration++;
         keepAliveHandler.removeCallbacks(keepAliveRunnable);
-        keepAliveHandler.post(keepAliveRunnable);
+        keepAliveUrl = null;
+        keepAliveToken = null;
     }
 }

@@ -35,4 +35,13 @@ public class VideoQualityPolicyTest {
         assertFalse(VideoQualityPolicy.offersH264High("m=audio 9 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=640c1f\r\n"));
         assertFalse(VideoQualityPolicy.offersH264High(header.replace("m=video 9", "m=video 0") + "a=fmtp:96 profile-level-id=640c1f\r\n"));
     }
+    @Test public void profileSummaryRespectsPayloadsAndUnorderedFmtpWithoutLeakingSdp() {
+        String sdp = "v=0\r\na=ice-pwd:private\r\nm=video 9 RTP/AVP 96 97\r\n"
+                + "a=fmtp:96 profile-level-id=64001f\r\na=fmtp:97 profile-level-id=640c1f\r\n"
+                + "a=rtpmap:96 H264/90000\r\na=rtpmap:97 H264/90000\r\n"
+                + "a=rtpmap:98 H264/90000\r\na=fmtp:98 profile-level-id=42e01f\r\n";
+        assertEquals("[64001f, 640c1f]", VideoQualityPolicy.h264Profiles(sdp).toString());
+        assertTrue(VideoQualityPolicy.h264Profiles(null).isEmpty());
+        assertTrue(VideoQualityPolicy.h264Rank("64001f", true, true) > VideoQualityPolicy.h264Rank("640c1f", true, true));
+    }
 }

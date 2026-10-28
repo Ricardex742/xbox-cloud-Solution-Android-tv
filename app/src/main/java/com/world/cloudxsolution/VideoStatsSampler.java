@@ -8,11 +8,13 @@ public final class VideoStatsSampler {
     private String previousId;
     private double previousTimestamp;
     private double previousBytes;
+    private double previousReceived = -1, previousDecoded = -1, previousDecodeTime = -1;
 
     public void reset() {
         previousId = null;
         previousTimestamp = 0;
         previousBytes = 0;
+        previousReceived = previousDecoded = previousDecodeTime = -1;
     }
 
     public String sample(String id, double timestampUs, Map<String, Object> video, Map<String, Object> codec) {
@@ -23,6 +25,21 @@ public final class VideoStatsSampler {
             // bits / microseconds == megabits / second.
             rate = String.format(Locale.ROOT, "%.1f Mbps", (bytes - previousBytes) * 8 / elapsed);
         }
+        double received = number(video.get("framesReceived"));
+        double decoded = number(video.get("framesDecoded"));
+        double decodeTime = number(video.get("totalDecodeTime"));
+        String receivedFps = "medindo...", decodeMs = "n/d";
+        if (id.equals(previousId) && elapsed > 0) {
+            if (previousReceived >= 0 && received >= previousReceived) {
+                receivedFps = String.format(Locale.ROOT, "%.1f", (received - previousReceived) * 1000000 / elapsed);
+            }
+            if (previousDecoded >= 0 && decoded > previousDecoded && previousDecodeTime >= 0 && decodeTime >= previousDecodeTime) {
+                decodeMs = String.format(Locale.ROOT, "%.2f", (decodeTime - previousDecodeTime) * 1000 / (decoded - previousDecoded));
+            }
+        }
+        previousReceived = received;
+        previousDecoded = decoded;
+        previousDecodeTime = decodeTime;
         previousId = id;
         previousTimestamp = timestampUs;
         previousBytes = bytes;
@@ -31,8 +48,9 @@ public final class VideoStatsSampler {
         return "Vídeo recebido: " + value(video, "frameWidth") + "x" + value(video, "frameHeight")
                 + " | " + rate + "\nCodec: " + value(codec, "mimeType") + profile
                 + "\nDecodificador: " + value(video, "decoderImplementation")
-                + "\nFPS recebido: " + value(video, "framesPerSecond")
-                + " | Perdidos na rede: " + value(video, "packetsLost");
+                + "\nFPS recebido: " + receivedFps + " | Decodificado: " + value(video, "framesPerSecond")
+                + "\nDecodificação: " + decodeMs + " ms/quadro | Descartados: " + value(video, "framesDropped")
+                + " | Pacotes perdidos: " + value(video, "packetsLost");
     }
 
     public static String profileStatus(boolean preferHigh, boolean hardwareHigh, boolean highOffered, Map<String, Object> codec) {

@@ -47,4 +47,18 @@ public class VideoStatsSamplerTest {
         assertFalse(result.contains("outro perfil"));
         assertTrue(VideoStatsSampler.profileStatus(false, true, true, codec).contains("solicitado nesta sessão: Baseline"));
     }
+    @Test public void distinguishesReceptionFromSlowDecodeAndResetsIntervals() {
+        VideoStatsSampler sampler = new VideoStatsSampler();
+        Map<String, Object> video = new HashMap<>();
+        video.put("framesReceived", 100); video.put("framesDecoded", 100);
+        video.put("totalDecodeTime", 1.0); video.put("framesPerSecond", 30);
+        sampler.sample("v", 1000000, video, new HashMap<>());
+        video.put("framesReceived", 220); video.put("framesDecoded", 160);
+        video.put("totalDecodeTime", 2.2);
+        String report = sampler.sample("v", 3000000, video, new HashMap<>());
+        assertTrue(report.contains("FPS recebido: 60.0 | Decodificado: 30"));
+        assertTrue(report.contains("Decodificação: 20.00 ms/quadro"));
+        sampler.reset();
+        assertTrue(sampler.sample("v", 5000000, video, new HashMap<>()).contains("FPS recebido: medindo..."));
+    }
 }
