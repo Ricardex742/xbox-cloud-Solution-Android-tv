@@ -7,4 +7,8 @@
     <string name="browser_stopped_title">Navegador da TV encerrado</string>
     <string name="browser_stopped_message">O processo do navegador foi encerrado pelo sistema ou apresentou uma falha. Você pode reabrir o catálogo para iniciar outra sessão.</string>
     <string name="reopen_catalog">Reabrir catálogo</string>
+    <string name="startup_retry">Tentar novamente</string>
+    <string name="startup_android_settings">Configurações do Android</string>
+    <string name="startup_menu">Abrir menu</string>
+    <string name="startup_exit">Sair do aplicativo</string>
 </resources>

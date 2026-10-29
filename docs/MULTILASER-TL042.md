@@ -69,3 +69,56 @@ Para diagnóstico por ADB, quando disponível: `adb logcat -s XboxFramesMain Web
 - JavaScript passou na checagem de sintaxe; git diff --check aprovado.
 - Os arquivos de gatilhos, deadzones e pacotes de controle permanecem iguais à base ff69b8f.
 - Sessões reais, RAM, Wi-Fi, decodificador e estabilidade na TL042 ainda precisam da validação física descrita acima.
+
+## Correção da abertura preta — após o teste da build #24
+
+Relato na TL042/Android 11: a ajuda inicial aparece, mas não há catálogo/login
+nem resposta ao atalho do menu. A execução #24 corresponde a `76b990c`.
+Não há logcat da TV para atribuir o bloqueio a um driver ou à rede.
+
+Defeitos identificados e tratados:
+
+- O splash esperava a criação da WebView, sem limite. Agora libera o primeiro
+  desenho da Activity sem aguardar rede, Binder ou EGL.
+- `onServiceConnected` fazia inicialização WebRTC síncrona na thread da UI.
+  Inicialização e entrega da Surface passam por um único worker, sem bloquear
+  os comandos da Activity. Eventos de Surface durante uma chamada em andamento
+  são consolidados, em vez de criarem uma fila de recriações.
+- O serviço construía EGL em `onCreate`, antes mesmo de concluir o bind. Agora
+  essa construção ocorre na chamada de inicialização atendida pelo Binder.
+- A inicialização tem prazo total de 45 s, incluindo bind, fábrica e Surface.
+  A tela informa a etapa que não concluiu. Respostas de tentativas encerradas,
+  falhas ou de uma Activity destruída não abrem o catálogo.
+- O carregamento de uma página de catálogo/login tem prazo de 45 s. A WebView
+  não é ocultada com GONE a cada navegação; commit visível pode revelar a página
+  antes de todos os recursos terminarem. Erros de rede/HTTP do documento principal
+  mostram recuperação; erro de subrecurso não substitui uma página funcional.
+- A tela de carregamento oferece menu e saída pelo controle remoto. Em falha,
+  oferece tentar novamente e abrir as configurações Android. Não apaga cookies.
+- Voltar funciona mesmo antes da criação da WebView. Desvincular o serviço não
+  espera uma chamada nativa na UI; a liberação nativa é serializada com a
+  inicialização, em outra thread do serviço.
+
+Um timeout não cancela uma chamada de driver/Binder travada. A opção de tentar
+novamente não cria workers concorrentes para contornar isso. Se a chamada
+continuar sem responder, a tela orienta forçar a parada nas configurações Android.
+O limite da página não é um limite da fila do xCloud: não roda durante streaming.
+Não foram alterados codec, bitrate, deadzones, protocolos ou o preset 720p/8 Mbps.
+
+Validação local: 20 testes Java (incluindo 5 de transições de inicialização),
+14 testes Node, Debug/Release compilados, lint sem erros (95 avisos).
+Os testes verificam que timeout, retry e saída rejeitam respostas antigas;
+não simulam o driver EGL/MediaCodec nem o processo real da WebView na TL042.
+
+Próximo teste físico:
+
+1. Atualizar com o APK Universal ARM da nova execução desta branch.
+2. Abrir e fechar três vezes; confirmar catálogo/login e menu responsivo.
+3. Se falhar, fotografar a mensagem e a etapa após 45 s. Tentar novamente uma
+   vez; se a mensagem indicar chamada ainda presa, usar Configurações Android.
+4. Pressionar Voltar durante carregamento; o aplicativo deve sair sem fechar
+   por erro. Abrir novamente e verificar se uma tentativa antiga não reaparece.
+5. Abrir com Wi-Fi desligado: deve haver erro recuperável do catálogo. Reativar
+   a conexão e tentar novamente; o login salvo deve permanecer.
+6. Só depois, aplicar o perfil TL042 e testar a entrada em três jogos. A build
+   ainda precisa dessa validação para confirmar que resolveu o relato na TV.

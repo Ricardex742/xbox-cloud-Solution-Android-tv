@@ -49,6 +49,7 @@ public class StreamingService extends Service implements StreamHost {
     private static final String CHANNEL_ID = "cloudx_streaming";
 
     private WebRtcReceiver webRtcReceiver;
+    private volatile boolean destroyed;
     private EglBase serviceEglBase;
     private org.webrtc.EglRenderer eglRenderer; // raw-Surface renderer -- see note below
 
@@ -65,8 +66,8 @@ public class StreamingService extends Service implements StreamHost {
         super.onCreate();
         callbackHandler = new Handler(Looper.getMainLooper());
         startForegroundWithNotification();
-        webRtcReceiver = new WebRtcReceiver(this /* StreamHost */);
-        setupSignalingRelay();
+        // Binding and foreground notification must not wait for EGL/native drivers.
+        // The client initializes the receiver from its video worker via Binder.
     }
 
     private void setupSignalingRelay() {
@@ -125,19 +126,26 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void initPeerConnectionFactory() {
+        public synchronized void initPeerConnectionFactory() {
+            if (destroyed) throw new IllegalStateException("Streaming service destroyed");
+            if (webRtcReceiver == null) {
+                Log.i(TAG, "startup: creating native EGL receiver");
+                webRtcReceiver = new WebRtcReceiver(StreamingService.this);
+                setupSignalingRelay();
+            }
             webRtcReceiver.initPeerConnectionFactory();
         }
 
         @Override
-        public void releaseSession() {
+        public synchronized void releaseSession() {
             clearRenderSurface();
-            webRtcReceiver.closeSession();
+            if (webRtcReceiver != null) webRtcReceiver.closeSession();
             StreamingService.this.setStreamingState(false);
         }
 
         @Override
-        public void setRenderSurface(Surface surface, int width, int height) {
+        public synchronized void setRenderSurface(Surface surface, int width, int height) {
+            if (destroyed || webRtcReceiver == null) throw new IllegalStateException("Video service not ready");
             if (surface == null || !surface.isValid()) {
                 if(width==41&&height==40){webRtcReceiver.enablePerfStats(true);}
                 else if(width==51&&height==50){
@@ -188,7 +196,7 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void clearRenderSurface() {
+        public synchronized void clearRenderSurface() {
             if (eglRenderer != null) {
                 VideoTrack remoteTrack = webRtcReceiver.getRemoteVideoTrack();
                 // Note: we can't easily remove the anonymous wrapperSink here
@@ -246,9 +254,9 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void closeSession() {
+        public synchronized void closeSession() {
             clearRenderSurface();
-            webRtcReceiver.closeSession();
+            if (webRtcReceiver != null) webRtcReceiver.closeSession();
             StreamingService.this.setStreamingState(false);
         }
 
@@ -455,9 +463,20 @@ public class StreamingService extends Service implements StreamHost {
 
     @Override
     public void onDestroy() {
-        try { binder.clearRenderSurface(); } catch (android.os.RemoteException ignored) {}
-        if (webRtcReceiver != null) webRtcReceiver.release();
+        destroyed = true;
         callbacks.kill();
+        // Exit must not wait for an in-flight native startup or EGL teardown.
+        // The same monitor prevents releasing a receiver during its initialization.
+        new Thread(() -> {
+            synchronized (binder) {
+                try {
+                    binder.clearRenderSurface();
+                    if (webRtcReceiver != null) webRtcReceiver.release();
+                } catch (android.os.RemoteException | RuntimeException e) {
+                    Log.w(TAG, "Native video teardown failed", e);
+                }
+            }
+        }, "CloudX-video-cleanup").start();
         super.onDestroy();
     }
 }

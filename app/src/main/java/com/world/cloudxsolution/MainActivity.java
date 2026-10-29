@@ -119,27 +119,164 @@ public class MainActivity extends AppCompatActivity {
     public boolean isStreaming() {
         return isStreaming;
     }
-    private IStreamingService streamingService;
+    private volatile IStreamingService streamingService;
+    private final android.os.Handler startupHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    // A single bounded-in-practice stream of native work. Never spawn replacement workers
+    // when a driver/Binder call times out: interrupt cannot cancel a native driver hang.
+    private final java.util.concurrent.ExecutorService videoWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-video-startup"));
+    private final StartupGate startup = new StartupGate();
+    private boolean serviceBound, nativeWorkInFlight, surfaceDirty, activityDestroyed;
+    private Runnable startupTimeout, catalogTimeout;
+    private int catalogGeneration;
+    private boolean catalogFailed;
+    private Button startupRetry, startupAndroidSettings;
+
     private ServiceConnection serviceConnection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+            if (activityDestroyed) return;
             streamingService = IStreamingService.Stub.asInterface(binder);
-            try {
-                streamingService.registerCallback(streamingCallback);
-                streamingService.initPeerConnectionFactory();
-            } catch (RemoteException e) {
-                showCustomToast("Falha ao iniciar o serviço de vídeo. Feche e reabra o aplicativo.");
-                Log.e(TAG, "Streaming service initialization failed", e);
-                return;
-            }
-            pushSurfaceIfReady();
-            showWebview();
+            if (startup.stage() == StartupGate.Stage.BINDING) initializeVideo(startup.token());
         }
         @Override public void onServiceDisconnected(ComponentName name) {
             streamingService = null;
+            failStartup("Serviço de vídeo desconectado.");
+        }
+        @Override public void onBindingDied(ComponentName name) {
+            streamingService = null;
+            failStartup("A conexão com o serviço de vídeo foi encerrada.");
+        }
+        @Override public void onNullBinding(ComponentName name) {
+            failStartup("O serviço de vídeo não ficou disponível.");
         }
     };
 
-    public IStreamingService getStreamingService() { return streamingService; }
+    private void beginStartup() {
+        if (activityDestroyed) return;
+        if (nativeWorkInFlight) {
+            showStartupFailure("O serviço de vídeo ainda não respondeu. Use Configurações do Android para forçar a parada do app e abrir novamente.");
+            return;
+        }
+        int token = startup.begin();
+        showStartupProgress("Conectando ao serviço de vídeo…");
+        if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
+        startupTimeout = () -> {
+            if (startup.accepts(token)) failStartup("Tempo esgotado: " + startup.stageLabel() + ".");
+        };
+        startupHandler.postDelayed(startupTimeout, 45000);
+        if (streamingService != null) {
+            initializeVideo(token);
+            return;
+        }
+        if (serviceBound) {
+            unbindService(serviceConnection);
+            serviceBound = false;
+        }
+        try {
+            serviceBound = bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE);
+            if (!serviceBound) failStartup("Não foi possível conectar ao serviço de vídeo.");
+        } catch (RuntimeException e) {
+            Log.e(TAG, "startup: bind failed", e);
+            failStartup("Falha ao conectar ao serviço de vídeo.");
+        }
+    }
+
+    private void initializeVideo(int token) {
+        if (!startup.advance(token, StartupGate.Stage.INITIALIZING) || nativeWorkInFlight) return;
+        showStartupProgress("Preparando áudio e vídeo…");
+        IStreamingService service = streamingService;
+        nativeWorkInFlight = true;
+        videoWorker.execute(() -> {
+            try {
+                Log.i(TAG, "startup: native initialization started");
+                service.registerCallback(streamingCallback);
+                service.initPeerConnectionFactory();
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (activityDestroyed || !startup.advance(token, StartupGate.Stage.SURFACE)) return;
+                    showStartupProgress("Preparando saída de vídeo…");
+                    pushSurfaceIfReady();
+                });
+            } catch (RemoteException | RuntimeException e) {
+                Log.e(TAG, "startup: native initialization failed", e);
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (startup.accepts(token)) failStartup("Falha ao preparar áudio e vídeo.");
+                });
+            }
+        });
+    }
+
+    private void showStartupProgress(String message) {
+        if (activityDestroyed) return;
+        Log.i(TAG, "startup: " + message);
+        loadingLayout.setVisibility(View.VISIBLE);
+        loadingText.setText(message);
+        findViewById(R.id.loadingIndicator).setVisibility(View.VISIBLE);
+        startupRetry.setVisibility(View.GONE);
+        startupAndroidSettings.setVisibility(View.GONE);
+    }
+
+    private void failStartup(String message) {
+        if (activityDestroyed) return;
+        startup.fail();
+        if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
+        showStartupFailure(message);
+    }
+
+    private void showStartupFailure(String message) {
+        if (activityDestroyed) return;
+        loadingLayout.setVisibility(View.VISIBLE);
+        loadingLayout.bringToFront();
+        loadingText.setText(message);
+        findViewById(R.id.loadingIndicator).setVisibility(View.GONE);
+        startupRetry.setVisibility(View.VISIBLE);
+        startupAndroidSettings.setVisibility(View.VISIBLE);
+        startupRetry.requestFocus();
+        Log.w(TAG, "startup: " + message);
+    }
+
+    private void retryLoading() {
+        if (!startup.ready()) { beginStartup(); return; }
+        catalogFailed = false;
+        if (webView != null) {
+            webView.stopLoading();
+            webView.loadUrl("https://www.xbox.com/pt-BR/play");
+        } else showWebview();
+    }
+
+    private void openAndroidAppSettings() {
+        try {
+            startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:" + getPackageName())));
+        } catch (android.content.ActivityNotFoundException e) {
+            showStartupFailure("Abra as configurações da TV → Aplicativos → CloudX para forçar a parada.");
+        }
+    }
+
+    private void beginCatalogLoading(WebView view) {
+        if (view != webView || isStreaming || activityDestroyed) return;
+        catalogFailed = false;
+        int generation = ++catalogGeneration;
+        if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+        showStartupProgress("Carregando catálogo ou login Xbox…");
+        catalogTimeout = () -> {
+            if (view == webView && generation == catalogGeneration && !isStreaming && !activityDestroyed) {
+                catalogFailed = true;
+                view.stopLoading();
+                showStartupFailure("O catálogo não concluiu o carregamento. Confira a conexão, a data/hora da TV e a versão do Android System WebView.");
+            }
+        };
+        startupHandler.postDelayed(catalogTimeout, 45000);
+    }
+
+    private void catalogVisible(WebView view) {
+        if (view != webView || catalogFailed || activityDestroyed || isStreaming) return;
+        if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+        setWebviewVisible();
+    }
+
+    public IStreamingService getStreamingService() { return startup.ready() ? streamingService : null; }
     private final IStreamingCallback.Stub streamingCallback = new IStreamingCallback.Stub() {
         @Override public void onAnswerReady(String sdp) { runOnUiThread(() -> sendAnswerToJs(sdp)); }
         @Override public void onOfferReady(String sdp) { runOnUiThread(() -> sendOfferToJs(sdp)); }
@@ -299,17 +436,8 @@ public class MainActivity extends AppCompatActivity {
         }, 1920, 1080);
         controllerLe = new AndroidControllerLe(legacyInputChannel, 0, sens, dz);
 
-        bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE);
-        // Keep the splash screen on-screen for at least 1500ms
-        // or until WebView starts loading.
-        final long startTime = System.currentTimeMillis();
-        splashScreen.setKeepOnScreenCondition(() -> {
-            boolean isReady = (webView != null);
-            boolean minTimeElapsed = (System.currentTimeMillis() - startTime) > 0;
-            return !isReady || !minTimeElapsed;
-        });
-
-
+        // The splash must never wait for a driver, Binder or a network page.
+        splashScreen.setKeepOnScreenCondition(() -> false);
 
         getWindow().setCallback(new WindowCallbackWrapper(getWindow().getCallback()) {
 
@@ -374,15 +502,23 @@ public class MainActivity extends AppCompatActivity {
             @Override public void surfaceCreated(SurfaceHolder holder) { pushSurfaceIfReady(); }
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) { pushSurfaceIfReady(); }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
-                if (streamingService != null) {
-                    try { streamingService.clearRenderSurface(); } catch (RemoteException ignored) {}
-                }
+                IStreamingService service = streamingService;
+                if (service != null && !activityDestroyed) videoWorker.execute(() -> {
+                    try { service.clearRenderSurface(); } catch (RemoteException | RuntimeException e) {
+                        Log.w(TAG, "clearRenderSurface failed", e);
+                    }
+                });
             }
         });
 
 
-        loadingLayout.setVisibility(View.VISIBLE);
-        loadingText.setText(R.string.preparing_video_service);
+        startupRetry = findViewById(R.id.startup_retry);
+        startupAndroidSettings = findViewById(R.id.startup_android_settings);
+        startupRetry.setOnClickListener(v -> retryLoading());
+        startupAndroidSettings.setOnClickListener(v -> openAndroidAppSettings());
+        findViewById(R.id.startup_menu).setOnClickListener(v -> showStreamingMenuDialog());
+        findViewById(R.id.startup_exit).setOnClickListener(v -> finish());
+        beginStartup();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -392,11 +528,7 @@ public class MainActivity extends AppCompatActivity {
                 } else if (isStreaming) {
                     showStreamingMenuDialog();
                 } else {
-                    assert webView != null;
-                    if (webView.getVisibility() == WebView.VISIBLE && !webView.canGoBack()) {
-                        setEnabled(false);
-                        getOnBackPressedDispatcher().onBackPressed();
-                    }
+                    finish();
                 }
             }
         });
@@ -409,13 +541,37 @@ public class MainActivity extends AppCompatActivity {
         showIntroHelpDialog();
     }
     private void pushSurfaceIfReady() {
-        if (streamingService == null) return;
+        if (activityDestroyed || streamingService == null || surfaceView == null
+                || (!startup.ready() && startup.stage() != StartupGate.Stage.SURFACE)) return;
+        if (nativeWorkInFlight) { surfaceDirty = true; return; }
+        Surface surface = surfaceView.getHolder().getSurface();
+        if (surface == null || !surface.isValid()) return;
         surfaceView.setKeepScreenOn(true);
-
-        Surface s = surfaceView.getHolder().getSurface();
-        if (s == null || !s.isValid()) return;
-        try { streamingService.setRenderSurface(s, surfaceView.getHolder().getSurfaceFrame().width(), surfaceView.getHolder().getSurfaceFrame().height()); }
-        catch (RemoteException e) { Log.e(TAG, "setRenderSurface", e); }
+        android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
+        int width = size.width(), height = size.height(), token = startup.token();
+        IStreamingService service = streamingService;
+        nativeWorkInFlight = true;
+        surfaceDirty = false;
+        videoWorker.execute(() -> {
+            try {
+                service.setRenderSurface(surface, width, height);
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (activityDestroyed || token != startup.token() || service != streamingService) return;
+                    if (startup.advance(token, StartupGate.Stage.READY)) {
+                        if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
+                        showWebview();
+                    }
+                    if (surfaceDirty) pushSurfaceIfReady();
+                });
+            } catch (RemoteException | RuntimeException e) {
+                Log.e(TAG, "startup: render surface failed", e);
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (token == startup.token()) failStartup("Falha ao preparar a saída de vídeo.");
+                });
+            }
+        });
     }
     private void showIntroHelpDialog() {
         android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -478,7 +634,8 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                setWebviewVisible();
+                if (view != webView || activityDestroyed || catalogFailed) return;
+                catalogVisible(view);
 
                 // Inject viewport meta tag to force fit
                 String viewportJs = "var meta = document.createElement('meta'); " +
@@ -511,6 +668,30 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                catalogVisible(view);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                                        android.webkit.WebResourceError error) {
+                if (request.isForMainFrame()) catalogError(view, "Falha ao carregar o catálogo (código " + error.getErrorCode() + "). Confira a conexão da TV.");
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, android.webkit.WebResourceRequest request,
+                                            android.webkit.WebResourceResponse response) {
+                if (request.isForMainFrame()) catalogError(view, "O site Xbox respondeu com erro HTTP " + response.getStatusCode() + ". Tente novamente mais tarde.");
+            }
+
+            private void catalogError(WebView view, String message) {
+                if (view != webView || activityDestroyed || isStreaming) return;
+                catalogFailed = true;
+                if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+                showStartupFailure(message);
+            }
+
+            @Override
             public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
                 if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
                 setStreamingState(false);
@@ -532,10 +713,7 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                if (loadingLayout != null) {
-                    loadingLayout.setVisibility(View.VISIBLE);
-                }
-                view.setVisibility(WebView.GONE);
+                beginCatalogLoading(view);
                 super.onPageStarted(view, url, favicon);
                 if (url != null && (url.contains("/fr-FR") || url.contains("/fr-fr"))) {
                     view.stopLoading();
@@ -555,6 +733,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public void setWebviewVisible(){
+       if (activityDestroyed || isStreaming || catalogFailed) return;
        if(webView!=null){
            webView.setVisibility(WebView.VISIBLE);}
        if (loadingLayout != null) {
@@ -615,12 +794,19 @@ private boolean debug=false;
     private Bundle webViewState;
 
     public void showWebview() {
+        if (activityDestroyed || !startup.ready()) return;
         if (audioManager != null) {
             audioManager.setMode(AudioManager.MODE_NORMAL);
         }
         runOnUiThread(() -> {
+            if (activityDestroyed || !startup.ready()) return;
             if (webView == null) {
-                initWebView();
+                try { initWebView(); } catch (RuntimeException e) {
+                    Log.e(TAG, "startup: WebView creation failed", e);
+                    webView = null;
+                    showStartupFailure("Não foi possível iniciar o navegador da TV. Verifique o Android System WebView.");
+                    return;
+                }
                 rootLayout.addView(webView, 1);
                 if (webViewState != null) {
                     webView.restoreState(webViewState);
@@ -952,6 +1138,9 @@ private boolean debug=false;
 
     @Override
     protected void onDestroy() {
+        activityDestroyed = true;
+        startup.close();
+        startupHandler.removeCallbacksAndMessages(null);
         if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
         if (performanceDialog != null) {
             performanceDialog.dismiss();
@@ -967,14 +1156,19 @@ private boolean debug=false;
             legacyInputChannel.shutdown();
         }
 
-        if (streamingService != null) {
+        IStreamingService service = streamingService;
+        streamingService = null;
+        if (service != null) videoWorker.execute(() -> {
             try {
-                streamingService.releaseSession();
-                streamingService.unregisterCallback(streamingCallback);
-            } catch (RemoteException ignored) {}
+                service.unregisterCallback(streamingCallback);
+                // Last unbind invokes service teardown; do not race a second release.
+            } catch (RemoteException | RuntimeException e) { Log.w(TAG, "Video cleanup failed", e); }
+        });
+        videoWorker.shutdown();
+        if (serviceBound) {
+            unbindService(serviceConnection);
+            serviceBound = false;
         }
-
-        try { unbindService(serviceConnection); } catch (Exception ignored) {}
 
         if (webView != null) {
             if (rootLayout != null) rootLayout.removeView(webView);
@@ -994,8 +1188,9 @@ private boolean debug=false;
 
         @Override
         public void onProgressChanged(WebView view, int newProgress) {
-            if (loadingText != null) {
-                loadingText.setText(newProgress + "%");
+            if (view != webView || activityDestroyed) return;
+            if (loadingText != null && !catalogFailed && !isStreaming) {
+                loadingText.setText("Carregando catálogo ou login Xbox… " + newProgress + "%");
             }
             if (newProgress > 30 && !isScriptInjected && view.getUrl() != null && view.getUrl().contains("play")) {
                 isScriptInjected = true;
@@ -1029,6 +1224,16 @@ private boolean debug=false;
     }
 
     public void showStreamingMenuDialog() {
+        if (activityDestroyed) return;
+        if (!startup.ready()) {
+            new androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("Inicialização do CloudX")
+                    .setMessage(startup.stageLabel())
+                    .setPositiveButton("Tentar novamente", (d, w) -> retryLoading())
+                    .setNeutralButton("Configurações Android", (d, w) -> openAndroidAppSettings())
+                    .setNegativeButton("Sair do aplicativo", (d, w) -> finish()).show();
+            return;
+        }
         Dialog dialog = new Dialog(this, R.style.XboxDialogTheme);
         dialog.setContentView(R.layout.dialog_streaming_menu);
         dialog.setCancelable(true);
@@ -1058,7 +1263,7 @@ private boolean debug=false;
         // Initial Mic State
         boolean micCurrentlyEnabled = false;
         try {
-            if (streamingService != null) micCurrentlyEnabled = streamingService.isMicrophoneEnabled();
+            if (isStreaming && streamingService != null) micCurrentlyEnabled = streamingService.isMicrophoneEnabled();
         } catch (RemoteException ignored) {}
         btnMic.setText(micCurrentlyEnabled ? "Microfone: Ativado" : "Microfone: Desativado");
 
@@ -1143,9 +1348,7 @@ private boolean debug=false;
 
         btnReloadXbox.setOnClickListener(v -> {
             if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
-            if (webView != null) {
-                webView.reload();
-            }
+            retryLoading();
             dialog.dismiss();
         });
 

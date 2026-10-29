@@ -30,9 +30,9 @@
 
         <ImageView
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_height="64dp"
             android:src="@drawable/splash_branding_hdpi"
-            android:layout_marginBottom="40dp"
+            android:layout_marginBottom="12dp"
             android:importantForAccessibility="no" />
 
         <com.google.android.material.progressindicator.CircularProgressIndicator
@@ -54,6 +54,28 @@
             android:textStyle="bold"
             android:text="0%" />
 
+        <Button
+            android:id="@+id/startup_retry"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/startup_retry"
+            android:visibility="gone" />
+        <Button
+            android:id="@+id/startup_android_settings"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/startup_android_settings"
+            android:visibility="gone" />
+        <Button
+            android:id="@+id/startup_menu"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/startup_menu" />
+        <Button
+            android:id="@+id/startup_exit"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/startup_exit" />
     </LinearLayout>
 
 </FrameLayout>
