@@ -164,3 +164,51 @@ Validação: 29 testes Java e 14 Node aprovados; Debug/Release compilados; lint 
 Ainda é necessária a instalação na TL042: abrir até o catálogo; se o bind falhar,
 aguardar a linha de diagnóstico e fotografar a tela inteira antes de tentar
 novamente. Não alterar perfil de vídeo para investigar esta etapa.
+
+## Fluidez irregular — após a abertura funcionar na build #29
+
+O usuário confirmou catálogo e jogos acessíveis. Relatou 30–45 FPS instáveis,
+com EA FC 26 mais fluido durante gameplay e Gears, Forza 6 e Cold War injogáveis.
+Os vídeos mostram preset 720/8 Mbps, vídeo/superfície 1280x720, H.264 42e01f e
+OMX.MS.AVC.Decoder. Um trecho legível mostra aproximadamente 36 FPS renderizados,
+5,9 Mbps, zero descartes do renderizador e zero pacotes perdidos acumulados.
+Isso não identifica sozinho o gargalo e não prova capacidade sustentada de 60 FPS.
+
+Erro de diagnóstico confirmado: `framesPerSecond` de inbound-rtp corresponde
+à taxa de decodificação, mas era rotulado como FPS recebido. Portanto, o valor
+34–36 mostrado anteriormente não permite atribuir a queda ao servidor/rede.
+
+Correções e ferramentas de comparação:
+
+- FPS recebidos e decodificados calculados separadamente pelas diferenças dos
+  contadores no intervalo. Campos ausentes/reiniciados aparecem como n/d.
+- Média de decodificação por quadro e permanência no jitter buffer no intervalo;
+  descartes WebRTC e perdas de pacotes também por intervalo. RTT vem do par ICE
+  selecionado pelo transporte do vídeo, com protocolo e relay quando disponíveis.
+  RTT não é latência total de comando. Não se coletam endereços dos candidatos.
+- Uma atualização completa do painel por amostra, sem a atualização parcial
+  anterior que fazia o texto alternar e exigia mais uma chamada IPC/layout.
+  Continua amostrando apenas com painel ligado, no ciclo existente do renderer.
+- O mesmo Surface não é reenviado em cada surfaceChanged: resize dos buffers não
+  exige destruir/recriar EGL, thread, drawer e sink. Eventos de criação/destruição
+  identificam substituição real; um pedido explícito do serviço força reenvio
+  para uma nova sessão. Retornos atrasados não satisfazem uma superfície nova.
+- Ao liberar a saída, o sink pendente é limpo. Um callback de frame antigo mantém
+  referência ao seu renderer original em vez de alimentar um renderer novo.
+- Opções de 4 e 6 Mbps disponíveis para comparação manual em nova sessão.
+  Preset/default continua 720p/8 Mbps. Não foi adicionado limite local de 30 FPS,
+  nem forçado codec/driver, software, High, upscaling ou 60 FPS.
+
+Validação: 40 testes Java e 14 Node aprovados, builds Debug/Release concluídos,
+lint sem erros. Testes novos cobrem substituição/destruição de Surface durante
+entrega assíncrona, reuso entre notificações de tamanho, nova sessão, diferenças
+entre FPS recebidos/decodificados, contadores ausentes/reiniciados, decoder
+parado, timestamps repetidos e RTT/relay sem expor endereços. Não simulam EGL,
+MediaCodec ou o firmware da TL042.
+
+Teste físico: conferir catálogo e entrada/saída sem regressão; iniciar um dos
+jogos problemáticos em 720p/8 Mbps, aguardar duas amostras do painel e fotografar
+FPS recebidos/decodificados, decodificação, buffer, perdas, RTT e renderer. Repetir
+em 720p/6 Mbps com nova sessão e cena comparável. Registrar também como fica sem
+o painel aberto. 4 Mbps é opcional e reduz qualidade. Só os resultados reais
+podem confirmar ganho de fluidez e orientar uma mudança no decodificador.

@@ -160,6 +160,7 @@ public class StreamingService extends Service implements StreamHost {
                     new org.webrtc.GlRectDrawer());
             eglRenderer.createEglSurface(surface);
 
+            final org.webrtc.EglRenderer targetRenderer = eglRenderer;
             org.webrtc.VideoSink wrapperSink = new org.webrtc.VideoSink() {
                 private boolean firstFrameSeen = false;
                 private int lastWidth, lastHeight;
@@ -176,9 +177,8 @@ public class StreamingService extends Service implements StreamHost {
                         Log.i(TAG, "First frame detected in service! " + frame.getRotatedWidth() + "x" + frame.getRotatedHeight());
                         onFirstFrameRendered(frame.getRotatedWidth(), frame.getRotatedHeight());
                     }
-                    if (eglRenderer != null) {
-                        eglRenderer.onFrame(frame);
-                    }
+                    // A callback already in flight must never feed a replacement renderer.
+                    targetRenderer.onFrame(frame);
                 }
             };
 
@@ -199,6 +199,7 @@ public class StreamingService extends Service implements StreamHost {
                 if (remoteTrack != null && webRtcReceiver.getPendingRenderTarget() != null) {
                     remoteTrack.removeSink(webRtcReceiver.getPendingRenderTarget());
                 }
+                webRtcReceiver.setPendingRenderTarget(null);
                 eglRenderer.release();
                 eglRenderer = null;
             }

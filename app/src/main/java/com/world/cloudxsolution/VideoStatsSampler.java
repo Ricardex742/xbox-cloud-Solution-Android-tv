@@ -1,31 +1,41 @@
 package com.world.cloudxsolution;
 
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
-/** Interval bitrate, never a cumulative average masquerading as current throughput. */
+/** Interval measurements, preserving the distinction between reception and decoding. */
 public final class VideoStatsSampler {
     private String previousId;
     private double previousTimestamp;
-    private double previousBytes;
+    private Map<String, Object> previous = Collections.emptyMap();
 
     public void reset() {
         previousId = null;
         previousTimestamp = 0;
-        previousBytes = 0;
+        previous = Collections.emptyMap();
     }
 
     public String sample(String id, double timestampUs, Map<String, Object> video, Map<String, Object> codec) {
-        double bytes = number(video.get("bytesReceived"));
         double elapsed = timestampUs - previousTimestamp;
-        String rate = "medindo...";
-        if (id.equals(previousId) && elapsed > 0 && bytes >= previousBytes && previousBytes >= 0) {
-            // bits / microseconds == megabits / second.
-            rate = String.format(Locale.ROOT, "%.1f Mbps", (bytes - previousBytes) * 8 / elapsed);
-        }
+        boolean interval = id.equals(previousId) && Double.isFinite(elapsed) && elapsed > 0;
+        double bytes = delta(video, "bytesReceived", interval);
+        double received = delta(video, "framesReceived", interval);
+        double decoded = delta(video, "framesDecoded", interval);
+        double decodeTime = delta(video, "totalDecodeTime", interval);
+        double dropped = delta(video, "framesDropped", interval);
+        double lost = delta(video, "packetsLost", interval);
+        double jitterDelay = delta(video, "jitterBufferDelay", interval);
+        double emitted = delta(video, "jitterBufferEmittedCount", interval);
+        String rate = bytes >= 0 ? format(bytes * 8 / elapsed, 1) + " Mbps" : "medindo...";
+        String receivedFps = received >= 0 ? format(received * 1000000 / elapsed, 1) : "n/d";
+        String decodedFps = decoded >= 0 ? format(decoded * 1000000 / elapsed, 1) : "n/d";
+        String decodeMs = decoded > 0 && decodeTime >= 0 ? format(decodeTime * 1000 / decoded, 2) : "n/d";
+        String bufferMs = emitted > 0 && jitterDelay >= 0 ? format(jitterDelay * 1000 / emitted, 1) : "n/d";
         previousId = id;
         previousTimestamp = timestampUs;
-        previousBytes = bytes;
+        previous = new HashMap<>(video);
         String profile = "";
         Object fmtp = codec.get("sdpFmtpLine");
         if (fmtp instanceof String) for (String param : ((String) fmtp).split(";")) {
@@ -34,14 +44,37 @@ public final class VideoStatsSampler {
         return "Vídeo recebido: " + value(video, "frameWidth") + "x" + value(video, "frameHeight")
                 + " | " + rate + "\nCodec: " + value(codec, "mimeType") + profile
                 + "\nDecodificador: " + value(video, "decoderImplementation")
-                + "\nFPS recebido: " + value(video, "framesPerSecond")
-                + " | Perdidos na rede: " + value(video, "packetsLost");
+                + "\nFPS recebidos: " + receivedFps + " | Decodificados: " + decodedFps
+                + "\nDecodificação: " + decodeMs + " ms/quadro | Buffer: " + bufferMs + " ms"
+                + "\nDescartes WebRTC: " + count(dropped) + " | Pacotes perdidos: " + count(lost) + " (intervalo)"
+                + "\nJitter da rede: " + milliseconds(video.get("jitter")) + " ms";
     }
 
+    public static String networkSummary(Map<String, Object> pair, Map<String, Object> localCandidate) {
+        return "RTT ICE: " + milliseconds(pair.get("currentRoundTripTime"))
+                + " ms | ICE: " + value(localCandidate, "protocol")
+                + (localCandidate.containsKey("relayProtocol") ? " / relay: " + value(localCandidate, "relayProtocol") : "");
+    }
+
+    private double delta(Map<String, Object> current, String key, boolean interval) {
+        double now = number(current.get(key)), before = number(previous.get(key));
+        return interval && now >= 0 && before >= 0 && now >= before ? now - before : -1;
+    }
+
+    private static String milliseconds(Object value) {
+        double seconds = number(value);
+        return seconds >= 0 ? format(seconds * 1000, 1) : "n/d";
+    }
+
+    private static String count(double number) { return number >= 0 ? format(number, 0) : "n/d"; }
+    private static String format(double value, int precision) {
+        return String.format(Locale.ROOT, "%." + precision + "f", value).trim();
+    }
     private static double number(Object value) {
-        return value instanceof Number ? ((Number) value).doubleValue() : -1;
+        if (!(value instanceof Number)) return -1;
+        double number = ((Number) value).doubleValue();
+        return Double.isFinite(number) ? number : -1;
     }
-
     private static String value(Map<String, Object> values, String key) {
         Object value = values.get(key);
         return value == null ? "n/d" : String.valueOf(value);

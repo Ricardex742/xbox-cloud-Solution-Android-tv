@@ -620,7 +620,6 @@ public class WebRtcReceiver implements Loggable {
 
         if (showStats && message != null && message.startsWith("stream-rendererDuration:")) {
             String stats = message.substring("stream-rendererDuration:".length()).trim();
-            if (signalingListener != null) signalingListener.onPerformanceStatsReceived(stats);
             synchronized (statsLock) {
                 if (!statsPending) {
                     statsPending = true;
@@ -653,8 +652,18 @@ public class WebRtcReceiver implements Loggable {
                         RTCStats codec = report.getStatsMap().get(members.get("codecId"));
                         String summary = videoStatsSampler.sample(stat.getId(), stat.getTimestampUs(), members,
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
+                        // Resolve the selected pair via this video transport, not an arbitrary
+                        // candidate pair (which might be a failed/unselected route).
+                        RTCStats transport = report.getStatsMap().get(members.get("transportId"));
+                        RTCStats pair = transport == null ? null : report.getStatsMap().get(
+                                transport.getMembers().get("selectedCandidatePairId"));
+                        RTCStats candidate = pair == null ? null : report.getStatsMap().get(
+                                pair.getMembers().get("localCandidateId"));
+                        String network = VideoStatsSampler.networkSummary(
+                                pair == null ? java.util.Collections.emptyMap() : pair.getMembers(),
+                                candidate == null ? java.util.Collections.emptyMap() : candidate.getMembers());
                         if (signalingListener != null) {
-                            signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary);
+                            signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary + "\n" + network);
                         }
                         break;
                     }

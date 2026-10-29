@@ -128,6 +128,7 @@ public class MainActivity extends AppCompatActivity {
     private final java.util.concurrent.ExecutorService diagnosticWorker =
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-startup-diagnostics"));
     private final StartupGate startup = new StartupGate();
+    private final SurfaceDispatchGate surfaceDispatch = new SurfaceDispatchGate();
     private long startupStartedAt;
     private boolean diagnosticWorkInFlight;
     private boolean serviceBound, nativeWorkInFlight, surfaceDirty, activityDestroyed;
@@ -163,6 +164,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         int token = startup.begin();
+        surfaceDispatch.requested();
         startupStartedAt = System.currentTimeMillis();
         showStartupProgress("Conectando ao serviço de vídeo…");
         if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
@@ -352,7 +354,10 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @Override public void onRenderSurfaceRequested() {
-            runOnUiThread(MainActivity.this::pushSurfaceIfReady);
+            runOnUiThread(() -> {
+                surfaceDispatch.requested();
+                pushSurfaceIfReady();
+            });
         }
 
         @Override public void onVideoSizeChanged(int w, int h) {
@@ -523,9 +528,13 @@ public class MainActivity extends AppCompatActivity {
         }
 
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder holder) { pushSurfaceIfReady(); }
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                surfaceDispatch.created();
+                pushSurfaceIfReady();
+            }
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) { pushSurfaceIfReady(); }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                surfaceDispatch.destroyed();
                 IStreamingService service = streamingService;
                 if (service != null && !activityDestroyed) videoWorker.execute(() -> {
                     try { service.clearRenderSurface(); } catch (RemoteException | RuntimeException e) {
@@ -567,7 +576,9 @@ public class MainActivity extends AppCompatActivity {
     private void pushSurfaceIfReady() {
         if (activityDestroyed || streamingService == null || surfaceView == null
                 || (!startup.ready() && startup.stage() != StartupGate.Stage.SURFACE)) return;
+        if (!surfaceDispatch.needsDelivery()) return;
         if (nativeWorkInFlight) { surfaceDirty = true; return; }
+        long surfaceGeneration = surfaceDispatch.generation();
         Surface surface = surfaceView.getHolder().getSurface();
         if (surface == null || !surface.isValid()) return;
         surfaceView.setKeepScreenOn(true);
@@ -582,6 +593,12 @@ public class MainActivity extends AppCompatActivity {
                 startupHandler.post(() -> {
                     nativeWorkInFlight = false;
                     if (activityDestroyed || token != startup.token() || service != streamingService) return;
+                    surfaceDispatch.delivered(surfaceGeneration);
+                    if (!surfaceDispatch.available()) return;
+                    if (surfaceDispatch.needsDelivery()) {
+                        pushSurfaceIfReady();
+                        return;
+                    }
                     if (startup.advance(token, StartupGate.Stage.READY)) {
                         if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
                         showWebview();
@@ -1659,8 +1676,8 @@ private boolean debug=false;
         spinnerRes.setAdapter(resAdapter);
 
         // Bitrate options
-        Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};
-        String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (teto recomendado)"};
+        Integer[] bitrateValues = {0, 4, 6, 8, 10, 12, 15, 18, 20};
+        String[] bitrateLabels = {"Automático (20 Mbps)", "4 Mbps (menor qualidade)", "6 Mbps", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (teto recomendado)"};
         android.widget.ArrayAdapter<String> bitrateAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bitrateLabels);
         bitrateAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerBitrate.setAdapter(bitrateAdapter);
