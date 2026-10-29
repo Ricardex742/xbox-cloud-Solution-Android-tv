@@ -122,3 +122,45 @@ Próximo teste físico:
    a conexão e tentar novamente; o login salvo deve permanecer.
 6. Só depois, aplicar o perfil TL042 e testar a entrada em três jogos. A build
    ainda precisa dessa validação para confirmar que resolveu o relato na TV.
+
+## Falha de bind persistente — após o teste da build #28
+
+O vídeo de 29/10 mostra `Conectando ao serviço de vídeo…`. O usuário confirmou
+que termina em `Tempo esgotado: conexão com o serviço de vídeo`, em tentativas
+repetidas. Isso situa a falha antes de `onServiceConnected`: fábrica WebRTC,
+SDP, codec, bitrate e catálogo ainda não foram iniciados. O vídeo não contém
+logcat nem prova a causa da ausência do callback.
+
+A build #28 removeu o bloqueio da interface, mas deixou uma dependência anterior
+ao bind: `StreamingService.onCreate` chamava NotificationManager/startForeground
+sem tratamento de erro. O manifesto também declarava mediaProjection e
+connectedDevice para um serviço que reproduz o vídeo recebido. Não há captura
+de tela MediaProjection neste fluxo. Uma recusa/espera nesse caminho podia
+impedir a conexão; ainda não foi comprovado que foi isso que ocorreu na TL042.
+
+Alterações desta revisão:
+
+- Serviço conecta como bound service; `onCreate`/`onBind` não fazem notificação,
+  promoção foreground nem inicialização nativa. A Activity visível mantém a
+  importância do serviço vinculado durante a abertura.
+- Notificação e promoção são solicitadas somente com sessão ativa, usando o tipo
+  mediaPlayback e a permissão já existente. As permissões de foreground
+  mediaProjection/connectedDevice desnecessárias foram removidas.
+- Trabalho de notificação roda em worker separado. RuntimeException na promoção
+  é registrada sem encerrar o serviço bound. Encerrar a sessão remove a
+  notificação; mudanças rápidas são consolidadas. Não se promete a mesma proteção
+  contra encerramento em segundo plano se a promoção for recusada pelo Android.
+- Em timeout de bind no Android 11+, consulta-se o histórico de saída somente do
+  processo `:stream` e somente da tentativa atual. Motivo (falha Java/nativa,
+  falta de memória, ANR etc.) e status aparecem na tela. Ausência de registro
+  continua sendo causa desconhecida; um crash antigo não é atribuído à tentativa.
+  A consulta roda fora da UI e não coleta stack traces, URLs ou credenciais.
+- Logs distinguem solicitação de bind aceita, criação do serviço, retorno do
+  Binder e recebimento do Binder pela Activity.
+
+Validação: 29 testes Java e 14 Node aprovados; Debug/Release compilados; lint sem
+ erros. Os novos testes cobrem notificação adiada, recusa de promoção, saída
+ durante uma promoção lenta, consolidação de eventos e filtragem de histórico.
+Ainda é necessária a instalação na TL042: abrir até o catálogo; se o bind falhar,
+aguardar a linha de diagnóstico e fotografar a tela inteira antes de tentar
+novamente. Não alterar perfil de vídeo para investigar esta etapa.

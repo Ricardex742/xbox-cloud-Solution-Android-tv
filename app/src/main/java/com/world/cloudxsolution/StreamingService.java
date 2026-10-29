@@ -27,21 +27,9 @@ import org.webrtc.VideoTrack;
 import java.nio.ByteBuffer;
 
 /**
- * Runs in the :stream process. Declare in AndroidManifest.xml:
- *
- *   <service android:name=".StreamingService"
- *            android:process=":stream"
- *            android:foregroundServiceType="mediaProjection|connectedDevice" />
- *
- * (adjust foregroundServiceType to whatever's accurate for your target SDK --
- * you're already streaming media + reading a connected gamepad, so both
- * likely apply; check the exact allowed combination for your compileSdk.)
- *
- * Owns everything that used to be instantiated directly inside MainActivity:
- * WebRtcReceiver (PeerConnectionFactory, EglBase, DataChannels) and, via
- * WebRtcReceiver, the AndroidGamepadListener. MainActivity now only owns the
- * WebView, the visible SurfaceView, and raw input capture -- everything else
- * is forwarded here over IStreamingService.
+ * Bound service in :stream. Binding is sufficient while the game Activity is visible.
+ * Optional foreground promotion uses mediaPlayback only after a session becomes active;
+ * it never gates onCreate/onBind, native initialization or the catalog.
  */
 public class StreamingService extends Service implements StreamHost {
 
@@ -55,6 +43,9 @@ public class StreamingService extends Service implements StreamHost {
 
     private final RemoteCallbackList<IStreamingCallback> callbacks = new RemoteCallbackList<>();
     private Handler callbackHandler;
+    private final java.util.concurrent.ExecutorService notificationWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-notification"));
+    private SessionForeground sessionForeground;
 
     // Local mirror -- deliberately NOT cross-process reads, because these
     // are checked on the hot input/data-channel path (see StreamHost javadoc).
@@ -65,9 +56,12 @@ public class StreamingService extends Service implements StreamHost {
     public void onCreate() {
         super.onCreate();
         callbackHandler = new Handler(Looper.getMainLooper());
-        startForegroundWithNotification();
-        // Binding and foreground notification must not wait for EGL/native drivers.
-        // The client initializes the receiver from its video worker via Binder.
+        sessionForeground = new SessionForeground(notificationWorker, new SessionForeground.Notification() {
+            @Override public void start() { startForegroundWithNotification(); }
+            @Override public void stop() { stopForeground(STOP_FOREGROUND_REMOVE); }
+        }, e -> Log.w(TAG, "Playback notification unavailable; keeping bound service", e));
+        // No NotificationManager, foreground promotion or EGL work before onBind.
+        Log.i(TAG, "startup: service created; waiting for bind");
     }
 
     private void setupSignalingRelay() {
@@ -351,11 +345,13 @@ public class StreamingService extends Service implements StreamHost {
         @Override
         public void setStreamingState(boolean isStreaming) {
             isStreamingMirror = isStreaming;
+            sessionForeground.setActive(isStreaming);
         }
     };
 
     @Override
     public IBinder onBind(Intent intent) {
+        Log.i(TAG, "startup: returning service binder");
         return binder;
     }
 
@@ -388,6 +384,7 @@ public class StreamingService extends Service implements StreamHost {
     @Override
     public void setStreamingState(boolean isStreaming) {
         isStreamingMirror = isStreaming;
+        sessionForeground.setActive(isStreaming);
         broadcast(cb -> safe(() -> cb.onStreamingStateChanged(isStreaming)));
     }
 
@@ -455,15 +452,19 @@ public class StreamingService extends Service implements StreamHost {
             nm.createNotificationChannel(channel);
         }
         Notification notification = new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("Streaming active")
+                .setContentTitle("CloudX — sessão de jogo ativa")
+                .setCategory(Notification.CATEGORY_TRANSPORT)
+                .setOngoing(true)
                 .setSmallIcon(android.R.drawable.presence_video_online)
                 .build();
-        startForeground(1, notification);
+        startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
     }
 
     @Override
     public void onDestroy() {
         destroyed = true;
+        if (sessionForeground != null) sessionForeground.close();
+        notificationWorker.shutdown();
         callbacks.kill();
         // Exit must not wait for an in-flight native startup or EGL teardown.
         // The same monitor prevents releasing a receiver during its initialization.

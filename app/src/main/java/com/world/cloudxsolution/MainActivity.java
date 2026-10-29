@@ -125,7 +125,11 @@ public class MainActivity extends AppCompatActivity {
     // when a driver/Binder call times out: interrupt cannot cancel a native driver hang.
     private final java.util.concurrent.ExecutorService videoWorker =
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-video-startup"));
+    private final java.util.concurrent.ExecutorService diagnosticWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-startup-diagnostics"));
     private final StartupGate startup = new StartupGate();
+    private long startupStartedAt;
+    private boolean diagnosticWorkInFlight;
     private boolean serviceBound, nativeWorkInFlight, surfaceDirty, activityDestroyed;
     private Runnable startupTimeout, catalogTimeout;
     private int catalogGeneration;
@@ -136,6 +140,7 @@ public class MainActivity extends AppCompatActivity {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
             if (activityDestroyed) return;
             streamingService = IStreamingService.Stub.asInterface(binder);
+            Log.i(TAG, "startup: service binder connected");
             if (startup.stage() == StartupGate.Stage.BINDING) initializeVideo(startup.token());
         }
         @Override public void onServiceDisconnected(ComponentName name) {
@@ -158,6 +163,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         int token = startup.begin();
+        startupStartedAt = System.currentTimeMillis();
         showStartupProgress("Conectando ao serviço de vídeo…");
         if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
         startupTimeout = () -> {
@@ -174,6 +180,7 @@ public class MainActivity extends AppCompatActivity {
         }
         try {
             serviceBound = bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE);
+            Log.i(TAG, "startup: bind request accepted=" + serviceBound);
             if (!serviceBound) failStartup("Não foi possível conectar ao serviço de vídeo.");
         } catch (RuntimeException e) {
             Log.e(TAG, "startup: bind failed", e);
@@ -219,9 +226,26 @@ public class MainActivity extends AppCompatActivity {
 
     private void failStartup(String message) {
         if (activityDestroyed) return;
+        boolean failedWhileBinding = startup.stage() == StartupGate.Stage.BINDING;
         startup.fail();
         if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
         showStartupFailure(message);
+        if (failedWhileBinding && !diagnosticWorkInFlight) {
+            diagnosticWorkInFlight = true;
+            int token = startup.token();
+            long since = startupStartedAt;
+            Context context = getApplicationContext();
+            diagnosticWorker.execute(() -> {
+                String report = StartupDiagnostics.read(context, since);
+                startupHandler.post(() -> {
+                    diagnosticWorkInFlight = false;
+                    if (!activityDestroyed && token == startup.token() && startup.stage() == StartupGate.Stage.FAILED) {
+                        loadingText.setText(message + "\n" + report);
+                        Log.w(TAG, "startup: " + report);
+                    }
+                });
+            });
+        }
     }
 
     private void showStartupFailure(String message) {
@@ -1141,6 +1165,7 @@ private boolean debug=false;
         activityDestroyed = true;
         startup.close();
         startupHandler.removeCallbacksAndMessages(null);
+        diagnosticWorker.shutdown();
         if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
         if (performanceDialog != null) {
             performanceDialog.dismiss();
