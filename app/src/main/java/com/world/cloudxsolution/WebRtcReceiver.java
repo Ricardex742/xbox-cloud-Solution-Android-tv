@@ -173,6 +173,7 @@ public class WebRtcReceiver implements Loggable {
         WebRtcLoggingHelper.injectCustomLogger(this, Logging.Severity.LS_INFO);
 
         audioDeviceModule = JavaAudioDeviceModule.builder(appContext)
+                .setUseStereoOutput(true)
                 .setUseHardwareAcousticEchoCanceler(false)
                 .setUseHardwareNoiseSuppressor(false)
                 .setAudioTrackStateCallback(new JavaAudioDeviceModule.AudioTrackStateCallback() {
@@ -457,7 +458,7 @@ public class WebRtcReceiver implements Loggable {
             @Override public void onCreateSuccess(SessionDescription description) {
                 if (peerConnection != connection) return;
                 final SessionDescription configuredOffer = new SessionDescription(description.type,
-                        SdpPolicy.videoBandwidth(description.description, bitrateKbps));
+                        SdpPolicy.stereoAudio(SdpPolicy.videoBandwidth(description.description, bitrateKbps)));
                 highOffered = VideoQualityPolicy.offersH264High(configuredOffer.description);
                 offeredProfiles = VideoQualityPolicy.h264Profiles(configuredOffer.description).toString();
                 connection.setLocalDescription(new ReportingSdpObserver("local-offer") {

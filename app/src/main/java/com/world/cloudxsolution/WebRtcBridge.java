@@ -153,6 +153,11 @@ public class WebRtcBridge {
     }
 
     @JavascriptInterface
+    public void onInputVersions(int legacy, int modern, int reliable) {
+        if (active) runIfActive(() -> activity.onInputVersions(legacy, modern, reliable));
+    }
+
+    @JavascriptInterface
     public void onControlAuthorizationSent() {
         if (!active) return;
         runIfActive(activity::onControlAuthorizationSent);

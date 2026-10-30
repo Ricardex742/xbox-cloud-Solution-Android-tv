@@ -41,14 +41,51 @@ window.handleSignalingError = function(operation) {
 };
 window.handleAnswer = function(sdp) {
     if (!window.peer || window.peer.signalingState === 'closed') return;
+    window.peer._nativeAnswerSdp = sdp;
     const answer = { type: 'answer', sdp };
     if (window.bxNativePending.answer) window.bxSettleNative('answer', answer);
     else window.bxEarlyAnswer = answer;
 };
 window.handleOffer = function(sdp) {
+    if (!window.peer || window.peer.signalingState === 'closed') return;
+    window.peer._nativeOfferSdp = sdp;
     window.bxSettleNative('offer', { type: 'offer', sdp });
 };
 window.handleRemoteDescriptionSet = function() { window.bxSettleNative('remote'); };
+
+// Called before the SDK handles an answer: report versions are not DCEP protocol strings.
+window.bxCaptureInputVersions = function(value, owner) {
+    if (!owner || window.peer !== owner || owner.signalingState === 'closed') return;
+    try {
+        let answer = typeof value === 'string' ? JSON.parse(value) : value;
+        for (let n=0; n<3 && answer && typeof answer.sdp !== 'string'; n++) {
+            const wrapped = answer.exchangeResponse || answer.response || answer.answer;
+            if (!wrapped) break;
+            answer = typeof wrapped === 'string' ? JSON.parse(wrapped) : wrapped;
+        }
+        if (!answer || typeof answer.sdp !== 'string' || !('input' in answer || 'unreliableinput' in answer)) return;
+        const integer = v => Number.isInteger(Number(v)) ? Number(v) : 0;
+        owner._inputVersions = [integer(answer.input), integer(answer.unreliableinput), integer(answer.reliableinput)];
+        if (window.AndroidBridge && window.AndroidBridge.onInputVersions)
+            window.AndroidBridge.onInputVersions(...owner._inputVersions);
+    } catch (e) {}
+};
+window.bxCanonicalOfferMessage = function(data, depth = 0) {
+    if (typeof data !== 'string' || !window.peer || window.peer.signalingState === 'closed' || depth > 2) return data;
+    try {
+        const msg = JSON.parse(data);
+        if (msg.messageType === 'offer' && typeof msg.sdp === 'string' && window.peer._nativeOfferSdp) {
+            msg.sdp = window.peer._nativeOfferSdp;
+            return JSON.stringify(msg);
+        }
+        for (const key of ['exchangeRequest', 'message', 'request']) {
+            if (typeof msg[key] !== 'string') continue;
+            const canonical = window.bxCanonicalOfferMessage(msg[key], depth + 1);
+            if (canonical !== msg[key]) { msg[key] = canonical; return JSON.stringify(msg); }
+        }
+    } catch (e) {}
+    return data;
+};
 
 window.bxKeepAliveTimer = null;
 window.bxKeepAliveStarted = false;
@@ -413,7 +450,19 @@ class XcloudInterceptor {
         } else if (url.endsWith("/configuration")) {
             return XcloudInterceptor.handleConfiguration(request, init);
         }
-        return NATIVE_FETCH(request, init);
+        const owner = window.peer;
+        if (/sdp/i.test(url)) {
+            try {
+                const oldBody = await request.clone().text();
+                const body = window.bxCanonicalOfferMessage(oldBody);
+                if (body !== oldBody) { request = new Request(request, Object.assign({}, init, {body})); init = undefined; }
+            } catch (e) {}
+        }
+        const response = await NATIVE_FETCH(request, init);
+        if (owner && /sdp/i.test(url)) {
+            try { window.bxCaptureInputVersions(await response.clone().json(), owner); } catch (e) {}
+        }
+        return response;
     }
 }
 
@@ -422,14 +471,56 @@ function interceptHttpRequests() {
         let url = typeof request === "string" ? request : request.url;
 
         if (url.includes("xboxlive.com") || url.includes("gssv-play-prod.xboxlive.com")) {
-            if (typeof request === "string") {
-                request = new Request(request, init);
-            }
-            return XcloudInterceptor.handle(request, init);
+            // Materialize RequestInit once so a later fetch cannot overwrite a patched body/header.
+            request = new Request(request, init);
+            return XcloudInterceptor.handle(request, undefined);
         }
 
-        return NATIVE_FETCH(request, init);
+        if (!/sdp/i.test(url)) return NATIVE_FETCH(request, init);
+        let finalRequest = request;
+        let finalInit = init;
+        let body = init && init.body;
+        if (!body && request && typeof request !== 'string' && request.clone && request.method === 'POST') {
+            try { body = await request.clone().text(); } catch (e) {}
+        }
+        const canonical = window.bxCanonicalOfferMessage(body);
+        if (canonical !== body) {
+            if (typeof request === 'string') finalInit = Object.assign({}, init, {body: canonical});
+            else { finalRequest = new Request(request, Object.assign({}, init, {body: canonical})); finalInit = undefined; }
+        }
+        const owner = window.peer;
+        const response = await NATIVE_FETCH(finalRequest, finalInit);
+        if (owner && /sdp/i.test(url)) {
+            try { window.bxCaptureInputVersions(await response.clone().json(), owner); } catch (e) {}
+        }
+        return response;
     };
+}
+
+// Some SDK releases use XHR for the same SDP exchange instead of fetch/WebSocket.
+function patchSignalingXhr() {
+    const Original = window.XMLHttpRequest;
+    if (typeof Original !== 'function') return;
+    window.XMLHttpRequest = function() {
+        const xhr = new Original();
+        const open = xhr.open, send = xhr.send;
+        let signaling = false, owner = null;
+        xhr.open = function(method, url, ...rest) {
+            signaling = /sdp/i.test(String(url));
+            return open.call(this, method, url, ...rest);
+        };
+        xhr.send = function(body) {
+            owner = window.peer;
+            return send.call(this, signaling ? window.bxCanonicalOfferMessage(body) : body);
+        };
+        xhr.addEventListener('load', () => {
+            if (!signaling) return;
+            try { window.bxCaptureInputVersions(xhr.responseType === 'json' ? xhr.response : xhr.responseText, owner); } catch (e) {}
+        });
+        return xhr;
+    };
+    window.XMLHttpRequest.prototype = Original.prototype;
+    Object.assign(window.XMLHttpRequest, Original);
 }
 
 window._lastFullConfig = null;
@@ -439,8 +530,17 @@ function patchWebSocket() {
     window.WebSocket = function(url, protocols) {
         const ws = new OriginalWebSocket(url, protocols);
         const originalSend = ws.send;
+        if (typeof ws.addEventListener === 'function') ws.addEventListener('message', event => {
+            window.bxCaptureInputVersions(event.data, ws._cloudxPeer);
+        });
 
         ws.send = function(data) {
+            // A socket belongs to the peer that sent its offer, never a later session.
+            try { if (JSON.parse(data).messageType === 'offer') {
+                if (ws._cloudxPeer && ws._cloudxPeer !== window.peer) return;
+                ws._cloudxPeer = window.peer;
+            } } catch (e) {}
+            data = window.bxCanonicalOfferMessage(data);
             if (typeof data === 'string') {
                 try {
                     const msg = JSON.parse(data);
@@ -455,7 +555,7 @@ function patchWebSocket() {
                     }
                 } catch (e) {}
             }
-            return originalSend.apply(this, arguments);
+            return originalSend.call(this, data);
         };
 
         return ws;
@@ -589,6 +689,8 @@ function patchRtcPeerConnection() {
             const destination = audioCtx.createMediaStreamDestination();
             stream = destination.stream;
             track = stream.getAudioTracks()[0];
+            if (track) track.enabled = false;
+            if (typeof audioCtx.suspend === 'function') Promise.resolve(audioCtx.suspend()).catch(() => {});
         }
 
         window.peer._auxStreams.push(stream);
@@ -806,7 +908,9 @@ function patchRtcPeerConnection() {
 
             setLocalDescription: function(description) {
                 if (window.peer !== this || this.signalingState === 'closed') return Promise.reject(new Error('Peer connection closed'));
-                this.localDescription = description;
+                const nativeSdp = description && (description.type === 'offer' ? this._nativeOfferSdp : this._nativeAnswerSdp);
+                if (!nativeSdp) return Promise.reject(new Error('Native local description missing'));
+                this.localDescription = {type: description.type, sdp: nativeSdp};
                 this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable';
 
                 let event = new Event('signalingstatechange');
@@ -917,6 +1021,7 @@ function main() {
     BxLogger.info("Init", "Loading lightweight xCloud bypass (PT-BR Optimized)...");
     interceptHttpRequests();
     patchWebSocket();
+    patchSignalingXhr();
     Patcher.init();
 }
 

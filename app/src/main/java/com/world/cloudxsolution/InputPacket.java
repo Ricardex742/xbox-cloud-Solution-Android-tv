@@ -28,6 +28,14 @@ public final class InputPacket {
     private static final int FRAME_SIZE = 23;
     private static final int FRAME_COUNT_BYTE = 1;
 
+    private int version = 10;
+    public void setVersion(int value) { version = Math.max(1, Math.min(10, value)); }
+    private void header(ByteBuffer buf, int report, long sequence) {
+        if (version >= 8) buf.putShort((short)report); else buf.put((byte)report);
+        buf.putInt((int)sequence);
+        if (version >= 7) buf.putDouble(getRelativeTimestampMs());
+    }
+
     private static final long START_TIME_NS = System.nanoTime();
 
     private final ByteBuffer metadataBuf =
@@ -38,9 +46,7 @@ public final class InputPacket {
     public ByteBuffer metadataPacket(long sequence, int maxTouchpoints) {
         metadataBuf.clear();
 
-        metadataBuf.putShort((short) REPORT_CLIENT_METADATA);
-        metadataBuf.putInt((int) sequence);
-        metadataBuf.putDouble(getRelativeTimestampMs());
+        header(metadataBuf, REPORT_CLIENT_METADATA, sequence);
         metadataBuf.put((byte) maxTouchpoints);
 
         metadataBuf.flip();
@@ -50,9 +56,7 @@ public final class InputPacket {
     public ByteBuffer forFrame(long sequence, GamepadFrame frame, int serverWidth, int serverHeight) {
         frameBuf.clear();
 
-        frameBuf.putShort((short) REPORT_GAMEPAD);
-        frameBuf.putInt((int) sequence);
-        frameBuf.putDouble(getRelativeTimestampMs());
+        header(frameBuf, REPORT_GAMEPAD, sequence);
 
         frameBuf.put((byte) 1);
         writeFrame(frameBuf, frame);
@@ -65,7 +69,7 @@ public final class InputPacket {
         return (System.nanoTime() - START_TIME_NS) / 1_000_000.0;
     }
 
-    private static void writeFrame(ByteBuffer buf, GamepadFrame f) {
+    private void writeFrame(ByteBuffer buf, GamepadFrame f) {
         buf.put((byte) f.gamepadIndex);
 
         buf.putShort((short) f.buttons);
@@ -76,8 +80,7 @@ public final class InputPacket {
         buf.putShort(normalizeTrigger(f.axes[GamepadFrame.AXIS_LEFT_TRIGGER]));
         buf.putShort(normalizeTrigger(f.axes[GamepadFrame.AXIS_RIGHT_TRIGGER]));
 
-        buf.putInt(calculatePhysicality(f));
-        buf.putInt(0);
+        if (version >= 2) { buf.putInt(calculatePhysicality(f)); buf.putInt(0); }
     }
 
     private static short normalizeTrigger(float value) {

@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">cloudxSolution</string>
     <string name="video_quality_label">Qualidade e desempenho</string>
-    <string name="video_quality_help">High depende do suporte da TV e da negociação com o servidor. Pode causar travamentos. Encerre e reabra o jogo para aplicar; confira o perfil efetivo no painel.</string>
+    <string name="video_quality_help">Preferir High permite Baseline se o servidor escolher. Exigir High recusa Baseline e pode falhar ao conectar. Encerre e reabra o jogo para aplicar; confira o perfil efetivo.</string>
     <string name="low_latency_experimental">Solicitar baixa latência da TV (experimental)</string>
 <string name="tl042_preset">Usar perfil Multilaser TL042 (720p / 8 Mbps)</string>
 

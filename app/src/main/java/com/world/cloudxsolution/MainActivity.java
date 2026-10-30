@@ -96,7 +96,9 @@ public class MainActivity extends AppCompatActivity {
     private String lastPerformanceReport = "Sem amostra de desempenho. Abra as estatísticas durante o jogo.";
     private static final String KEY_LOW_LATENCY = "prefer_minimal_post_processing";
     private int nativeGamepadIndex;
-    private long handledControllerEvents, remoteInputAcks;
+    private long handledControllerEvents, remoteInputAcks, lastAckTraceAtMs;
+    private int legacyInputVersion = 10, modernInputVersion = 10, reliableInputVersion = 10;
+    private boolean inputVersionsKnown;
     private GamepadRumbleHandler rumbleHandler;
 
     private static final String PREFS_NAME = "CloudXPrefs";
@@ -389,7 +391,7 @@ public class MainActivity extends AppCompatActivity {
                 if (performanceDialog != null && performanceDialog.isShowing()) {
                     android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
                     performanceDialog.updateStats(stats + "\nControle: " + (activeInputChannel.isEmpty() ? "aguardando canal" : activeInputChannel)
-                            + " | Autorização enviada: " + (inputSession.authorized() ? "sim" : "não")
+                            + " | v=" + (inputVersionsKnown ? ("input".equals(activeInputChannel) ? legacyInputVersion : modernInputVersion) : "não confirmada") + " | Autorização enviada: " + (inputSession.authorized() ? "sim" : "não")
                             + "\nAnúncio enviado: " + (gamepadAnnounced ? "sim" : "não")
                             + " | Eventos tratados: " + handledControllerEvents + "\nACKs input recebidos: " + remoteInputAcks + " (não confirmam ação no jogo)\nSuperfície: " + size.width() + "x" + size.height() + "\n" + displayLatencyStatus());
                 }
@@ -429,21 +431,12 @@ public class MainActivity extends AppCompatActivity {
                     legacyInputChannel.onResolutionChange(w, h);
                 }
                 showCustomToast("Sessão ativa: " + w + "x" + h);
-                if (webView != null) {
-                    webView.setVisibility(View.INVISIBLE);
-                }
-
-                    if(surfaceView!=null) {
-                        ViewGroup parent = (ViewGroup) surfaceView.getParent();
-                        //originalIndex = parent.indexOfChild(surfaceView);
-                        surfaceView.setZOrderOnTop(true);
-                        surfaceView.bringToFront();
-                        parent.requestLayout();
-                        parent.invalidate();
-                    }
-                    if (webView!=null&&Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        webView.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
-                    }
+                if (webView != null) webView.setVisibility(View.GONE);
+                loadingLayout.setVisibility(View.GONE);
+                // Keep the Surface Z-order established before creation. Changing it here can
+                // destroy/recreate EGL while the decoder is delivering its first frames.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+                    getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
 
             });
         }
@@ -457,7 +450,7 @@ public class MainActivity extends AppCompatActivity {
         @Override public void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control) {
             post(() -> {
                 if (!acceptInputCallbacks || activityDestroyed) return;
-                inputSession.snapshot(legacy, modern, control);
+                inputSession.snapshot(legacy && legacyInputVersion > 0, modern && modernInputVersion >= 9 && reliableInputVersion >= 9, control);
                 if (legacy || modern) setStreamingState(true);
                 updateInputRoute();
                 announceNativeGamepad();
@@ -548,6 +541,7 @@ public class MainActivity extends AppCompatActivity {
                         if (controllerLe.onGenericMotion(event)) { handledControllerEvents++; return true; }
                     }
                 }
+                if (isStreaming && event.isFromSource(InputDevice.SOURCE_JOYSTICK)) return true;
                 return super.dispatchGenericMotionEvent(event);
             }
 
@@ -582,6 +576,9 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }
                 }
+                // Gameplay belongs to native input even while a route is opening.
+                // Chromium must not reinterpret an unhandled gamepad button as page navigation.
+                if (isStreaming && event.isFromSource(InputDevice.SOURCE_GAMEPAD)) return true;
                 return super.dispatchKeyEvent(event);
             }
 
@@ -589,6 +586,8 @@ public class MainActivity extends AppCompatActivity {
 
         rootLayout = findViewById(R.id.rootLayout);
         surfaceView = findViewById(R.id.surfaceView);
+        surfaceView.setZOrderOnTop(false);
+        surfaceView.getHolder().setFormat(android.graphics.PixelFormat.OPAQUE);
         loadingLayout = findViewById(R.id.loadingLayout);
         loadingText = findViewById(R.id.loadingText);
 
@@ -839,7 +838,8 @@ public class MainActivity extends AppCompatActivity {
     public void setWebviewVisible(){
        if (activityDestroyed || isStreaming || catalogFailed || !"Catálogo".equals(sessionStatus)) return;
        if(webView!=null){
-           webView.setVisibility(WebView.VISIBLE);}
+           webView.onResume();
+           webView.setVisibility(WebView.VISIBLE); webView.requestFocus();}
        if (loadingLayout != null) {
            loadingLayout.setVisibility(View.GONE);
        }
@@ -1016,6 +1016,10 @@ private boolean debug=false;
 
     public void closeNativeSession() {
         onNativeSessionClosing();
+        // SDK close can occur before a navigation or replacement peer. Uncover the page
+        // instead of leaving a released Surface above an invisible WebView.
+        if (webView != null) { webView.onResume(); webView.setVisibility(View.VISIBLE); webView.requestFocus(); }
+        if (performanceDialog != null) performanceDialog.dismiss();
         sessionGeneration++;
         IStreamingService service = streamingService;
         if (service != null) runNativeOperation(() -> {
@@ -1083,7 +1087,7 @@ private boolean debug=false;
     public void onDataChannelMessageReceived(String label, byte[] bin, String message, boolean isBinary) {
 
         if (("reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) && bin != null) {
-            InputMessageParser.parse(bin,
+            InputMessageParser.parse(bin, "input".equals(label) ? legacyInputVersion : reliableInputVersion,
                     (w, h) -> {
                         Log.i(TAG, "Server resolution update: " + w + "x" + h);
                         if (legacyInputChannel != null) {
@@ -1097,15 +1101,22 @@ private boolean debug=false;
                     },
                     token -> {
                         remoteInputAcks++;
-                        inputTrace.add(android.os.SystemClock.elapsedRealtime(), "ACK input recebido");
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        if (now - lastAckTraceAtMs >= 1000) {
+                            inputTrace.add(now, "ACK input total=" + remoteInputAcks);
+                            lastAckTraceAtMs = now;
+                        }
                     });
-            return;
+            // SDK needs server dimensions for initialization, but native-generated frame ACKs
+            // have no corresponding JS queue. Do not make it log an empty-queue warning at 60Hz.
+            int version = "input".equals(label) ? legacyInputVersion : reliableInputVersion;
+            if ((InputMessageParser.reportType(bin, version) & 16) == 0) return;
         }
         if (webView == null) return;
 
         // 2. Filter: Only forward 'control', 'message', and 'reliableinput' to JS
         boolean shouldSendToJs = "control".equalsIgnoreCase(label) ||
-                "message".equalsIgnoreCase(label) ||"chat".equalsIgnoreCase(label);
+                "message".equalsIgnoreCase(label) ||"chat".equalsIgnoreCase(label) || "input".equals(label) || "reliableinput".equals(label);
 
         if (shouldSendToJs) {
             // Ensure message is populated for binary data so JS gets something via Base64
@@ -1132,7 +1143,10 @@ private boolean debug=false;
         if (!acceptInputCallbacks || activityDestroyed) return;
         if (("input".equalsIgnoreCase(label) || "unreliableinput".equalsIgnoreCase(label))
                 && "OPEN".equalsIgnoreCase(state)) setStreamingState(true);
-        inputSession.channel(label, state);
+        String routeState = state;
+        if ("input".equals(label) && legacyInputVersion <= 0) routeState = "CLOSED";
+        if ("unreliableinput".equals(label) && (modernInputVersion < 9 || reliableInputVersion < 9)) routeState = "CLOSED";
+        inputSession.channel(label, routeState);
         if (!inputSession.canAnnounce()) gamepadAnnounced = false;
         updateInputRoute();
         announceNativeGamepad();
@@ -1148,7 +1162,7 @@ private boolean debug=false;
     }
 
     private void updateInputRoute() {
-        String selected = inputSession.activeChannel();
+        String selected = inputVersionsKnown ? inputSession.activeChannel() : "";
         if (selected.equals(activeInputChannel)) return;
         activeInputChannel = selected;
         if ("input".equals(selected) && legacyInputChannel != null) {
@@ -1159,16 +1173,33 @@ private boolean debug=false;
         }
     }
 
+    public void onInputVersions(int legacy, int modern, int reliable) {
+        if (!acceptInputCallbacks || activityDestroyed) return;
+        legacyInputVersion = legacy >= 1 && legacy <= 10 ? legacy : 0;
+        modernInputVersion = modern == 9 || modern == 10 ? modern : 0;
+        reliableInputVersion = reliable == 9 || reliable == 10 ? reliable : 0;
+        inputVersionsKnown = true;
+        legacyInputChannel.setVersion(Math.max(1, legacyInputVersion));
+        inputTrace.setLegacyVersion(Math.max(1, legacyInputVersion));
+        if (modernInputVersion >= 9) gamepadListener.setProtocolVersion(modernInputVersion);
+        requestInputSnapshot(); updateInputRoute(); announceNativeGamepad();
+    }
+
     public void onControlAuthorizationSent() {
         if (!acceptInputCallbacks || activityDestroyed) return;
         inputSession.authorizationSent();
+        final long generation = sessionGeneration;
+        startupHandler.postDelayed(() -> {
+            if (generation == sessionGeneration && acceptInputCallbacks && !inputVersionsKnown)
+                reportSignalingError("versão-input-não-recebida");
+        }, 10000);
         gamepadAnnounced = false;
         requestInputSnapshot();
         announceNativeGamepad();
     }
 
     private void announceNativeGamepad() {
-        if (gamepadAnnounced || !inputSession.canAnnounce() || streamingService == null) return;
+        if (!inputVersionsKnown || gamepadAnnounced || !inputSession.canAnnounce() || streamingService == null) return;
         try {
             String message = new JSONObject().put("message", "gamepadChanged")
                     .put("gamepadIndex", nativeGamepadIndex).put("wasAdded", true).toString();
@@ -1182,6 +1213,7 @@ private boolean debug=false;
     public void onNativeSessionClosing() {
         if (firstFrameTimeout != null) startupHandler.removeCallbacks(firstFrameTimeout);
         acceptInputCallbacks = false;
+        inputVersionsKnown = false; legacyInputVersion = modernInputVersion = reliableInputVersion = 10;
         inputSession.reset();
         gamepadAnnounced = false;
         activeInputChannel = "";
@@ -1575,7 +1607,6 @@ private boolean debug=false;
         long generation = ++sessionGeneration;
         if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
         if (performanceDialog != null) performanceDialog.dismiss();
-        surfaceView.setZOrderOnTop(false);
         surfaceView.setVisibility(View.GONE);
         destroySessionPage();
         showStartupProgress("Encerrando sessão…");
@@ -1897,7 +1928,7 @@ private boolean debug=false;
         androidx.appcompat.widget.SwitchCompat lowLatencySwitch = dialog.findViewById(R.id.switch_low_latency);
         lowLatencySwitch.setChecked(prefersMinimalPostProcessing());
         lowLatencySwitch.setEnabled(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R);
-        String[] profileLabels = {"Preferir Baseline (estável)", "Preferir High", "Automático", "Somente High (experimental)"};
+        String[] profileLabels = {"Preferir Baseline (estável)", "Compatível: preferir High", "Automático", "Exigir High (pode falhar)"};
         android.widget.ArrayAdapter<String> profileAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, profileLabels);
         profileAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerVideoProfile.setAdapter(profileAdapter);

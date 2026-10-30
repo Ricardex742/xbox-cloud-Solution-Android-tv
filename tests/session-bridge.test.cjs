@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync('app/src/main/assets/index.js', 'utf8');
 
-function setup() {
+function setup(options = {}) {
     const calls = [], timers = new Map();
     let nextTimer = 0;
     const c = {console: {log() {}, warn() {}, error() {}}, URL,
@@ -20,8 +20,19 @@ function setup() {
         RTCPeerConnection: function OriginalPeer() {},
         AndroidBridge: new Proxy({}, {get: (_, name) => (...args) => calls.push([name, ...args])})};
     c.document = {body: null, readyState: 'loading'};
-    c.fetch = async () => {throw new Error('unexpected fetch');};
-    c.WebSocket = function OriginalSocket() {};
+    c.XMLHttpRequest = class {
+        constructor(){this.listeners={};this.responseType='';}
+        open(method,url){this.url=url;}
+        send(body){this.body=body;}
+        addEventListener(type,callback){this.listeners[type]=callback;}
+    };
+    c.Request = Request; c.Response = Response;
+    c.fetch = options.fetch || (async () => {throw new Error('unexpected fetch');});
+    c.WebSocket = function OriginalSocket() {
+        this.sent=[]; this.listeners={};
+        this.send=data=>this.sent.push(data);
+        this.addEventListener=(type,handler)=>this.listeners[type]=handler;
+    };
     c.window = c; c.top = c;
     vm.createContext(c);
     vm.runInContext(source, c);
@@ -247,4 +258,87 @@ test('all late negotiation methods from an old peer are rejected before touching
     await assert.rejects(old.addIceCandidate({candidate:'old'}), /closed/);
     assert.equal(calls.length,count);
     assert.equal(current.signalingState,'stable');
+});
+
+test('SDK profile and stereo munging cannot diverge from the SDP committed natively', async () => {
+    const {c,pc}=setup();
+    const native='m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=fmtp:111 stereo=1\r\nm=video 9 UDP/TLS/RTP/SAVPF 98 96\r\na=fmtp:98 profile-level-id=64001f\r\na=fmtp:96 profile-level-id=42e01f\r\n';
+    const promise=pc.createOffer();c.handleOffer(native);const offer=await promise;
+    offer.sdp=offer.sdp.replace('98 96','96 98').replace('stereo=1','stereo=0');
+    await pc.setLocalDescription(offer);
+    assert.equal(pc.localDescription.sdp,native);
+    const ws=JSON.parse(c.bxCanonicalOfferMessage(JSON.stringify({messageType:'offer',requestId:7,sdp:offer.sdp,configuration:{input:{maxVersion:10}}})));
+    assert.equal(ws.sdp,native);assert.equal(ws.requestId,7);assert.equal(ws.configuration.input.maxVersion,10);
+    const http=JSON.parse(c.bxCanonicalOfferMessage(JSON.stringify({exchangeRequest:JSON.stringify(ws)})));
+    assert.equal(JSON.parse(http.exchangeRequest).sdp,native);
+    assert.equal(c.bxCanonicalOfferMessage('{"messageType":"iceCandidate","candidate":"unchanged"}'),'{"messageType":"iceCandidate","candidate":"unchanged"}');
+});
+
+test('server-selected input versions arrive before native registration and old answers are ignored', () => {
+    const {c,pc,calls}=setup();
+    c.bxCaptureInputVersions({sdp:'answer',input:7,unreliableinput:9,reliableinput:9},pc);
+    assert.deepEqual(calls.find(x=>x[0]==='onInputVersions'),['onInputVersions',7,9,9]);
+    const count=calls.length;const current=new c.RTCPeerConnection({iceServers:[]});const after=calls.length;
+    c.bxCaptureInputVersions({sdp:'old',input:10,unreliableinput:10,reliableinput:10},pc);
+    assert.equal(calls.length,after);
+    c.bxCaptureInputVersions({exchangeResponse:JSON.stringify({sdp:'new',input:8})},current);
+    assert.deepEqual(calls.at(-1),['onInputVersions',8,0,0]);
+});
+
+test('auxiliary audio is disabled and suspended while native playback remains independent', () => {
+    const {c,pc}=setup();let suspended=0;const track={enabled:true};
+    c.AudioContext=class {createMediaStreamDestination(){return {stream:{getAudioTracks:()=>[track]}};} suspend(){suspended++;return Promise.resolve();}};
+    c.simulateOnTrack('audio','aux');
+    assert.equal(track.enabled,false);assert.equal(suspended,1);assert.equal(pc._auxStreams.length,1);
+});
+
+test('WebSocket sends the canonical SDP rather than its original unmodified arguments', async () => {
+    const {c,pc,calls}=setup();const ws=new c.WebSocket('wss://example.invalid');
+    const promise=pc.createOffer();c.handleOffer('native-high-and-stereo');await promise;
+    ws.send(JSON.stringify({messageType:'offer',sdp:'sdk-baseline',configuration:{input:{maxVersion:10}}}));
+    assert.equal(JSON.parse(ws.sent[0]).sdp,'native-high-and-stereo');
+    ws.listeners.message({data:JSON.stringify({messageType:'answer',sdp:'server',input:10,unreliableinput:9,reliableinput:9})});
+    assert.deepEqual(calls.at(-1),['onInputVersions',10,9,9]);
+    new c.RTCPeerConnection({});const count=calls.length;
+    ws.listeners.message({data:JSON.stringify({messageType:'answer',sdp:'late',input:7})});
+    assert.equal(calls.length,count);
+});
+
+test('HTTP signaling canonicalizes wrapped offers and captures selected input version', async () => {
+    let sent;
+    const {c,pc,calls}=setup({fetch:async (request)=>{
+        sent=await request.clone().json();
+        return new Response(JSON.stringify({exchangeResponse:JSON.stringify({sdp:'answer',input:7,unreliableinput:9,reliableinput:9})}),{status:200});
+    }});
+    const pending=pc.createOffer();c.handleOffer('native-http');await pending;
+    await c.fetch('https://example.xboxlive.com/v5/sessions/cloud/test/sdp',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({exchangeRequest:JSON.stringify({messageType:'offer',sdp:'mutated',configuration:{input:{maxVersion:10}}})})
+    });
+    assert.equal(JSON.parse(sent.exchangeRequest).sdp,'native-http');
+    assert.deepEqual(calls.at(-1),['onInputVersions',7,9,9]);
+});
+
+test('XHR signaling preserves canonical offers and observes selected input versions', async () => {
+    const {c,pc,calls}=setup();const pending=pc.createOffer();c.handleOffer('native-xhr');await pending;
+    const xhr=new c.XMLHttpRequest();xhr.open('POST','https://example.invalid/sdp');
+    xhr.send(JSON.stringify({messageType:'offer',sdp:'sdk-mutated',configuration:{}}));
+    assert.equal(JSON.parse(xhr.body).sdp,'native-xhr');
+    xhr.responseText=JSON.stringify({sdp:'server',input:10,unreliableinput:9,reliableinput:9});xhr.listeners.load();
+    assert.deepEqual(calls.at(-1),['onInputVersions',10,9,9]);
+    const other=new c.XMLHttpRequest();other.open('POST','https://example.invalid/settings');other.send('unmodified');
+    assert.equal(other.body,'unmodified');
+});
+
+test('canonicalizing a Request preserves RequestInit authorization and content type', async () => {
+    let auth,body;
+    const {c,pc}=setup({fetch:async request=>{
+        auth=request.headers.get('Authorization');body=await request.json();
+        return new Response(JSON.stringify({sdp:'answer',input:10}));
+    }});
+    const pending=pc.createOffer();c.handleOffer('native-with-headers');await pending;
+    const request=new Request('https://example.xboxlive.com/session/sdp',{method:'POST',body:'{}'});
+    await c.fetch(request,{headers:{Authorization:'Bearer unit-test-placeholder','Content-Type':'application/json'},
+        body:JSON.stringify({messageType:'offer',sdp:'changed'})});
+    assert.equal(auth,'Bearer unit-test-placeholder');assert.equal(body.sdp,'native-with-headers');
 });

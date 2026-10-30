@@ -17,6 +17,11 @@ public final class UnreliableInputPacket {
 
     public static ByteBuffer forChangedGamepads(long token, long tickCounter,
                                                 GamepadTransitionFrame changedGamepads) {
+        return forChangedGamepads(token, tickCounter, changedGamepads, 10);
+    }
+
+    public static ByteBuffer forChangedGamepads(long token, long tickCounter, GamepadTransitionFrame changedGamepads, int version) {
+        if (version != 9 && version != 10) throw new IllegalArgumentException("Unsupported unreliable input version");
         int totalSize = HEADER_SIZE
                 + 4                              // t
                 + 1                              // changedGamepads.length
@@ -24,7 +29,7 @@ public final class UnreliableInputPacket {
                 + 1                              // changedPointers.length (0)
                 + 1                              // hasKeyboard (0)
                 + 1                              // hasMouse (0)
-                + 1                              // hasLockKeys (0)
+                + (version >= 10 ? 1 : 0)         // lock keys introduced in v10
                 + 1;                             // terminator
 
         ByteBuffer buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN);
@@ -41,7 +46,7 @@ public final class UnreliableInputPacket {
         buf.put((byte) 0);
         buf.put((byte) 0);
         buf.put((byte) 0);
-        buf.put((byte) 0);
+        if (version >= 10) buf.put((byte) 0);
         buf.put((byte) 0);
 
         buf.flip();

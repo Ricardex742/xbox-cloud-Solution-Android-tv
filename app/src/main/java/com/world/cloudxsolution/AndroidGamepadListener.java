@@ -19,7 +19,9 @@ public final class AndroidGamepadListener {
     private final GamepadTransitionFrame transitionFrame;
     private final Consumer<ByteBuffer> unreliableSendRaw;
     private final AtomicLong unreliableToken = new AtomicLong(0);
-    private long tickCounter = 0;
+    private long tickCounter = 1;
+    private int protocolVersion = 10;
+    public void setProtocolVersion(int version) { synchronized (stateLock) { protocolVersion = version; } }
     private volatile long inputEpoch;
     private float stickDeadzone = 0.12f;
     private float cameraSensitivity = 1.5f;
@@ -90,7 +92,7 @@ public final class AndroidGamepadListener {
     private void sendState(GamepadPendingState state) {
         if (testModeActive) return;
         try {
-            ByteBuffer packet = UnreliableInputPacket.forChangedGamepads(state.token, state.tick, state.snapshot);
+            ByteBuffer packet = UnreliableInputPacket.forChangedGamepads(state.token, state.tick, state.snapshot, protocolVersion);
             unreliableSendRaw.accept(packet);
         } catch (Exception e) {
             Log.e("GamepadListener", "Failed to send packet", e);
@@ -222,7 +224,7 @@ public final class AndroidGamepadListener {
         synchronized (stateLock) {
             inputEpoch++;
             transitionFrame.resetSession();
-            unreliableToken.set(0); tickCounter = 0;
+            unreliableToken.set(0); tickCounter = 1;
             Arrays.fill(keyDown, false);
             prevHatUp = prevHatDown = prevHatLeft = prevHatRight = false;
             axesWereActive = false; testModeActive = false;

@@ -10,6 +10,27 @@ import java.util.Set;
 public final class SdpPolicy {
     private SdpPolicy() {}
 
+    public static String stereoAudio(String sdp) {
+        StringBuilder out = new StringBuilder();
+        java.util.Set<String> opus = new java.util.HashSet<>();
+        boolean audio = false;
+        for (String line : sdp.split("\\r?\\n")) {
+            if (line.startsWith("m=")) { audio = line.startsWith("m=audio ") && !line.startsWith("m=audio 0 "); opus.clear(); }
+            if (audio && line.matches("(?i)a=rtpmap:[0-9]+ opus/48000/2")) opus.add(line.substring(9).split(" ")[0]);
+            if (audio && line.startsWith("a=fmtp:")) {
+                String[] parts = line.substring(7).split(" +",2);
+                if (opus.contains(parts[0])) {
+                    java.util.List<String> params = new java.util.ArrayList<>();
+                    if (parts.length == 2) for (String param : parts[1].split(";"))
+                        if (!param.trim().toLowerCase(java.util.Locale.ROOT).startsWith("stereo=")) params.add(param.trim());
+                    params.add("stereo=1"); line = "a=fmtp:" + parts[0] + " " + String.join(";",params);
+                }
+            }
+            out.append(line).append("\r\n");
+        }
+        return out.toString();
+    }
+
     public static String videoBandwidth(String sdp, int requestedKbps) {
         StringBuilder result = new StringBuilder();
         List<String> section = new ArrayList<>();

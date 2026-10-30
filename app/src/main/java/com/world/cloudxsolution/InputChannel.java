@@ -23,6 +23,9 @@ public final class InputChannel {
         this.serverHeight = serverHeight;
     }
 
+    private int version = 10;
+    public synchronized void setVersion(int value) { version = value; packetWriter.setVersion(value); }
+
     public void onResolutionChange(int width, int height) {
         this.serverWidth = width;
         this.serverHeight = height;
@@ -32,8 +35,9 @@ public final class InputChannel {
      * Sends the initial metadata packet. Call once the underlying transport is open.
      */
     public synchronized void start(int maxTouchpoints) {
+        if (version < 3) return;
         sequence.set(0); // Reset sequence for new session
-        long seq = sequence.get();
+        long seq = sequence.incrementAndGet();
         ByteBuffer packet = packetWriter.metadataPacket(seq, maxTouchpoints);
         sendRaw.accept(packet);
     }

@@ -56,13 +56,24 @@ public final class InputMessageParser {
      *             limit are only valid for the duration of the WebRTC
      *             callback).
      */
+    public static int reportType(byte[] data, int version) {
+        int size = version >= 8 ? 2 : 1;
+        if (data == null || data.length < size) return 0;
+        return size == 2 ? (data[0] & 255) | ((data[1] & 255) << 8) : data[0] & 255;
+    }
+
     public static void parse(byte[] data, ResolutionListener resolutionListener, RumbleListener rumbleListener, AckListener ackListener) {
-        if (data == null || data.length < 2) return;
+        parse(data, 10, resolutionListener, rumbleListener, ackListener);
+    }
+
+    public static void parse(byte[] data, int version, ResolutionListener resolutionListener, RumbleListener rumbleListener, AckListener ackListener) {
+        int header = version >= 8 ? 2 : 1;
+        if (data == null || data.length < header) return;
 
         ByteBuffer buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
 
-        int reportType = buf.getShort(0) & 0xFFFF; // uint16
-        int offset = 2;
+        int reportType = header == 2 ? buf.getShort(0) & 0xFFFF : buf.get(0) & 255; // uint16
+        int offset = header;
 
         if ((reportType & REPORT_SERVER_METADATA) != 0) {
             if (data.length >= offset + 8) {
