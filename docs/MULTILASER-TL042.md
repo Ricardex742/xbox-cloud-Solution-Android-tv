@@ -212,3 +212,62 @@ FPS recebidos/decodificados, decodificação, buffer, perdas, RTT e renderer. Re
 em 720p/6 Mbps com nova sessão e cena comparável. Registrar também como fica sem
 o painel aberto. 4 Mbps é opcional e reduz qualidade. Só os resultados reais
 podem confirmar ganho de fluidez e orientar uma mudança no decodificador.
+
+## Controle ausente e congelamentos com/sem áudio — relato complementar
+
+O usuário esclareceu que os testes eram anteriores às correções da build #30:
+Gears sem controle, sessões variando entre 30–45 e 60 FPS, imagem congelada por
+aproximadamente 15 s com áudio ainda tocando; sessões de 30–45 FPS às vezes sem
+áudio. Isso não é um resultado de validação da build #30 e não comprova causa
+única para áudio, vídeo e input.
+
+Falhas de controle corrigidas nesta revisão:
+
+- O navegador passa a deixar o anúncio/remoção de gamepad para o nativo. Depois
+  de enviar authorizationRequest no canal control ordenado, a ponte pede o
+  anúncio gamepadChanged e um estado atual do controle, mesmo parado. Não se
+  interpreta isso como confirmação de autorização/execução pelo servidor.
+- O anúncio exige canal control, transporte de input aberto e envio prévio da
+  autorização. Estados abertos são reapresentados por snapshot nativo após
+  registrar observadores, ao autorizar e no primeiro quadro. Preferência de
+  transporte não pode selecionar um canal fechado.
+- Atualizar a configuração ICE não reinicia o estado do controle. Fechar a
+  sessão limpa rota/estado e callbacks de input são ignorados fora de sessão.
+  O proxy bloqueia envios de um canal JavaScript de sessão antiga.
+- O canal reliableinput deixa de ser bloqueado na saída: carrega sincronização
+  do protocolo, enquanto input/unreliableinput de gameplay continuam nativos.
+  Relatórios binários de entrada confiáveis chegam ao parser nativo de
+  metadados/vibração, em vez de serem descartados.
+- OPEN repetido não redispara a autorização do SDK. Contadores mostram eventos
+  tratados e envios aceitos/recusados localmente; não são confirmação remota.
+
+Diagnóstico de vídeo/áudio:
+
+- Amostragem a cada 4 s em thread própria somente com painel habilitado. Deixa
+  de depender da chegada de logs do renderizador, que pode parar numa falha EGL.
+  Há no máximo uma consulta getStats pendente; resultados de epochs/sessões
+  anteriores são descartados. Fechar o painel interrompe a amostragem.
+- Mostra idade do último quadro entregue pelo decoder e idade do relatório EGL,
+  evitando apresentar FPS antigos do renderer como medição atual num congelamento.
+- Mostra bitrate de áudio, amostras recebidas por segundo e amostras ocultadas
+  no intervalo; registra se a trilha chegou e callbacks de início/parada/erro
+  da saída AudioTrack. Dados recebidos/saída iniciada não provam som audível.
+- Ativar/desativar estatísticas usa uma chamada IPC assíncrona específica, sem
+  depender do lock de criação/liberação da Surface.
+
+Não foi aplicado reinício automático de decoder, limite de 30 FPS ou alteração
+de codec para presumir a causa dos congelamentos. Não há promessa de corrigir
+os congelamentos ou o áudio ausente sem a próxima evidência física.
+
+Validação local: 47 testes Java e 19 Node, builds Debug/Release e lint sem erros.
+Novos testes cobrem as ordens de autorização/abertura, canal fechado, nova
+sessão, bloqueio de remoção pelo navegador, mensagens confiáveis, mensagens de
+sessão antiga e áudio avançando enquanto a idade do último quadro cresce.
+Esses testes não reproduzem o firmware, AudioTrack ou MediaCodec reais da TL042.
+
+Próximo teste: instalar a nova build (inclui #30), manter inicialmente 720p/8 Mbps.
+Abrir Gears, esperar 60 s sem movimentar e testar A/analógicos; fotografar o
+painel se não funcionar. Em EA FC 26 ou outro jogo, manter o painel visível no
+congelamento e registrar FPS recebidos/decodificados, idade do quadro/EGL,
+áudio e saída AudioTrack. Comparar 6 Mbps em nova sessão somente depois dessa
+amostra de referência. Registrar se som e menu continuam respondendo.

@@ -221,6 +221,12 @@ public final class AndroidControllerLe {
         }
     }
 
+    /** Resend current held/neutral state after native controller registration. */
+    public synchronized void sendCurrentState() {
+        lastSent = null;
+        sendIfChanged();
+    }
+
     public synchronized void releaseAll() {
         java.util.Arrays.fill(frame.axes, 0f);
         frame.buttons = 0;

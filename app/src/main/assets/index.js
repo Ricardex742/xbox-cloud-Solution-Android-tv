@@ -107,6 +107,7 @@ window.handleDataChannelState = function(label, state) {
     console.log("[BxC] handleDataChannelState: " + label + " -> " + state);
     const dc = window.proxyDataChannels && window.proxyDataChannels[label];
     if (dc) {
+        if (dc.readyState === state.toLowerCase()) return;
         dc.readyState = state.toLowerCase();
         if (dc.readyState === 'open') dc.dispatchEvent(new Event('open'));
         if (dc.readyState === 'closed') dc.dispatchEvent(new Event('close'));
@@ -664,7 +665,8 @@ function patchRtcPeerConnection() {
                     onclose: null,
 
                     send: function(data) {
-                        if (label === 'input' || label === 'unreliableinput' || label === 'reliableinput') return;
+                        if (window.peer !== pc || pc.signalingState === 'closed') return;
+                        if (label === 'input' || label === 'unreliableinput') return;
                         if (window.AndroidBridge) {
                             let isBinary = typeof data !== 'string';
                             if (isBinary) {
@@ -673,6 +675,15 @@ function patchRtcPeerConnection() {
                                 window.AndroidBridge.onDataChannelSend(label, Array.from(bytes), null, true);
                                 return;
                             } else {
+                                let authorizationSent = false;
+                                if (label === 'control') {
+                                    try {
+                                        const message = JSON.parse(data).message;
+                                        // Native owns the controller slot; the hidden page must not remove it.
+                                        if (message === 'gamepadChanged') return;
+                                        authorizationSent = message === 'authorizationRequest';
+                                    } catch (e) {}
+                                }
                                 if (label === 'control' && data.includes('resolutionAlias')) {
                                     try {
                                         let overridesData = JSON.parse(data);
@@ -689,6 +700,9 @@ function patchRtcPeerConnection() {
                                 }
                                 let base64 = window.btoa(unescape(encodeURIComponent(data)));
                                 window.AndroidBridge.onDataChannelSend(label, null, base64, false);
+                                if (authorizationSent && window.AndroidBridge.onControlAuthorizationSent) {
+                                    window.AndroidBridge.onControlAuthorizationSent();
+                                }
                             }
                         }
                     },
@@ -794,7 +808,7 @@ function patchRtcPeerConnection() {
             setConfiguration: function(config) {
                 this.config = config;
                 if (window.AndroidBridge && config) {
-                    window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config || {}));
+                    window.AndroidBridge.onPeerConnectionConfigUpdated(JSON.stringify(config || {}));
                 }
             },
 

@@ -82,7 +82,11 @@ public class MainActivity extends AppCompatActivity {
     private AndroidGamepadListener gamepadListener;
     private AndroidControllerLe controllerLe;
     private InputChannel legacyInputChannel;
-    private String activeInputChannel = "unreliableinput"; // Default to modern
+    private String activeInputChannel = "";
+    private final InputSessionState inputSession = new InputSessionState();
+    private boolean acceptInputCallbacks, gamepadAnnounced;
+    private int nativeGamepadIndex;
+    private long handledControllerEvents;
     private GamepadRumbleHandler rumbleHandler;
 
     private static final String PREFS_NAME = "CloudXPrefs";
@@ -348,7 +352,10 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 if (performanceDialog != null && performanceDialog.isShowing()) {
                     android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
-                    performanceDialog.updateStats(stats + "\nSuperfície: " + size.width() + "x" + size.height());
+                    performanceDialog.updateStats(stats + "\nControle: " + (activeInputChannel.isEmpty() ? "aguardando canal" : activeInputChannel)
+                            + " | Autorização enviada: " + (inputSession.authorized() ? "sim" : "não")
+                            + "\nAnúncio enviado: " + (gamepadAnnounced ? "sim" : "não")
+                            + " | Eventos tratados: " + handledControllerEvents + "\nSuperfície: " + size.width() + "x" + size.height());
                 }
             });
         }
@@ -373,6 +380,8 @@ public class MainActivity extends AppCompatActivity {
 
         @Override public void onFirstFrameRendered(int w, int h) {
             runOnUiThread(() -> {
+                if (!acceptInputCallbacks || activityDestroyed) return;
+                requestInputSnapshot();
                 Log.i(TAG, "onFirstFrameRendered callback received: " + w + "x" + h);
                 setStreamingState(true);
                 if (legacyInputChannel != null) {
@@ -404,6 +413,15 @@ public class MainActivity extends AppCompatActivity {
         @Override public void setWebViewVisibility(int visibility) {
             runOnUiThread(() -> { if (webView != null) webView.setVisibility(visibility); });
         }
+        @Override public void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control) {
+            runOnUiThread(() -> {
+                if (!acceptInputCallbacks || activityDestroyed) return;
+                inputSession.snapshot(legacy, modern, control);
+                if (legacy || modern) setStreamingState(true);
+                updateInputRoute();
+                announceNativeGamepad();
+            });
+        }
         @Override public void onDataChannelStateChanged(String label, String state) {
             runOnUiThread(() -> MainActivity.this.onDataChannelStateChanged(label, state));
         }
@@ -434,7 +452,7 @@ public class MainActivity extends AppCompatActivity {
         float dz = gpPrefs.getFloat("camera_deadzone", 0.12f);
         float sens = gpPrefs.getFloat("gamepad_sensitivity", 1.5f);
         boolean useUnreliable = gpPrefs.getBoolean(KEY_USE_UNRELIABLE_INPUT, true);
-        activeInputChannel = useUnreliable ? "unreliableinput" : "input";
+        inputSession.preferModern(useUnreliable);
         
         rumbleHandler = new GamepadRumbleHandler(idx -> 
                 gamepadListener != null ? gamepadListener.getLastDevice() : null);
@@ -475,10 +493,10 @@ public class MainActivity extends AppCompatActivity {
                 if (isStreaming) {
                     if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) {
                         showCustomToast(gamepadListener.prepare(event.getDevice()));
-                        if (gamepadListener.onGenericMotion(event)) return true;
+                        if (gamepadListener.onGenericMotion(event)) { handledControllerEvents++; return true; }
                     } else if ("input".equals(activeInputChannel) && controllerLe != null) {
                         controllerLe.detectAxisLayout(event.getDevice());
-                        if (controllerLe.onGenericMotion(event)) return true;
+                        if (controllerLe.onGenericMotion(event)) { handledControllerEvents++; return true; }
                     }
                 }
                 return super.dispatchGenericMotionEvent(event);
@@ -498,16 +516,16 @@ public class MainActivity extends AppCompatActivity {
                     if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) {
                         showCustomToast(gamepadListener.prepare(event.getDevice()));
                         if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                            if (gamepadListener.onKeyDown(event.getKeyCode(), event)) return true;
+                            if (gamepadListener.onKeyDown(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                            if (gamepadListener.onKeyUp(event.getKeyCode(), event)) return true;
+                            if (gamepadListener.onKeyUp(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         }
                     } else if ("input".equals(activeInputChannel) && controllerLe != null) {
                         controllerLe.detectAxisLayout(event.getDevice());
                         if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                            if (controllerLe.onKeyDown(event.getKeyCode(), event)) return true;
+                            if (controllerLe.onKeyDown(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                            if (controllerLe.onKeyUp(event.getKeyCode(), event)) return true;
+                            if (controllerLe.onKeyUp(event.getKeyCode(), event)) { handledControllerEvents++; return true; }
                         }
                     }
                 }
@@ -898,14 +916,22 @@ private boolean debug=false;
     // before (the whole try block built List<PeerConnection.IceServer> and
 // called webRtcReceiver.setSignalingListener(null)/createPeerConnection(finalServers)/setupSignalingListener()):
 
-    public void onPeerConnectionConfigReceived(String configJson) {
+    public void onPeerConnectionConfigReceived(String configJson) { configurePeer(configJson, true); }
+    public void onPeerConnectionConfigUpdated(String configJson) { configurePeer(configJson, false); }
+
+    private void configurePeer(String configJson, boolean newSession) {
         if (configJson == null || configJson.equals("null") || configJson.isEmpty()) {
             return;
         }
         runOnUiThread(() -> {
             if (streamingService == null) return;
             try {
+                if (newSession) {
+                    onNativeSessionClosing();
+                    acceptInputCallbacks = true;
+                }
                 streamingService.createPeerConnection(configJson);
+                requestInputSnapshot();
             } catch (RemoteException e) {
                 Log.e(TAG, "createPeerConnection", e);
             }
@@ -999,45 +1025,66 @@ private boolean debug=false;
     }
 
     public void onDataChannelStateChanged(String label, String state) {
-        if ("unreliableinput".equalsIgnoreCase(label)) {
-            if ("OPEN".equalsIgnoreCase(state)) {
-                activeInputChannel = "unreliableinput";
-            } else if ("CLOSING".equalsIgnoreCase(state) || "CLOSED".equalsIgnoreCase(state)) {
-                if ("unreliableinput".equals(activeInputChannel)) {
-                    activeInputChannel = "input";
-                    //showCustomToast("[debug]: Modern input channel lost, switching to legacy");
-                    Log.d(TAG,"[debug]: Modern input channel lost, switching to legacy");
-                }
-            }
-        } else if ("input".equalsIgnoreCase(label)) {
-            if ("OPEN".equalsIgnoreCase(state)) {
-                // Only switch active channel to legacy 'input' if unreliable is NOT preferred
-                // or if unreliable hasn't opened yet. This prevents legacy 'input' from 
-                // overriding 'unreliableinput' if both open.
-                if (!"unreliableinput".equals(activeInputChannel)) {
-                    activeInputChannel = "input";
-                    Log.d(TAG, "Legacy input channel active");
-                }
-                
-                if (legacyInputChannel != null) {
-                    legacyInputChannel.start(0);
-                }
-            } else if ("CLOSING".equalsIgnoreCase(state) || "CLOSED".equalsIgnoreCase(state)) {
-                if ("input".equals(activeInputChannel)) {
-                    activeInputChannel = "unreliableinput";
-                    Log.d(TAG, "Legacy input channel lost, switching to unreliable");
-                }
-                if (legacyInputChannel != null) {
-                    legacyInputChannel.shutdown();
-                }
-            }
-        }
+        if (!acceptInputCallbacks || activityDestroyed) return;
+        if (("input".equalsIgnoreCase(label) || "unreliableinput".equalsIgnoreCase(label))
+                && "OPEN".equalsIgnoreCase(state)) setStreamingState(true);
+        inputSession.channel(label, state);
+        if (!inputSession.canAnnounce()) gamepadAnnounced = false;
+        updateInputRoute();
+        announceNativeGamepad();
+        if (webView != null) webView.evaluateJavascript(
+                "if(window.handleDataChannelState) window.handleDataChannelState("
+                        + JSONObject.quote(label) + "," + JSONObject.quote(state) + ");", null);
+    }
 
-        if (webView == null) return;
-        String script = "if (window.handleDataChannelState) { window.handleDataChannelState('" + label + "', '" + state + "'); }";
-        runOnUiThread(() -> {
-            if (webView != null) webView.evaluateJavascript(script, null);
-        });
+    private void requestInputSnapshot() {
+        if (!acceptInputCallbacks || streamingService == null) return;
+        try { streamingService.requestInputChannelSnapshot(); }
+        catch (RemoteException e) { Log.w(TAG, "Input snapshot unavailable", e); }
+    }
+
+    private void updateInputRoute() {
+        String selected = inputSession.activeChannel();
+        if (selected.equals(activeInputChannel)) return;
+        activeInputChannel = selected;
+        if ("input".equals(selected) && legacyInputChannel != null) {
+            legacyInputChannel.start(0);
+            if (controllerLe != null) controllerLe.sendCurrentState();
+        } else if ("unreliableinput".equals(selected) && gamepadListener != null) {
+            gamepadListener.sendCurrentState();
+        }
+    }
+
+    public void onControlAuthorizationSent() {
+        if (!acceptInputCallbacks || activityDestroyed) return;
+        inputSession.authorizationSent();
+        gamepadAnnounced = false;
+        requestInputSnapshot();
+        announceNativeGamepad();
+    }
+
+    private void announceNativeGamepad() {
+        if (gamepadAnnounced || !inputSession.canAnnounce() || streamingService == null) return;
+        try {
+            String message = new JSONObject().put("message", "gamepadChanged")
+                    .put("gamepadIndex", nativeGamepadIndex).put("wasAdded", true).toString();
+            streamingService.onDataChannelSend("control", message.getBytes(StandardCharsets.UTF_8), null, false);
+            gamepadAnnounced = true;
+            if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) gamepadListener.sendCurrentState();
+            if ("input".equals(activeInputChannel) && controllerLe != null) controllerLe.sendCurrentState();
+        } catch (RemoteException | org.json.JSONException e) { Log.w(TAG, "Gamepad announcement failed", e); }
+    }
+
+    public void onNativeSessionClosing() {
+        acceptInputCallbacks = false;
+        inputSession.reset();
+        gamepadAnnounced = false;
+        activeInputChannel = "";
+        handledControllerEvents = 0;
+        if (gamepadListener != null) gamepadListener.releaseAll();
+        if (controllerLe != null) controllerLe.releaseAll();
+        nativeGamepadEnabled = false;
+        setStreamingState(false);
     }
 
     public void onIceConnectionStateChanged(String state) {
@@ -1064,6 +1111,8 @@ private boolean debug=false;
     }
 
     public void setGamepadIndex(int idx) {
+        if (idx < 0 || idx > 3) return;
+        nativeGamepadIndex = idx;
         if (gamepadListener != null) {
             gamepadListener.setgamepadIndex(idx);
         }
@@ -1335,11 +1384,11 @@ private boolean debug=false;
                     performanceDialog = new PerformanceDialog(this);
                 }
                 performanceDialog.show();
-                try { streamingService.setRenderSurface(null, 41, 40); }
+                try { streamingService.setPerformanceStatsEnabled(true); }
                 catch (RemoteException e) { Log.e(TAG, "Cannot show performance states:"+ e.getMessage()); }
             } else {
                 if (performanceDialog != null) {
-                    try { streamingService.setRenderSurface(null, 51, 50); }
+                    try { streamingService.setPerformanceStatsEnabled(false); }
                     catch (RemoteException e) { Log.e(TAG, "Cannot close performance states:"+ e.getMessage()); }
                     performanceDialog.dismiss();
                 }
@@ -1348,6 +1397,7 @@ private boolean debug=false;
         });
 
         btnExit.setOnClickListener(v -> {
+            onNativeSessionClosing();
             if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
             if (webView != null) webView.evaluateJavascript(
                     "if(window.peer) window.peer.close(); window.location.href='https://www.xbox.com/pt-BR/play';", null);
@@ -1434,6 +1484,16 @@ private boolean debug=false;
             lp.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
             
             getWindow().setAttributes(lp);
+        }
+
+        @Override public void dismiss() {
+            super.dismiss();
+            isPerformanceOverlayVisible = false;
+            IStreamingService service = streamingService;
+            if (service != null) {
+                try { service.setPerformanceStatsEnabled(false); }
+                catch (RemoteException e) { Log.w(TAG, "Cannot stop statistics", e); }
+            }
         }
 
         public void updateStats(String stats) {
@@ -1552,7 +1612,8 @@ private boolean debug=false;
 
                 if (gamepadListener != null) gamepadListener.releaseAll();
                 if (controllerLe != null) controllerLe.releaseAll();
-                activeInputChannel = useUnreliable ? "unreliableinput" : "input";
+                inputSession.preferModern(useUnreliable);
+                updateInputRoute();
                 if (webView != null) {
                     webView.evaluateJavascript("if (window.setUseUnreliableInput) { window.setUseUnreliableInput(" + useUnreliable + "); }", null);
                 }

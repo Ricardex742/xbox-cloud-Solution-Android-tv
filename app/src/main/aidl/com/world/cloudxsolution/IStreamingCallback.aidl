@@ -28,6 +28,7 @@ oneway interface IStreamingCallback {
     void onStreamingStateChanged(boolean isStreaming);
     void setWebViewVisibility(int visibility); // View.VISIBLE / INVISIBLE / GONE
     void onDataChannelStateChanged(String label, String state);
+    void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control);
     void onDataChannelMessageReceived(String label, in byte[] data, String base64Data, boolean binary);
     void requestShowStreamingMenu();
     void setNativeGamepadEnabledOnUi(boolean enabled); // mirrors old activity.setNativeGamepadEnabled

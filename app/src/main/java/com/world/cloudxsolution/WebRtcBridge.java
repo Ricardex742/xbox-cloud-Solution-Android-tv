@@ -126,6 +126,16 @@ public class WebRtcBridge {
     }
 
     @JavascriptInterface
+    public void onControlAuthorizationSent() {
+        activity.runOnUiThread(activity::onControlAuthorizationSent);
+    }
+
+    @JavascriptInterface
+    public void onPeerConnectionConfigUpdated(String config) {
+        activity.onPeerConnectionConfigUpdated(config);
+    }
+
+    @JavascriptInterface
     public void gamepadIndex(int idx) {
         activity.runOnUiThread(() -> activity.setGamepadIndex(idx));
         activity.showCustomToast("Índice do controle: " + idx);
@@ -148,6 +158,7 @@ public class WebRtcBridge {
     @JavascriptInterface
     public void onPeerConnectionClose() {
         activity.runOnUiThread(() -> {
+            activity.onNativeSessionClosing();
             stopKeepAlive();
             IStreamingService s = service();
             if (s == null) return;

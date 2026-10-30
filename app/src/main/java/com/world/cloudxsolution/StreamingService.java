@@ -39,7 +39,7 @@ public class StreamingService extends Service implements StreamHost {
     private WebRtcReceiver webRtcReceiver;
     private volatile boolean destroyed;
     private EglBase serviceEglBase;
-    private org.webrtc.EglRenderer eglRenderer; // raw-Surface renderer -- see note below
+    private volatile org.webrtc.EglRenderer eglRenderer; // raw-Surface renderer -- see note below
 
     private final RemoteCallbackList<IStreamingCallback> callbacks = new RemoteCallbackList<>();
     private Handler callbackHandler;
@@ -166,6 +166,8 @@ public class StreamingService extends Service implements StreamHost {
                 private int lastWidth, lastHeight;
                 @Override
                 public void onFrame(org.webrtc.VideoFrame frame) {
+                    if (eglRenderer != targetRenderer) return;
+                    webRtcReceiver.noteDecodedFrame();
                     int w = frame.getRotatedWidth(), h = frame.getRotatedHeight();
                     if (w != lastWidth || h != lastHeight) {
                         lastWidth = w;
@@ -246,6 +248,14 @@ public class StreamingService extends Service implements StreamHost {
         public void createPeerConnection(String iceServersJson) {
             webRtcReceiver.createPeerConnection(iceServersJson);
             if (eglRenderer == null) broadcast(cb -> safe(cb::onRenderSurfaceRequested));
+        }
+
+        @Override public void setPerformanceStatsEnabled(boolean enabled) {
+            if (webRtcReceiver != null && !destroyed) webRtcReceiver.enablePerfStats(enabled);
+        }
+
+        @Override public void requestInputChannelSnapshot() {
+            if (webRtcReceiver != null && !destroyed) webRtcReceiver.requestInputChannelSnapshot();
         }
 
         @Override
@@ -398,6 +408,10 @@ public class StreamingService extends Service implements StreamHost {
     @Override
     public boolean isNativeGamepadEnabled() {
         return nativeGamepadEnabledMirror && isStreamingMirror;
+    }
+
+    @Override public void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control) {
+        broadcast(cb -> safe(() -> cb.onInputChannelSnapshot(legacy, modern, control)));
     }
 
     @Override

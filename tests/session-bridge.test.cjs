@@ -163,7 +163,8 @@ test('reconfiguration uses existing native connection and patch is idempotent', 
     assert.equal(c.RTCPeerConnection, constructor);
     pc.setConfiguration({iceServers: [{urls: 'stun:example.test'}]});
     assert.equal(calls.filter(x => x[0] === 'onPeerConnectionClose').length, 0);
-    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfig').length, 2);
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfig').length, 1);
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfigUpdated').length, 1);
 });
 
 test('binary views preserve byte offset and length', () => {
@@ -182,4 +183,54 @@ test('720p device dimensions agree with the requested resolution', () => {
     assert.equal(c.generateMsDeviceInfo('android', '720').dev.displayInfo.dimensions.widthInPixels, 1280);
     assert.equal(c.generateMsDeviceInfo('android', '720HQ').dev.displayInfo.dimensions.heightInPixels, 720);
     assert.equal(c.generateMsDeviceInfo('tizen', '1080HQ').dev.displayInfo.dimensions.heightInPixels, 1080);
+});
+
+test('native controller registration is requested only after sending control authorization', () => {
+    const {pc, calls} = setup();
+    const control = pc.createDataChannel('control');
+    control.send(JSON.stringify({message: 'authorizationRequest', token: 'test-only'}));
+    const send = calls.findIndex(x => x[0] === 'onDataChannelSend');
+    const announce = calls.findIndex(x => x[0] === 'onControlAuthorizationSent');
+    assert.ok(send >= 0 && announce > send);
+    assert.equal(Buffer.from(calls[send][3], 'base64').toString(), '{"message":"authorizationRequest","token":"test-only"}');
+});
+
+test('hidden browser cannot remove native gamepad but normal control messages pass', () => {
+    const {pc, calls} = setup();
+    const control = pc.createDataChannel('control');
+    control.send('{"message":"gamepadChanged","gamepadIndex":0,"wasAdded":false}');
+    assert.equal(calls.filter(x => x[0] === 'onDataChannelSend').length, 0);
+    control.send('{"message":"videoKeyframeRequested"}');
+    assert.equal(calls.filter(x => x[0] === 'onDataChannelSend').length, 1);
+    assert.equal(calls.filter(x => x[0] === 'onControlAuthorizationSent').length, 0);
+});
+
+test('duplicate open notification does not repeat SDK authorization', () => {
+    const {c, pc, calls} = setup();
+    const control = pc.createDataChannel('control');
+    control.onopen = () => control.send('{"message":"authorizationRequest"}');
+    c.handleDataChannelState('control', 'OPEN');
+    c.handleDataChannelState('control', 'OPEN');
+    assert.equal(calls.filter(x => x[0] === 'onControlAuthorizationSent').length, 1);
+});
+
+test('old control channel cannot register or remove a controller in the next session', () => {
+    const {c, pc, calls} = setup();
+    const old = pc.createDataChannel('control');
+    new c.RTCPeerConnection({iceServers: []});
+    const count = calls.length;
+    old.send('{"message":"authorizationRequest"}');
+    old.send('{"message":"gamepadChanged","wasAdded":false}');
+    assert.equal(calls.length, count);
+});
+
+test('reliable input synchronization remains available alongside native motion', () => {
+    const {pc, calls} = setup();
+    pc.createDataChannel('reliableinput').send(new Uint8Array([0, 1, 2, 3]).subarray(1));
+    pc.createDataChannel('unreliableinput').send(new Uint8Array([9]));
+    const sent = calls.filter(x => x[0] === 'onDataChannelSend');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0][1], 'reliableinput');
+    assert.deepEqual(Array.from(sent[0][2]), [1, 2, 3]);
+    assert.equal(sent[0][4], true);
 });

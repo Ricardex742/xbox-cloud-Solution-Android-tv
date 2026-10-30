@@ -38,6 +38,7 @@ public interface StreamHost {
 
     // was: activity.onDataChannelStateChanged(label, state)
     void onDataChannelStateChanged(String label, String state);
+    void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control);
 
     // was: activity.onDataChannelMessageReceived(label, base64Data, binary)
     void onDataChannelMessageReceived(String label,byte[] data, String base64Data, boolean binary);

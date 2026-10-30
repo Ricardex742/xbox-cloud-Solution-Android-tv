@@ -50,16 +50,44 @@ public class WebRtcReceiver implements Loggable {
     private AudioDeviceModule audioDeviceModule;
     private final java.util.concurrent.ConcurrentHashMap<String, DataChannel> dataChannels = new java.util.concurrent.ConcurrentHashMap<>();
     private long lastSendWarningMs;
+    private final java.util.concurrent.ConcurrentHashMap<String, DataChannel.State> channelStates = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile long acceptedInputPackets, rejectedInputPackets;
+    private volatile long lastDecodedFrameMs = -1;
+    private volatile String audioOutputState = "aguardando";
+    private volatile boolean remoteAudioSeen;
+    private final PlaybackHealthStats playbackHealth = new PlaybackHealthStats();
 
     private SurfaceViewRenderer remoteRenderer;
     private SignalingListener signalingListener;
-    private boolean isReleased = false;
+    private volatile boolean isReleased = false;
 
     private boolean codecLogged = false;
     private boolean preferHighProfile;
     private final java.util.Set<String> hardwareH264Profiles = new java.util.HashSet<>();
     private final VideoStatsSampler videoStatsSampler = new VideoStatsSampler();
-    private final android.os.Handler statsHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private android.os.HandlerThread statsThread;
+    private android.os.Handler statsHandler;
+    private long statsEpoch, statsRequestId;
+    private volatile String lastRendererStats = "Renderizador: aguardando amostra";
+    private volatile long lastRendererStatsAtMs = -1;
+    private String lastStatsSummary = "Recepção: aguardando amostra";
+    private long statsRequestedAtMs;
+    private final Runnable statsTick = new Runnable() {
+        @Override public void run() {
+            final long tickEpoch;
+            synchronized (statsLock) {
+                if (!showStats || isReleased) return;
+                tickEpoch = statsEpoch;
+            }
+            reportVideoStats();
+            synchronized (statsLock) {
+                // A toggle may have scheduled a replacement tick while this one was running.
+                if (showStats && !isReleased && tickEpoch == statsEpoch && statsHandler != null) {
+                    statsHandler.postDelayed(this, 4000);
+                }
+            }
+        }
+    };
     private boolean statsPending;
     private final Object statsLock = new Object();
 
@@ -76,9 +104,23 @@ public class WebRtcReceiver implements Loggable {
     public void enablePerfStats(boolean enabled) {
         synchronized (statsLock) {
             showStats = enabled;
+            statsEpoch++;
+            // Keep an outstanding query occupied when toggling the overlay.
             videoStatsSampler.reset();
+            playbackHealth.reset();
+            if (statsHandler != null) statsHandler.removeCallbacks(statsTick);
+            if (enabled && !isReleased) {
+                if (statsThread == null) {
+                    statsThread = new android.os.HandlerThread("CloudX-stats", android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    statsThread.start();
+                    statsHandler = new android.os.Handler(statsThread.getLooper());
+                }
+                statsHandler.post(statsTick);
+            }
         }
     }
+
+    public void noteDecodedFrame() { lastDecodedFrameMs = android.os.SystemClock.elapsedRealtime(); }
 
     public interface SignalingListener {
         void onLocalIceCandidate(IceCandidate candidate);
@@ -130,6 +172,24 @@ public class WebRtcReceiver implements Loggable {
         audioDeviceModule = JavaAudioDeviceModule.builder(appContext)
                 .setUseHardwareAcousticEchoCanceler(false)
                 .setUseHardwareNoiseSuppressor(false)
+                .setAudioTrackStateCallback(new JavaAudioDeviceModule.AudioTrackStateCallback() {
+                    @Override public void onWebRtcAudioTrackStart() { audioOutputState = "iniciada"; }
+                    @Override public void onWebRtcAudioTrackStop() { audioOutputState = "parada"; }
+                })
+                .setAudioTrackErrorCallback(new JavaAudioDeviceModule.AudioTrackErrorCallback() {
+                    @Override public void onWebRtcAudioTrackInitError(String message) {
+                        audioOutputState = "erro de inicialização";
+                        Log.w(TAG, "AudioTrack initialization failed: " + message);
+                    }
+                    @Override public void onWebRtcAudioTrackStartError(JavaAudioDeviceModule.AudioTrackStartErrorCode code, String message) {
+                        audioOutputState = "erro ao iniciar: " + code;
+                        Log.w(TAG, "AudioTrack start failed: " + message);
+                    }
+                    @Override public void onWebRtcAudioTrackError(String message) {
+                        audioOutputState = "erro de reprodução";
+                        Log.w(TAG, "AudioTrack failed: " + message);
+                    }
+                })
                 .setAudioAttributes(new android.media.AudioAttributes.Builder()
                         .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
                         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
@@ -252,6 +312,9 @@ public class WebRtcReceiver implements Loggable {
                 if (!peerConnection.setConfiguration(rtcConfig)) reportSignalingError("configuration");
                 return;
             }
+            acceptedInputPackets = rejectedInputPackets = 0;
+            lastDecodedFrameMs = -1;
+            remoteAudioSeen = false;
             final long generation = ++connectionGeneration;
             peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, new PeerConnection.Observer() {
                 @Override
@@ -285,6 +348,7 @@ public class WebRtcReceiver implements Loggable {
                             remoteVideoTrack.addSink(pendingRenderTarget);
                         }
                     } else if (track instanceof org.webrtc.AudioTrack) {
+                        remoteAudioSeen = true;
                         Log.i(TAG, "Audio track received from server");
                         // Store the audio sender so we can attach our local mic track to it
                         localAudioSender = transceiver.getSender();
@@ -485,9 +549,16 @@ public class WebRtcReceiver implements Loggable {
             setupDataChannel(channel);
         }
     }
+    private boolean channelOpen(String label) { return channelStates.get(label) == DataChannel.State.OPEN; }
+
+    public void requestInputChannelSnapshot() {
+        host.onInputChannelSnapshot(channelOpen("input"), channelOpen("unreliableinput"), channelOpen("control"));
+    }
+
     private void setupDataChannel(DataChannel channel) {
         String label = channel.label();
         dataChannels.put(label, channel);
+        channelStates.put(label, channel.state());
 
         channel.registerObserver(new DataChannel.Observer() {
             @Override
@@ -501,22 +572,19 @@ public class WebRtcReceiver implements Loggable {
             @Override
             public void onStateChange() {
                 if (dataChannels.get(label) != channel) return;
+                channelStates.put(label, channel.state());
                 //host.showToast("[debug]:Data channel " + label + " state change: " + channel.state().toString());
                 Log.i(TAG, "Data channel " + label + " state change: " + channel.state());
                 
                 boolean isInputChannel = "unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label);
                 
                 if (isInputChannel) {
-                    if (channel.state() == DataChannel.State.OPEN) {
-                        host.setStreamingState(true);
-                        host.setNativeGamepadEnabled(true);
-                    } else if (channel.state() == DataChannel.State.CLOSING) {
-                        // Don't force streaming state to false immediately if we might switch channels
-                        // MainActivity will handle the logic based on which channels are available
-                        host.setNativeGamepadEnabled(false);
-                    }
+                    boolean anyOpen = channelOpen("input") || channelOpen("unreliableinput");
+                    if (anyOpen) host.setStreamingState(true);
+                    host.setNativeGamepadEnabled(anyOpen);
                 }
                 host.onDataChannelStateChanged(label, channel.state().toString());
+                requestInputChannelSnapshot();
             }
 
             @Override
@@ -524,14 +592,11 @@ public class WebRtcReceiver implements Loggable {
                 if (dataChannels.get(label) != channel) return;
                 //Log.i(TAG, "received data from (" + label + "): " + (buffer.binary?"binary":"data"));
 
-                if ("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) {
-                    return;
-                }
-                if ("reliableinput".equalsIgnoreCase(label)) {
-//                    byte[] data = new byte[buffer.data.remaining()];
-//                    buffer.data.get(data);
-//                    host.onDataChannelMessageReceived(label, data,null, true);
-
+                if ("unreliableinput".equalsIgnoreCase(label)) return;
+                if (("input".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label)) && buffer.binary) {
+                    byte[] payload = new byte[buffer.data.remaining()];
+                    buffer.data.get(payload);
+                    host.onDataChannelMessageReceived(label, payload, null, true);
                     return;
                 }
 
@@ -549,24 +614,31 @@ public class WebRtcReceiver implements Loggable {
                 host.onDataChannelMessageReceived(label, null,dataStr, false);
             }
         });
+        // Refresh after observer installation too: OPEN can precede registration.
+        if (dataChannels.get(label) == channel) {
+            channelStates.put(label, channel.state());
+            host.onDataChannelStateChanged(label, channel.state().toString());
+            requestInputChannelSnapshot();
+        }
     }
 
     public synchronized void sendDataChannelMessage(String label, byte[] data, boolean isBinary) {
         DataChannel channel = dataChannels.get(label);
-        if (channel != null && channel.state() == DataChannel.State.OPEN) {
-
-            if (!channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary))) {
-                long now = android.os.SystemClock.elapsedRealtime();
-                if (now - lastSendWarningMs >= 1000) {
-                    lastSendWarningMs = now;
-                    Log.w(TAG, "DataChannel rejected send: " + label);
-                }
+        boolean input = "input".equals(label) || "unreliableinput".equals(label);
+        boolean accepted = channel != null && channel.state() == DataChannel.State.OPEN
+                && channel.send(new DataChannel.Buffer(java.nio.ByteBuffer.wrap(data), isBinary));
+        if (input) { if (accepted) acceptedInputPackets++; else rejectedInputPackets++; }
+        if (!accepted) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastSendWarningMs >= 1000) {
+                lastSendWarningMs = now;
+                Log.w(TAG, "DataChannel not ready or rejected send: " + label);
             }
         }
     }
 
     public synchronized void sendDataChannelMessage(String label, String dataStr, boolean isBinary) {
-        if (("unreliableinput".equalsIgnoreCase(label) || "reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) 
+        if (("unreliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label))
                 && host.isNativeGamepadEnabled()) {
             return;
         }
@@ -596,13 +668,25 @@ public class WebRtcReceiver implements Loggable {
             PeerConnection closingConnection = peerConnection;
             peerConnection = null;
             synchronized (statsLock) {
-                statsHandler.removeCallbacksAndMessages(null);
+                statsEpoch++;
+                statsRequestId++;
                 statsPending = false;
                 videoStatsSampler.reset();
+                playbackHealth.reset();
+                lastStatsSummary = "Recepção: aguardando amostra";
+                lastRendererStats = "Renderizador: aguardando amostra";
+                lastRendererStatsAtMs = -1;
+                if (statsHandler != null) {
+                    statsHandler.removeCallbacks(statsTick);
+                    if (showStats && !isReleased) statsHandler.postDelayed(statsTick, 4000);
+                }
             }
 
             List<DataChannel> closingChannels = new ArrayList<>(dataChannels.values());
             dataChannels.clear();
+            channelStates.clear();
+            lastDecodedFrameMs = -1;
+            remoteAudioSeen = false;
             for (DataChannel channel : closingChannels) channel.dispose();
 
             if (closingConnection != null) {
@@ -617,60 +701,69 @@ public class WebRtcReceiver implements Loggable {
 
     @Override
     public void onLogMessage(String message, Logging.Severity severity, String tag) {
-
         if (showStats && message != null && message.startsWith("stream-rendererDuration:")) {
-            String stats = message.substring("stream-rendererDuration:".length()).trim();
-            synchronized (statsLock) {
-                if (!statsPending) {
-                    statsPending = true;
-                    statsHandler.post(() -> reportVideoStats(stats));
-                }
-            }
+            lastRendererStats = message.substring("stream-rendererDuration:".length()).trim();
+            lastRendererStatsAtMs = android.os.SystemClock.elapsedRealtime();
         }
     }
 
-    // Sample only when the existing renderer telemetry arrives and the overlay is visible.
-    // No timer, frame processing, readback or extra rendering pass is added.
-    private synchronized void reportVideoStats(String rendererStats) {
+    private String playbackStatus() {
+        return PlaybackHealthStats.frameAge(android.os.SystemClock.elapsedRealtime(), lastDecodedFrameMs)
+                + "\nSaída de áudio: " + audioOutputState + " | Trilha: " + (remoteAudioSeen ? "recebida" : "aguardando")
+                + "\nInput aceito localmente: " + acceptedInputPackets + " | Recusado: " + rejectedInputPackets;
+    }
+
+    // Independent of renderer logging: keep sampling during a frozen image, only when enabled.
+    // Never query on the service/UI main thread and never queue a second pending getStats.
+    private synchronized void reportVideoStats() {
         PeerConnection connection = peerConnection;
-        if (!showStats || connection == null) {
-            synchronized (statsLock) { statsPending = false; }
-            return;
+        final long epoch, requestId;
+        synchronized (statsLock) {
+            if (!showStats || connection == null || isReleased) return;
+            if (statsPending) {
+                if (signalingListener != null) signalingListener.onPerformanceStatsReceived(
+                        "Telemetria nativa pendente há " + ((android.os.SystemClock.elapsedRealtime() - statsRequestedAtMs) / 1000)
+                                + " s (dados anteriores abaixo)\n" + lastStatsSummary + "\n" + playbackStatus());
+                return;
+            }
+            statsPending = true;
+            statsRequestedAtMs = android.os.SystemClock.elapsedRealtime();
+            epoch = statsEpoch;
+            requestId = ++statsRequestId;
         }
         try {
             connection.getStats(report -> {
-                // Do not take the lifecycle lock: dispose may wait for this native callback.
                 synchronized (statsLock) {
-                    if (peerConnection != connection) return;
-                    statsPending = false;
+                    if (requestId == statsRequestId) statsPending = false;
+                    if (peerConnection != connection || epoch != statsEpoch || isReleased) return;
                     if (!showStats) return;
+                    String video = "Vídeo: aguardando RTP", audio = "Áudio: aguardando RTP";
                     for (RTCStats stat : report.getStatsMap().values()) {
                         java.util.Map<String, Object> members = stat.getMembers();
-                        if (!"inbound-rtp".equals(stat.getType()) ||
-                                !("video".equals(members.get("kind")) || "video".equals(members.get("mediaType")))) continue;
+                        if (!"inbound-rtp".equals(stat.getType())) continue;
+                        if ("audio".equals(members.get("kind")) || "audio".equals(members.get("mediaType"))) {
+                            audio = playbackHealth.audio(stat.getId(), stat.getTimestampUs(), members);
+                            continue;
+                        }
+                        if (!("video".equals(members.get("kind")) || "video".equals(members.get("mediaType")))) continue;
                         if (!members.containsKey("framesDecoded") && !members.containsKey("frameWidth")) continue;
                         RTCStats codec = report.getStatsMap().get(members.get("codecId"));
                         String summary = videoStatsSampler.sample(stat.getId(), stat.getTimestampUs(), members,
                                 codec == null ? java.util.Collections.emptyMap() : codec.getMembers());
-                        // Resolve the selected pair via this video transport, not an arbitrary
-                        // candidate pair (which might be a failed/unselected route).
                         RTCStats transport = report.getStatsMap().get(members.get("transportId"));
-                        RTCStats pair = transport == null ? null : report.getStatsMap().get(
-                                transport.getMembers().get("selectedCandidatePairId"));
-                        RTCStats candidate = pair == null ? null : report.getStatsMap().get(
-                                pair.getMembers().get("localCandidateId"));
-                        String network = VideoStatsSampler.networkSummary(
+                        RTCStats pair = transport == null ? null : report.getStatsMap().get(transport.getMembers().get("selectedCandidatePairId"));
+                        RTCStats candidate = pair == null ? null : report.getStatsMap().get(pair.getMembers().get("localCandidateId"));
+                        video = summary + "\n" + VideoStatsSampler.networkSummary(
                                 pair == null ? java.util.Collections.emptyMap() : pair.getMembers(),
                                 candidate == null ? java.util.Collections.emptyMap() : candidate.getMembers());
-                        if (signalingListener != null) {
-                            signalingListener.onPerformanceStatsReceived(rendererStats + "\n" + summary + "\n" + network);
-                        }
-                        break;
                     }
+                    lastStatsSummary = PlaybackHealthStats.rendererAge(android.os.SystemClock.elapsedRealtime(), lastRendererStatsAtMs)
+                            + "\n" + lastRendererStats + "\n" + video + "\n" + audio;
+                    if (signalingListener != null) signalingListener.onPerformanceStatsReceived(lastStatsSummary + "\n" + playbackStatus());
                 }
             });
         } catch (RuntimeException e) {
-            synchronized (statsLock) { statsPending = false; }
+            synchronized (statsLock) { if (requestId == statsRequestId) statsPending = false; }
             Log.w(TAG, "Video stats unavailable", e);
         }
     }
@@ -709,6 +802,12 @@ public class WebRtcReceiver implements Loggable {
         synchronized (this) {
             if (isReleased) return;
             isReleased = true;
+            synchronized (statsLock) {
+                showStats = false;
+                statsEpoch++;
+                if (statsHandler != null) statsHandler.removeCallbacksAndMessages(null);
+                if (statsThread != null) statsThread.quitSafely();
+            }
             Log.i(TAG, "Releasing WebRtcReceiver resources...");
 
             signalingListener = null;

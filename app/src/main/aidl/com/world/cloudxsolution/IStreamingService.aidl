@@ -18,6 +18,8 @@ interface IStreamingService {
     // --- lifecycle ---
     void initPeerConnectionFactory();
     void releaseSession();
+    oneway void requestInputChannelSnapshot();
+    oneway void setPerformanceStatsEnabled(boolean enabled);
 
     // --- video output: called once when the SurfaceView in MainActivity
     // is created/resized. The service renders into this Surface directly

@@ -210,6 +210,11 @@ public final class AndroidGamepadListener {
         return true;
     }
 
+    /** Resend current held/neutral state after native controller registration. */
+    public void sendCurrentState() {
+        synchronized (stateLock) { sendUnreliableIfChanged(TYPE_MOTION); }
+    }
+
     public void releaseAll() {
         synchronized (stateLock) {
             transitionFrame.resetAllHeldButtons();
