@@ -5,6 +5,19 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class InputRegressionTest {
+    @Test public void aNewSessionCannotReplayPreviousMenuTransitions() {
+        GamepadTransitionFrame frame = new GamepadTransitionFrame(0);
+        frame.bumpButton(GamepadTransitionFrame.INDEX_MENU);
+        frame.setReleased(GamepadTransitionFrame.INDEX_MENU);
+        assertEquals(2, frame.transitions[GamepadTransitionFrame.INDEX_MENU]);
+        frame.resetSession();
+        for (int transition : frame.transitions) assertEquals(0, transition);
+        for (boolean held : frame.held) assertFalse(held);
+        frame.bumpButton(GamepadTransitionFrame.INDEX_A);
+        assertEquals(1, frame.transitions[GamepadTransitionFrame.INDEX_A]);
+        assertEquals(0, frame.transitions[GamepadTransitionFrame.INDEX_MENU]);
+    }
+
     @Test public void legacyRegistrationSendsNeutralEvenWithoutAnyPhysicalInputEvent() {
         java.util.List<byte[]> sent = new java.util.ArrayList<>();
         InputChannel channel = new InputChannel(buffer -> {

@@ -67,6 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "XboxFramesMain";
 
     public WebView webView;
+    private WebRtcBridge webRtcBridge;
     private SurfaceView surfaceView;
     private View loadingLayout;
     private TextView loadingText;
@@ -83,13 +84,19 @@ public class MainActivity extends AppCompatActivity {
     private InputChannel legacyInputChannel;
     private String activeInputChannel = "";
     private final InputSessionState inputSession = new InputSessionState();
-    private boolean gamepadAnnounced;
-    private WebRtcBridge webRtcBridge;
-    private int nativeGamepadIndex;
-    private boolean acceptSessionCallbacks = true;
-    private long handledControllerEvents;
-    private boolean documentStartInjection;
+    private boolean acceptInputCallbacks, gamepadAnnounced;
+    private boolean documentStartInjection, closingSession, signalingFailureShown;
+    private Runnable firstFrameTimeout;
+    private volatile long sessionGeneration;
+    private String sessionStatus = "Catálogo";
+    private int activeVideoProfile, activeSharpness, activeOutputScale;
+    private boolean microphoneEnabled;
+    private final InputTrace inputTrace = new InputTrace();
+    private long lastPerformanceAtMs = -1;
+    private String lastPerformanceReport = "Sem amostra de desempenho. Abra as estatísticas durante o jogo.";
     private static final String KEY_LOW_LATENCY = "prefer_minimal_post_processing";
+    private int nativeGamepadIndex;
+    private long handledControllerEvents, remoteInputAcks;
     private GamepadRumbleHandler rumbleHandler;
 
     private static final String PREFS_NAME = "CloudXPrefs";
@@ -126,41 +133,241 @@ public class MainActivity extends AppCompatActivity {
     public boolean isStreaming() {
         return isStreaming;
     }
-    private IStreamingService streamingService;
+    private volatile IStreamingService streamingService;
+    private final android.os.Handler startupHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    // A single bounded-in-practice stream of native work. Never spawn replacement workers
+    // when a driver/Binder call times out: interrupt cannot cancel a native driver hang.
+    private final java.util.concurrent.ExecutorService videoWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-video-startup"));
+    private final java.util.concurrent.ExecutorService diagnosticWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-startup-diagnostics"));
+    private final StartupGate startup = new StartupGate();
+    private final SurfaceDispatchGate surfaceDispatch = new SurfaceDispatchGate();
+    private long startupStartedAt;
+    private boolean diagnosticWorkInFlight;
+    private boolean serviceBound, nativeWorkInFlight, surfaceDirty, activityDestroyed;
+    private Runnable startupTimeout, catalogTimeout, catalogProbe;
+    private int catalogGeneration;
+    private boolean catalogFailed;
+    private Button startupRetry, startupAndroidSettings;
+
     private ServiceConnection serviceConnection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+            if (activityDestroyed) return;
             streamingService = IStreamingService.Stub.asInterface(binder);
-            try {
-                streamingService.registerCallback(streamingCallback);
-                streamingService.initPeerConnectionFactory();
-                // The page creates the only session connection.
-                showWebview();
-            } catch (RemoteException ignored) {}
-            pushSurfaceIfReady();
+            Log.i(TAG, "startup: service binder connected");
+            if (startup.stage() == StartupGate.Stage.BINDING) initializeVideo(startup.token());
         }
         @Override public void onServiceDisconnected(ComponentName name) {
             streamingService = null;
+            failStartup("Serviço de vídeo desconectado.");
+        }
+        @Override public void onBindingDied(ComponentName name) {
+            streamingService = null;
+            failStartup("A conexão com o serviço de vídeo foi encerrada.");
+        }
+        @Override public void onNullBinding(ComponentName name) {
+            failStartup("O serviço de vídeo não ficou disponível.");
         }
     };
 
-    public IStreamingService getStreamingService() { return streamingService; }
-    private final IStreamingCallback.Stub streamingCallback = new IStreamingCallback.Stub() {
-        @Override public void onAnswerReady(String sdp) { runOnUiThread(() -> sendAnswerToJs(sdp)); }
-        @Override public void onOfferReady(String sdp) { runOnUiThread(() -> sendOfferToJs(sdp)); }
+    private void beginStartup() {
+        if (activityDestroyed) return;
+        if (nativeWorkInFlight) {
+            showStartupFailure("O serviço de vídeo ainda não respondeu. Use Configurações do Android para forçar a parada do app e abrir novamente.");
+            return;
+        }
+        int token = startup.begin();
+        surfaceDispatch.requested();
+        startupStartedAt = System.currentTimeMillis();
+        showStartupProgress("Conectando ao serviço de vídeo…");
+        if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
+        startupTimeout = () -> {
+            if (startup.accepts(token)) failStartup("Tempo esgotado: " + startup.stageLabel() + ".");
+        };
+        startupHandler.postDelayed(startupTimeout, 45000);
+        if (streamingService != null) {
+            initializeVideo(token);
+            return;
+        }
+        if (serviceBound) {
+            unbindService(serviceConnection);
+            serviceBound = false;
+        }
+        try {
+            serviceBound = bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE);
+            Log.i(TAG, "startup: bind request accepted=" + serviceBound);
+            if (!serviceBound) failStartup("Não foi possível conectar ao serviço de vídeo.");
+        } catch (RuntimeException e) {
+            Log.e(TAG, "startup: bind failed", e);
+            failStartup("Falha ao conectar ao serviço de vídeo.");
+        }
+    }
+
+    private void initializeVideo(int token) {
+        if (!startup.advance(token, StartupGate.Stage.INITIALIZING) || nativeWorkInFlight) return;
+        showStartupProgress("Preparando áudio e vídeo…");
+        IStreamingService service = streamingService;
+        nativeWorkInFlight = true;
+        videoWorker.execute(() -> {
+            try {
+                Log.i(TAG, "startup: native initialization started");
+                service.registerCallback(streamingCallback);
+                service.initPeerConnectionFactory();
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (activityDestroyed || !startup.advance(token, StartupGate.Stage.SURFACE)) return;
+                    showStartupProgress("Preparando saída de vídeo…");
+                    pushSurfaceIfReady();
+                });
+            } catch (RemoteException | RuntimeException e) {
+                Log.e(TAG, "startup: native initialization failed", e);
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (startup.accepts(token)) failStartup("Falha ao preparar áudio e vídeo.");
+                });
+            }
+        });
+    }
+
+    private void showStartupProgress(String message) {
+        if (activityDestroyed) return;
+        Log.i(TAG, "startup: " + message);
+        loadingLayout.setVisibility(View.VISIBLE);
+        loadingText.setText(message);
+        findViewById(R.id.loadingIndicator).setVisibility(View.VISIBLE);
+        startupRetry.setVisibility(View.GONE);
+        startupAndroidSettings.setVisibility(View.GONE);
+    }
+
+    private void failStartup(String message) {
+        if (activityDestroyed) return;
+        boolean failedWhileBinding = startup.stage() == StartupGate.Stage.BINDING;
+        startup.fail();
+        if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
+        showStartupFailure(message);
+        if (failedWhileBinding && !diagnosticWorkInFlight) {
+            diagnosticWorkInFlight = true;
+            int token = startup.token();
+            long since = startupStartedAt;
+            Context context = getApplicationContext();
+            diagnosticWorker.execute(() -> {
+                String report = StartupDiagnostics.read(context, since);
+                startupHandler.post(() -> {
+                    diagnosticWorkInFlight = false;
+                    if (!activityDestroyed && token == startup.token() && startup.stage() == StartupGate.Stage.FAILED) {
+                        loadingText.setText(message + "\n" + report);
+                        Log.w(TAG, "startup: " + report);
+                    }
+                });
+            });
+        }
+    }
+
+    private void showStartupFailure(String message) {
+        if (activityDestroyed) return;
+        loadingLayout.setVisibility(View.VISIBLE);
+        loadingLayout.bringToFront();
+        loadingText.setText(message);
+        findViewById(R.id.loadingIndicator).setVisibility(View.GONE);
+        startupRetry.setVisibility(View.VISIBLE);
+        startupAndroidSettings.setVisibility(View.VISIBLE);
+        startupRetry.requestFocus();
+        Log.w(TAG, "startup: " + message);
+    }
+
+    private void retryLoading() {
+        if (closingSession) { showStartupFailure("Encerramento ainda pendente. Use Configurações Android para reiniciar o aplicativo."); return; }
+        if (!startup.ready()) { beginStartup(); return; }
+        catalogFailed = false;
+        if (webView != null) {
+            webView.stopLoading();
+            webView.loadUrl("https://www.xbox.com/pt-BR/play");
+        } else showWebview();
+    }
+
+    private void openAndroidAppSettings() {
+        try {
+            startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:" + getPackageName())));
+        } catch (android.content.ActivityNotFoundException e) {
+            showStartupFailure("Abra as configurações da TV → Aplicativos → CloudX para forçar a parada.");
+        }
+    }
+
+    private void beginCatalogLoading(WebView view) {
+        if (view != webView || isStreaming || activityDestroyed) return;
+        catalogFailed = false;
+        sessionStatus = "Carregando catálogo";
+        if (catalogProbe != null) startupHandler.removeCallbacks(catalogProbe);
+        catalogProbe = null;
+        int generation = ++catalogGeneration;
+        if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+        showStartupProgress("Carregando catálogo ou login Xbox…");
+        catalogTimeout = () -> {
+            if (view == webView && generation == catalogGeneration && !isStreaming && !activityDestroyed) {
+                catalogFailed = true;
+                view.stopLoading();
+                showStartupFailure("O catálogo não concluiu o carregamento. Confira a conexão, a data/hora da TV e a versão do Android System WebView.");
+            }
+        };
+        startupHandler.postDelayed(catalogTimeout, 45000);
+    }
+
+    private void catalogVisible(WebView view) {
+        if (view != webView || catalogFailed || activityDestroyed || isStreaming || catalogProbe != null) return;
+        final int generation = catalogGeneration;
+        catalogProbe = new Runnable() {
+            @Override public void run() {
+                if (view != webView || generation != catalogGeneration || catalogFailed || isStreaming || activityDestroyed) return;
+                // A finished document can still be an empty SPA. Wait for visible catalog/login content.
+                view.evaluateJavascript("(function(){var b=document.body;if(!b)return false;"
+                        + "var nodes=document.querySelectorAll('a[href*=\"/play/games/\"],input[type=email],input[type=password],input[name=loginfmt]');"
+                        + "for(var i=0;i<nodes.length;i++)if(nodes[i].getClientRects().length)return true;"
+                        + "return b.innerText.trim().length>120 && !!b.querySelector('a,button');})()", ready -> {
+                    if (view != webView || generation != catalogGeneration || catalogFailed || isStreaming || activityDestroyed) return;
+                    if ("true".equals(ready)) {
+                        if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+                        sessionStatus = "Catálogo";
+                        setWebviewVisible();
+                    } else startupHandler.postDelayed(this, 1000);
+                });
+            }
+        };
+        startupHandler.post(catalogProbe);
+    }
+
+    public IStreamingService getStreamingService() { return startup.ready() ? streamingService : null; }
+    private IStreamingCallback.Stub streamingCallback = newStreamingCallback(0);
+    private IStreamingCallback.Stub newStreamingCallback(long generation) {
+        return new IStreamingCallback.Stub() {
+        private void post(Runnable task) {
+            runOnUiThread(() -> { if (!activityDestroyed && generation == sessionGeneration) task.run(); });
+        }
+        @Override public void onAnswerReady(String sdp) { post(() -> sendAnswerToJs(sdp)); }
+        @Override public void onOfferReady(String sdp) { post(() -> sendOfferToJs(sdp)); }
+
+        @Override public void onRemoteDescriptionSet() {
+            post(() -> {
+                if (webView != null) webView.evaluateJavascript(
+                        "if(window.handleRemoteDescriptionSet) window.handleRemoteDescriptionSet();", null);
+            });
+        }
+        @Override public void onSignalingError(String operation) { post(() -> reportSignalingError(operation)); }
 
         @Override public void onLocalIceCandidate(String mid, int idx, String cand) {
-            runOnUiThread(() -> {
+            post(() -> {
                 IceCandidate candidate = (mid == null && cand == null) ? null : new IceCandidate(mid, idx, cand);
                 sendIceCandidateToJs(candidate);
             });
         }
 
         @Override public void onIceConnectionChange(String state) {
-            runOnUiThread(() -> onIceConnectionStateChanged(state));
+            post(() -> onIceConnectionStateChanged(state));
         }
 
         @Override public void onIceGatheringChange(String state) {
-            runOnUiThread(() -> {
+            post(() -> {
                 if (webView == null) return;
                 String stateStr = state.toLowerCase(Locale.ROOT);
                 String script = "if (window.handleIceGatheringState) { window.handleIceGatheringState('" + stateStr + "'); }";
@@ -169,7 +376,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @Override public void onTrackReceived(String kind, String id) {
-            runOnUiThread(() -> {
+            post(() -> {
                 if (webView == null) return;
                 String script = "if (window.simulateOnTrack) { window.simulateOnTrack('" + kind + "', '" + id + "'); }";
                 webView.evaluateJavascript(script, null);
@@ -178,34 +385,46 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @Override public void onPerformanceStatsReceived(String stats) {
-            runOnUiThread(() -> {
+            post(() -> {
                 if (performanceDialog != null && performanceDialog.isShowing()) {
                     android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
                     performanceDialog.updateStats(stats + "\nControle: " + (activeInputChannel.isEmpty() ? "aguardando canal" : activeInputChannel)
-                            + " | Eventos tratados: " + handledControllerEvents + "\nSuperfície: " + size.width() + "x" + size.height() + "\n" + displayLatencyStatus());
+                            + " | Autorização enviada: " + (inputSession.authorized() ? "sim" : "não")
+                            + "\nAnúncio enviado: " + (gamepadAnnounced ? "sim" : "não")
+                            + " | Eventos tratados: " + handledControllerEvents + "\nACKs input recebidos: " + remoteInputAcks + " (não confirmam ação no jogo)\nSuperfície: " + size.width() + "x" + size.height() + "\n" + displayLatencyStatus());
                 }
             });
         }
 
+        @Override public void onRenderSurfaceRequested() {
+            post(() -> {
+                surfaceDispatch.requested();
+                pushSurfaceIfReady();
+            });
+        }
+
         @Override public void onVideoSizeChanged(int w, int h) {
-            runOnUiThread(() -> {
+            post(() -> {
                 if (surfaceView == null || w <= 0 || h <= 0 || w > 3840 || h > 2160) return;
+                android.view.Display display = surfaceView.getDisplay();
+                android.view.Display.Mode mode = display == null ? null : display.getMode();
+                int[] output = VideoOutputPolicy.size(w, h, mode == null ? w : mode.getPhysicalWidth(),
+                        mode == null ? h : mode.getPhysicalHeight(), activeOutputScale);
                 android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
-                if (size.width() != w || size.height() != h) {
+                if (size.width() != output[0] || size.height() != output[1]) {
                     // Avoid downscaling 1080p video to a 720p TV launcher surface.
-                    surfaceView.getHolder().setFixedSize(w, h);
+                    surfaceView.getHolder().setFixedSize(output[0], output[1]);
                 }
             });
         }
 
         @Override public void onFirstFrameRendered(int w, int h) {
-            runOnUiThread(() -> {
-                if (!acceptSessionCallbacks) return;
+            post(() -> {
+                if (!acceptInputCallbacks || activityDestroyed) return;
+                if (firstFrameTimeout != null) startupHandler.removeCallbacks(firstFrameTimeout);
                 requestInputSnapshot();
                 Log.i(TAG, "onFirstFrameRendered callback received: " + w + "x" + h);
                 setStreamingState(true);
-                gamepadAnnounced = false;
-                announceNativeGamepad();
                 if (legacyInputChannel != null) {
                     legacyInputChannel.onResolutionChange(w, h);
                 }
@@ -222,43 +441,40 @@ public class MainActivity extends AppCompatActivity {
                         parent.requestLayout();
                         parent.invalidate();
                     }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+                    if (webView!=null&&Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        webView.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
                     }
 
             });
         }
-        @Override public void showToast(String message) { showCustomToast(message); }
+        @Override public void showToast(String message) { post(() -> showCustomToast(message)); }
         @Override public void onStreamingStateChanged(boolean streaming) {
-            runOnUiThread(() -> { if (acceptSessionCallbacks) setStreamingState(streaming); });
+            post(() -> setStreamingState(streaming));
         }
-        @Override public void onRenderSurfaceRequested() {
-            runOnUiThread(() -> { if (acceptSessionCallbacks) pushSurfaceIfReady(); });
+        @Override public void setWebViewVisibility(int visibility) {
+            post(() -> { if (webView != null) webView.setVisibility(visibility); });
         }
         @Override public void onInputChannelSnapshot(boolean legacy, boolean modern, boolean control) {
-            runOnUiThread(() -> {
-                if (!acceptSessionCallbacks) return;
-                // Open may have preceded observer registration. Enable sending before metadata/neutral bootstrap.
-                if (legacy || modern) setStreamingState(true);
+            post(() -> {
+                if (!acceptInputCallbacks || activityDestroyed) return;
                 inputSession.snapshot(legacy, modern, control);
+                if (legacy || modern) setStreamingState(true);
                 updateInputRoute();
                 announceNativeGamepad();
             });
         }
-        @Override public void setWebViewVisibility(int visibility) {
-            runOnUiThread(() -> { if (webView != null) webView.setVisibility(visibility); });
-        }
         @Override public void onDataChannelStateChanged(String label, String state) {
-            runOnUiThread(() -> MainActivity.this.onDataChannelStateChanged(label, state));
+            post(() -> MainActivity.this.onDataChannelStateChanged(label, state));
         }
         @Override public void onDataChannelMessageReceived(String label, byte[] data, String str, boolean binary) {
-            runOnUiThread(() -> MainActivity.this.onDataChannelMessageReceived(label, data,str, binary));
+            post(() -> MainActivity.this.onDataChannelMessageReceived(label, data,str, binary));
         }
-        @Override public void requestShowStreamingMenu() { runOnUiThread(MainActivity.this::showStreamingMenuDialog); }
+        @Override public void requestShowStreamingMenu() { post(MainActivity.this::showStreamingMenuDialog); }
         @Override public void setNativeGamepadEnabledOnUi(boolean enabled) {
-            runOnUiThread(() -> nativeGamepadEnabled = enabled);
+            post(() -> nativeGamepadEnabled = enabled);
         }
     };
+    }
 
     @SuppressLint({"SetJavaScriptEnabled", "RestrictedApi"})
     @Override
@@ -268,11 +484,17 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         android.content.SharedPreferences gpPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (TvCompatibilityProfile.isTl042(Build.MODEL)) {
+            SharedPreferences.Editor defaults = gpPrefs.edit();
+            if (!gpPrefs.contains(KEY_RESOLUTION)) defaults.putString(KEY_RESOLUTION, TvCompatibilityProfile.RESOLUTION);
+            if (!gpPrefs.contains(KEY_BITRATE)) defaults.putInt(KEY_BITRATE, TvCompatibilityProfile.BITRATE_MBPS);
+            if (!gpPrefs.contains(KEY_HIGH_VIDEO_PROFILE)) defaults.putBoolean(KEY_HIGH_VIDEO_PROFILE, false);
+            defaults.apply();
+        }
         float dz = gpPrefs.getFloat("camera_deadzone", 0.12f);
         float sens = gpPrefs.getFloat("gamepad_sensitivity", 1.5f);
         boolean useUnreliable = gpPrefs.getBoolean(KEY_USE_UNRELIABLE_INPUT, true);
         inputSession.preferModern(useUnreliable);
-        updateInputRoute();
         
         rumbleHandler = new GamepadRumbleHandler(idx -> 
                 gamepadListener != null ? gamepadListener.getLastDevice() : null);
@@ -281,6 +503,7 @@ public class MainActivity extends AppCompatActivity {
             if (isStreaming && streamingService != null && "unreliableinput".equals(activeInputChannel)) {
                 byte[] data = new byte[buffer.remaining()];
                 buffer.get(data);
+                inputTrace.packet(android.os.SystemClock.elapsedRealtime(), "unreliableinput", data);
                 try {
                     streamingService.onDataChannelSend("unreliableinput", data, null, true);
                 } catch (RemoteException e) {
@@ -294,6 +517,7 @@ public class MainActivity extends AppCompatActivity {
             if (isStreaming && streamingService != null && "input".equals(activeInputChannel)) {
                 byte[] data = new byte[buffer.remaining()];
                 buffer.get(data);
+                inputTrace.packet(android.os.SystemClock.elapsedRealtime(), "input", data);
                 try {
                     streamingService.onDataChannelSend("input", data, null, true);
                 } catch (RemoteException e) {
@@ -303,22 +527,18 @@ public class MainActivity extends AppCompatActivity {
         }, 1920, 1080);
         controllerLe = new AndroidControllerLe(legacyInputChannel, 0, sens, dz);
 
-        bindService(new Intent(this, StreamingService.class), serviceConnection, BIND_AUTO_CREATE);
-        // Keep the splash screen on-screen for at least 1500ms
-        // or until WebView starts loading.
-        final long startTime = System.currentTimeMillis();
-        splashScreen.setKeepOnScreenCondition(() -> {
-            boolean isReady = (webView != null);
-            boolean minTimeElapsed = (System.currentTimeMillis() - startTime) > 0;
-            return !isReady || !minTimeElapsed;
-        });
-
-
+        // The splash must never wait for a driver, Binder or a network page.
+        splashScreen.setKeepOnScreenCondition(() -> false);
 
         getWindow().setCallback(new WindowCallbackWrapper(getWindow().getCallback()) {
 
             @Override
             public boolean dispatchGenericMotionEvent(MotionEvent event) {
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (inputTrace.motionDue(now)) inputTrace.add(now, "eixos dev=" + event.getDeviceId()
+                        + " src=" + event.getSource() + " LT=" + event.getAxisValue(MotionEvent.AXIS_LTRIGGER)
+                        + " RT=" + event.getAxisValue(MotionEvent.AXIS_RTRIGGER)
+                        + " brake=" + event.getAxisValue(MotionEvent.AXIS_BRAKE) + " gas=" + event.getAxisValue(MotionEvent.AXIS_GAS));
                 if (isStreaming) {
                     if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) {
                         showCustomToast(gamepadListener.prepare(event.getDevice()));
@@ -333,6 +553,10 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public boolean dispatchKeyEvent(KeyEvent event) {
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (inputTrace.enabled(now)) inputTrace.add(now, "tecla dev=" + event.getDeviceId()
+                        + " src=" + event.getSource() + " key=" + event.getKeyCode() + " scan=" + event.getScanCode()
+                        + " ação=" + event.getAction() + " rep=" + event.getRepeatCount());
                 if (event.getKeyCode() == KeyEvent.KEYCODE_BUTTON_SELECT) {
                     isSelectPressed = event.getAction() == KeyEvent.ACTION_DOWN;
                 }
@@ -375,17 +599,32 @@ public class MainActivity extends AppCompatActivity {
         }
 
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder holder) { pushSurfaceIfReady(); }
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                surfaceDispatch.created();
+                pushSurfaceIfReady();
+            }
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) { pushSurfaceIfReady(); }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
-                if (streamingService != null) {
-                    try { streamingService.clearRenderSurface(); } catch (RemoteException ignored) {}
-                }
+                surfaceDispatch.destroyed();
+                IStreamingService service = streamingService;
+                long generation = sessionGeneration;
+                if (service != null && !activityDestroyed) videoWorker.execute(() -> {
+                    if (generation != sessionGeneration) return;
+                    try { service.clearRenderSurface(); } catch (RemoteException | RuntimeException e) {
+                        Log.w(TAG, "clearRenderSurface failed", e);
+                    }
+                });
             }
         });
 
 
-        showWebview();
+        startupRetry = findViewById(R.id.startup_retry);
+        startupAndroidSettings = findViewById(R.id.startup_android_settings);
+        startupRetry.setOnClickListener(v -> retryLoading());
+        startupAndroidSettings.setOnClickListener(v -> openAndroidAppSettings());
+        findViewById(R.id.startup_menu).setOnClickListener(v -> showStreamingMenuDialog());
+        findViewById(R.id.startup_exit).setOnClickListener(v -> finish());
+        beginStartup();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -395,11 +634,7 @@ public class MainActivity extends AppCompatActivity {
                 } else if (isStreaming) {
                     showStreamingMenuDialog();
                 } else {
-                    assert webView != null;
-                    if (webView.getVisibility() == WebView.VISIBLE && !webView.canGoBack()) {
-                        setEnabled(false);
-                        getOnBackPressedDispatcher().onBackPressed();
-                    }
+                    finish();
                 }
             }
         });
@@ -412,13 +647,45 @@ public class MainActivity extends AppCompatActivity {
         showIntroHelpDialog();
     }
     private void pushSurfaceIfReady() {
-        if (streamingService == null) return;
+        if (activityDestroyed || streamingService == null || surfaceView == null
+                || (!startup.ready() && startup.stage() != StartupGate.Stage.SURFACE)) return;
+        if (!surfaceDispatch.needsDelivery()) return;
+        if (nativeWorkInFlight) { surfaceDirty = true; return; }
+        long surfaceGeneration = surfaceDispatch.generation();
+        Surface surface = surfaceView.getHolder().getSurface();
+        if (surface == null || !surface.isValid()) return;
         surfaceView.setKeepScreenOn(true);
-
-        Surface s = surfaceView.getHolder().getSurface();
-        if (s == null || !s.isValid()) return;
-        try { streamingService.setRenderSurface(s, surfaceView.getHolder().getSurfaceFrame().width(), surfaceView.getHolder().getSurfaceFrame().height()); }
-        catch (RemoteException e) { Log.e(TAG, "setRenderSurface", e); }
+        android.graphics.Rect size = surfaceView.getHolder().getSurfaceFrame();
+        int width = size.width(), height = size.height(), token = startup.token();
+        IStreamingService service = streamingService;
+        nativeWorkInFlight = true;
+        surfaceDirty = false;
+        videoWorker.execute(() -> {
+            try {
+                service.setRenderSurface(surface, width, height);
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (activityDestroyed || token != startup.token() || service != streamingService) return;
+                    surfaceDispatch.delivered(surfaceGeneration);
+                    if (!surfaceDispatch.available()) return;
+                    if (surfaceDispatch.needsDelivery()) {
+                        pushSurfaceIfReady();
+                        return;
+                    }
+                    if (startup.advance(token, StartupGate.Stage.READY)) {
+                        if (startupTimeout != null) startupHandler.removeCallbacks(startupTimeout);
+                        showWebview();
+                    }
+                    if (surfaceDirty) pushSurfaceIfReady();
+                });
+            } catch (RemoteException | RuntimeException e) {
+                Log.e(TAG, "startup: render surface failed", e);
+                startupHandler.post(() -> {
+                    nativeWorkInFlight = false;
+                    if (token == startup.token()) failStartup("Falha ao preparar a saída de vídeo.");
+                });
+            }
+        });
     }
     private void showIntroHelpDialog() {
         android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -481,7 +748,8 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                setWebviewVisible();
+                if (view != webView || activityDestroyed || catalogFailed) return;
+                catalogVisible(view);
 
                 // Inject viewport meta tag to force fit
                 String viewportJs = "var meta = document.createElement('meta'); " +
@@ -514,11 +782,39 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                catalogVisible(view);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                                        android.webkit.WebResourceError error) {
+                if (request.isForMainFrame()) catalogError(view, "Falha ao carregar o catálogo (código " + error.getErrorCode() + "). Confira a conexão da TV.");
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, android.webkit.WebResourceRequest request,
+                                            android.webkit.WebResourceResponse response) {
+                if (request.isForMainFrame()) catalogError(view, "O site Xbox respondeu com erro HTTP " + response.getStatusCode() + ". Tente novamente mais tarde.");
+            }
+
+            private void catalogError(WebView view, String message) {
+                if (view != webView || activityDestroyed || isStreaming) return;
+                catalogFailed = true;
+                if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+                showStartupFailure(message);
+            }
+
+            @Override
+            public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                if (view != webView) { view.destroy(); return true; }
+                exitGameToCatalog();
+                return true;
+            }
+
+            @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                if (loadingLayout != null) {
-                    loadingLayout.setVisibility(View.VISIBLE);
-                }
-                view.setVisibility(WebView.GONE);
+                beginCatalogLoading(view);
                 super.onPageStarted(view, url, favicon);
                 if (url != null && (url.contains("/fr-FR") || url.contains("/fr-fr"))) {
                     view.stopLoading();
@@ -532,28 +828,18 @@ public class MainActivity extends AppCompatActivity {
             }
 
         });
-        if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
         webRtcBridge = new WebRtcBridge(this);
         webView.addJavascriptInterface(webRtcBridge, "AndroidBridge");
         webView.setWebChromeClient(new CustomWebChromeClient());
-        documentStartInjection = androidx.webkit.WebViewFeature.isFeatureSupported(
-                androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT);
-        if (documentStartInjection) {
-            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView,
-                    webConfigurationScript() + loadScriptFromAssets(),
-                    java.util.Collections.singleton("https://www.xbox.com"));
-        }
+        documentStartInjection = androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT);
+        if (documentStartInjection) androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView,
+                webConfigurationScript() + loadScriptFromAssets(), java.util.Collections.singleton("https://www.xbox.com"));
     }
 
     public void setWebviewVisible(){
-       if (isStreaming) {
-           if (webView != null) webView.setVisibility(View.INVISIBLE);
-           if (loadingLayout != null) loadingLayout.setVisibility(View.GONE);
-           return;
-       }
+       if (activityDestroyed || isStreaming || catalogFailed || !"Catálogo".equals(sessionStatus)) return;
        if(webView!=null){
-           webView.setVisibility(WebView.VISIBLE);
-           webView.requestFocus();}
+           webView.setVisibility(WebView.VISIBLE);}
        if (loadingLayout != null) {
            loadingLayout.setVisibility(View.GONE);
        }
@@ -612,13 +898,19 @@ private boolean debug=false;
     private Bundle webViewState;
 
     public void showWebview() {
-        if (streamingService == null) return;
+        if (activityDestroyed || !startup.ready()) return;
         if (audioManager != null) {
             audioManager.setMode(AudioManager.MODE_NORMAL);
         }
         runOnUiThread(() -> {
+            if (activityDestroyed || !startup.ready()) return;
             if (webView == null) {
-                initWebView();
+                try { initWebView(); } catch (RuntimeException e) {
+                    Log.e(TAG, "startup: WebView creation failed", e);
+                    webView = null;
+                    showStartupFailure("Não foi possível iniciar o navegador da TV. Verifique o Android System WebView.");
+                    return;
+                }
                 rootLayout.addView(webView, 1);
                 if (webViewState != null) {
                     webView.restoreState(webViewState);
@@ -628,7 +920,6 @@ private boolean debug=false;
                 }
             }
             webView.setVisibility(WebView.VISIBLE);
-            webView.requestFocus();
             webView.resumeTimers();
             webView.onResume();
             if (performanceDialog != null) {
@@ -649,9 +940,10 @@ private boolean debug=false;
                 //rootLayout.requestUnbufferedDispatch(InputDevice.SOURCE_JOYSTICK);
                 rootLayout.removeView(webView);
                 webView.stopLoading();
-                webView.clearCache(true);
+                // Keep the catalog cache; it reduces startup downloads on slower TVs.
                 webView.loadUrl("about:blank");
                 webView.onPause();
+                webView.pauseTimers();
                 webView.destroy();
                 webView = null;
                 // Request unbuffered dispatch specifically for joystick input sources
@@ -669,23 +961,92 @@ private boolean debug=false;
     // before (the whole try block built List<PeerConnection.IceServer> and
 // called webRtcReceiver.setSignalingListener(null)/createPeerConnection(finalServers)/setupSignalingListener()):
 
-    public void onPeerConnectionConfigReceived(String configJson) {
-        if (configJson == null || configJson.equals("null") || configJson.isEmpty()) {
-            return;
-        }
+    public void onPeerConnectionConfigReceived(String configJson) { configurePeer(configJson, true); }
+    public void onPeerConnectionConfigUpdated(String configJson) { configurePeer(configJson, false); }
+
+    private void configurePeer(String configJson, boolean newSession) {
+        if (configJson == null || configJson.isEmpty()) return;
         runOnUiThread(() -> {
-            if (streamingService == null) return;
-            try {
-                acceptSessionCallbacks = true;
-                inputSession.reset();
-                activeInputChannel = "";
-                gamepadAnnounced = false;
-                handledControllerEvents = 0;
+            if (streamingService == null || closingSession || activityDestroyed) return;
+            IStreamingService service = streamingService;
+            IStreamingCallback previous = streamingCallback;
+            if (newSession) {
+                onNativeSessionClosing();
+                gamepadListener.resetSession(); controllerLe.resetSession();
+                setGamepadIndex(0);
+                signalingFailureShown = false;
+                sessionGeneration++;
+                streamingCallback = newStreamingCallback(sessionGeneration);
+                acceptInputCallbacks = true;
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                activeVideoProfile = savedVideoProfile();
+                activeSharpness = prefs.getInt("video_sharpness", 0);
+                activeOutputScale = prefs.getInt("video_output_scale", 0);
+                microphoneEnabled = false;
+                sessionStatus = "Conectando";
                 surfaceView.setVisibility(View.VISIBLE);
-                streamingService.createPeerConnection(configJson);
-            } catch (RemoteException e) {
-                Log.e(TAG, "createPeerConnection", e);
+                final long waitingGeneration = sessionGeneration;
+                firstFrameTimeout = () -> {
+                    if (waitingGeneration == sessionGeneration && !activityDestroyed)
+                        reportSignalingError("tempo-esgotado-primeiro-quadro");
+                };
+                startupHandler.postDelayed(firstFrameTimeout, 35000);
             }
+            IStreamingCallback current = streamingCallback;
+            long generation = sessionGeneration;
+            runNativeOperation(() -> {
+                if (generation != sessionGeneration) return;
+                try {
+                    if (newSession) {
+                        service.unregisterCallback(previous);
+                        service.closeSession();
+                        service.configureVideoOptions(activeVideoProfile, activeSharpness);
+                        service.registerCallback(current);
+                    }
+                    service.createPeerConnection(configJson);
+                    service.requestInputChannelSnapshot();
+                } catch (RemoteException e) { reportSignalingError("configuração"); }
+            });
+        });
+    }
+
+    public void runNativeOperation(Runnable operation) {
+        if (!activityDestroyed && !videoWorker.isShutdown()) videoWorker.execute(operation);
+    }
+
+    public void closeNativeSession() {
+        onNativeSessionClosing();
+        sessionGeneration++;
+        IStreamingService service = streamingService;
+        if (service != null) runNativeOperation(() -> {
+            try { service.closeSession(); } catch (RemoteException e) { Log.w(TAG, "Session close failed", e); }
+        });
+    }
+
+    public void reportSignalingError(String operation) {
+        runOnUiThread(() -> {
+            if (activityDestroyed || closingSession) return;
+            sessionStatus = "Erro de conexão";
+            showCustomToast("Falha na conexão de vídeo (" + operation + "). Encerre e reabra o jogo.");
+            if (!signalingFailureShown && activeVideoProfile == 3 && acceptInputCallbacks) {
+                signalingFailureShown = true;
+                acceptInputCallbacks = false;
+                new androidx.appcompat.app.AlertDialog.Builder(this).setTitle("High exclusivo não conectou")
+                        .setMessage("O perfil pode não ser compatível com esta sessão. Você pode voltar ao catálogo usando Baseline.")
+                        .setPositiveButton("Usar Baseline", (d,w) -> {
+                            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putInt("video_profile_mode", 0)
+                                    .putBoolean(KEY_HIGH_VIDEO_PROFILE, false).apply(); exitGameToCatalog();
+                        }).setNegativeButton("Voltar ao catálogo", (d,w) -> exitGameToCatalog()).show();
+            }
+            if (!signalingFailureShown) {
+                signalingFailureShown = true;
+                new androidx.appcompat.app.AlertDialog.Builder(this).setTitle("A sessão não conectou corretamente")
+                        .setMessage("Falha: " + operation + ". Volte ao catálogo para tentar uma nova sessão.")
+                        .setPositiveButton("Voltar ao catálogo", (d,w) -> exitGameToCatalog())
+                        .setNegativeButton("Fechar", null).show();
+            }
+            if (webView != null) webView.evaluateJavascript(
+                    "if(window.handleSignalingError) window.handleSignalingError(" + JSONObject.quote(operation) + ");", null);
         });
     }
 
@@ -720,10 +1081,6 @@ private boolean debug=false;
     }
 
     public void onDataChannelMessageReceived(String label, byte[] bin, String message, boolean isBinary) {
-        if ("message".equals(label) && !isBinary && message != null && message.contains("HandshakeAck")) {
-            gamepadAnnounced = false;
-            announceNativeGamepad();
-        }
 
         if (("reliableinput".equalsIgnoreCase(label) || "input".equalsIgnoreCase(label)) && bin != null) {
             InputMessageParser.parse(bin,
@@ -734,13 +1091,13 @@ private boolean debug=false;
                         }
                     },
                     (idx, left, right, leftTrig, rightTrig, duration, delay, repeat) -> {
-                        if (rumbleHandler != null) {
+                        if (rumbleHandler != null && getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean("rumble_enabled", true)) {
                             rumbleHandler.onRumble(idx, left, right, leftTrig, rightTrig, duration, delay, repeat);
                         }
                     },
                     token -> {
-                        // Modern gamepadListener doesn't need ACKs usually, but if it did:
-                        // if (gamepadListener != null) gamepadListener.handleAck(token);
+                        remoteInputAcks++;
+                        inputTrace.add(android.os.SystemClock.elapsedRealtime(), "ACK input recebido");
                     });
             return;
         }
@@ -772,25 +1129,22 @@ private boolean debug=false;
     }
 
     public void onDataChannelStateChanged(String label, String state) {
-        if (!acceptSessionCallbacks) return;
+        if (!acceptInputCallbacks || activityDestroyed) return;
         if (("input".equalsIgnoreCase(label) || "unreliableinput".equalsIgnoreCase(label))
                 && "OPEN".equalsIgnoreCase(state)) setStreamingState(true);
         inputSession.channel(label, state);
-        updateInputRoute();
         if (!inputSession.canAnnounce()) gamepadAnnounced = false;
+        updateInputRoute();
         announceNativeGamepad();
-
-        if (webView == null) return;
-        String script = "if (window.handleDataChannelState) { window.handleDataChannelState('" + label + "', '" + state + "'); }";
-        runOnUiThread(() -> {
-            if (webView != null) webView.evaluateJavascript(script, null);
-        });
+        if (webView != null) webView.evaluateJavascript(
+                "if(window.handleDataChannelState) window.handleDataChannelState("
+                        + JSONObject.quote(label) + "," + JSONObject.quote(state) + ");", null);
     }
 
     private void requestInputSnapshot() {
-        if (streamingService == null || !acceptSessionCallbacks) return;
+        if (!acceptInputCallbacks || streamingService == null) return;
         try { streamingService.requestInputChannelSnapshot(); }
-        catch (RemoteException e) { Log.w(TAG, "Cannot refresh input channels", e); }
+        catch (RemoteException e) { Log.w(TAG, "Input snapshot unavailable", e); }
     }
 
     private void updateInputRoute() {
@@ -799,14 +1153,15 @@ private boolean debug=false;
         activeInputChannel = selected;
         if ("input".equals(selected) && legacyInputChannel != null) {
             legacyInputChannel.start(0);
-            if (controllerLe != null) controllerLe.releaseAll();
+            if (controllerLe != null) controllerLe.sendCurrentState();
         } else if ("unreliableinput".equals(selected) && gamepadListener != null) {
-            gamepadListener.releaseAll();
+            gamepadListener.sendCurrentState();
         }
     }
 
     public void onControlAuthorizationSent() {
-        if (!acceptSessionCallbacks) return;
+        if (!acceptInputCallbacks || activityDestroyed) return;
+        inputSession.authorizationSent();
         gamepadAnnounced = false;
         requestInputSnapshot();
         announceNativeGamepad();
@@ -817,14 +1172,25 @@ private boolean debug=false;
         try {
             String message = new JSONObject().put("message", "gamepadChanged")
                     .put("gamepadIndex", nativeGamepadIndex).put("wasAdded", true).toString();
-            streamingService.onDataChannelSend("control",
-                    message.getBytes(java.nio.charset.StandardCharsets.UTF_8), null, false);
+            streamingService.onDataChannelSend("control", message.getBytes(StandardCharsets.UTF_8), null, false);
             gamepadAnnounced = true;
-            // Earlier neutral frames may have preceded registration. Resend the actual
-            // state now, including neutral when idle; never clear a held button here.
             if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) gamepadListener.sendCurrentState();
             if ("input".equals(activeInputChannel) && controllerLe != null) controllerLe.sendCurrentState();
-        } catch (RemoteException | org.json.JSONException e) { Log.w(TAG, "Native gamepad announcement failed", e); }
+        } catch (RemoteException | org.json.JSONException e) { Log.w(TAG, "Gamepad announcement failed", e); }
+    }
+
+    public void onNativeSessionClosing() {
+        if (firstFrameTimeout != null) startupHandler.removeCallbacks(firstFrameTimeout);
+        acceptInputCallbacks = false;
+        inputSession.reset();
+        gamepadAnnounced = false;
+        activeInputChannel = "";
+        handledControllerEvents = remoteInputAcks = 0;
+        isSelectPressed = false;
+        if (gamepadListener != null) gamepadListener.releaseAll();
+        if (controllerLe != null) controllerLe.releaseAll();
+        nativeGamepadEnabled = false;
+        setStreamingState(false);
     }
 
     public void onIceConnectionStateChanged(String state) {
@@ -838,7 +1204,6 @@ private boolean debug=false;
     public void onDataChannelSend(String label, byte[] binary, String data, boolean isBinary) {
         if (streamingService == null) return;
         try {
-            Log.e(TAG, "onDataChannelSend:"+label);
 
             streamingService.onDataChannelSend(label, binary, data, isBinary);
         } catch (RemoteException e) {
@@ -852,15 +1217,14 @@ private boolean debug=false;
     }
 
     public void setGamepadIndex(int idx) {
+        if (idx < 0 || idx > 3) return;
         nativeGamepadIndex = idx;
-        gamepadAnnounced = false;
         if (gamepadListener != null) {
             gamepadListener.setgamepadIndex(idx);
         }
         if (controllerLe != null) {
             controllerLe.setgamepadIndex(idx);
         }
-        announceNativeGamepad();
     }
 
     public void updateGamepadSettings(float deadzone, float sensitivity) {
@@ -886,19 +1250,35 @@ private boolean debug=false;
     public void setStreamingState(boolean isStreaming) {
         Log.i(TAG, "Streaming State: " + (isStreaming ? "ACTIVE" : "INACTIVE"));
         this.isStreaming = isStreaming;
+        if (isStreaming) sessionStatus = "Jogando";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) getWindow().setPreferMinimalPostProcessing(isStreaming && prefersMinimalPostProcessing());
         runOnUiThread(() -> {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                getWindow().setPreferMinimalPostProcessing(isStreaming && prefersMinimalPostProcessing());
-            }
-            if (!isStreaming) {
-                if (webRtcBridge != null) webRtcBridge.stopKeepAlive();
-                inputSession.reset();
-                activeInputChannel = "";
-                gamepadAnnounced = false;
-            }
+//            if (isStreaming ) {
+//                if(surfaceView!=null) {
+//                    ViewGroup parent = (ViewGroup) surfaceView.getParent();
+//                    //originalIndex = parent.indexOfChild(surfaceView);
+//                    surfaceView.setZOrderOnTop(true);
+//                    surfaceView.bringToFront();
+//                    parent.requestLayout();
+//                    parent.invalidate();
+//                }
+//                if (webView!=null&&Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+//                    webView.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+//                }
+//            } else {
+//                if(surfaceView!=null){
+//                    ViewGroup parent = (ViewGroup) surfaceView.getParent();
+//                    surfaceView.setZOrderOnTop(false);
+//                    parent.removeView(surfaceView);
+//                    parent.addView(surfaceView, 0);
+//                }
+//                resetGamepadDispatch();
+//                if (webView != null) {
+//                    webView.setVisibility(View.VISIBLE);
+//                }
+//            }
         });
     }
-
     private boolean prefersMinimalPostProcessing() {
         return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_LOW_LATENCY, false);
     }
@@ -968,9 +1348,11 @@ private boolean debug=false;
 
     @Override
     protected void onDestroy() {
-        acceptSessionCallbacks = false;
+        activityDestroyed = true;
+        startup.close();
+        startupHandler.removeCallbacksAndMessages(null);
+        diagnosticWorker.shutdown();
         if (webRtcBridge != null) webRtcBridge.dispose();
-        setStreamingState(false);
         if (performanceDialog != null) {
             performanceDialog.dismiss();
             performanceDialog = null;
@@ -985,11 +1367,19 @@ private boolean debug=false;
             legacyInputChannel.shutdown();
         }
 
-        if (streamingService != null) {
-            try { streamingService.unregisterCallback(streamingCallback); } catch (RemoteException ignored) {}
+        IStreamingService service = streamingService;
+        streamingService = null;
+        if (service != null) videoWorker.execute(() -> {
+            try {
+                service.unregisterCallback(streamingCallback);
+                // Last unbind invokes service teardown; do not race a second release.
+            } catch (RemoteException | RuntimeException e) { Log.w(TAG, "Video cleanup failed", e); }
+        });
+        videoWorker.shutdown();
+        if (serviceBound) {
+            unbindService(serviceConnection);
+            serviceBound = false;
         }
-
-        try { unbindService(serviceConnection); } catch (Exception ignored) {}
 
         if (webView != null) {
             if (rootLayout != null) rootLayout.removeView(webView);
@@ -1009,8 +1399,9 @@ private boolean debug=false;
 
         @Override
         public void onProgressChanged(WebView view, int newProgress) {
-            if (loadingText != null) {
-                loadingText.setText(newProgress + "%");
+            if (view != webView || activityDestroyed) return;
+            if (loadingText != null && !catalogFailed && !isStreaming) {
+                loadingText.setText("Carregando catálogo ou login Xbox… " + newProgress + "%");
             }
             if (!documentStartInjection && newProgress > 0 && !isScriptInjected && view.getUrl() != null && view.getUrl().contains("play")) {
                 isScriptInjected = true;
@@ -1044,6 +1435,16 @@ private boolean debug=false;
     }
 
     public void showStreamingMenuDialog() {
+        if (activityDestroyed) return;
+        if (!startup.ready()) {
+            new androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("Inicialização do CloudX")
+                    .setMessage(startup.stageLabel())
+                    .setPositiveButton("Tentar novamente", (d, w) -> retryLoading())
+                    .setNeutralButton("Configurações Android", (d, w) -> openAndroidAppSettings())
+                    .setNegativeButton("Sair do aplicativo", (d, w) -> finish()).show();
+            return;
+        }
         Dialog dialog = new Dialog(this, R.style.XboxDialogTheme);
         dialog.setContentView(R.layout.dialog_streaming_menu);
         dialog.setCancelable(true);
@@ -1071,11 +1472,8 @@ private boolean debug=false;
         }
 
         // Initial Mic State
-        boolean micCurrentlyEnabled = false;
-        try {
-            if (streamingService != null) micCurrentlyEnabled = streamingService.isMicrophoneEnabled();
-        } catch (RemoteException ignored) {}
-        btnMic.setText(micCurrentlyEnabled ? "Microfone: Ativado" : "Microfone: Desativado");
+        boolean micCurrentlyEnabled = microphoneEnabled;
+        btnMic.setText(micCurrentlyEnabled ? "Microfone: solicitado" : "Microfone: Desativado");
 
         btnMic.setOnClickListener(v -> {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -1086,10 +1484,11 @@ private boolean debug=false;
 
             try {
                 if (streamingService != null) {
-                    boolean newState = !streamingService.isMicrophoneEnabled();
+                    boolean newState = !microphoneEnabled;
+                    microphoneEnabled = newState;
                     streamingService.setMicrophoneEnabled(newState);
-                    btnMic.setText(newState ? "Microfone: Ativado" : "Microfone: Desativado");
-                    showCustomToast(newState ? "Microfone ativado" : "Microfone desativado");
+                    btnMic.setText(newState ? "Microfone: solicitado" : "Microfone: Desativado");
+                    showCustomToast(newState ? "Ativação do microfone solicitada" : "Microfone desativado");
                 }
             } catch (RemoteException e) {
                 Log.e(TAG, "Failed to toggle mic", e);
@@ -1103,11 +1502,11 @@ private boolean debug=false;
                     performanceDialog = new PerformanceDialog(this);
                 }
                 performanceDialog.show();
-                try { streamingService.setRenderSurface(null, 41, 40); }
+                try { streamingService.setPerformanceStatsEnabled(true); }
                 catch (RemoteException e) { Log.e(TAG, "Cannot show performance states:"+ e.getMessage()); }
             } else {
                 if (performanceDialog != null) {
-                    try { streamingService.setRenderSurface(null, 51, 50); }
+                    try { streamingService.setPerformanceStatsEnabled(false); }
                     catch (RemoteException e) { Log.e(TAG, "Cannot close performance states:"+ e.getMessage()); }
                     performanceDialog.dismiss();
                 }
@@ -1115,10 +1514,7 @@ private boolean debug=false;
             dialog.dismiss();
         });
 
-        btnExit.setOnClickListener(v -> {
-            dialog.dismiss();
-            exitGameToCatalog();
-        });
+        btnExit.setOnClickListener(v -> { dialog.dismiss(); exitGameToCatalog(); });
 
         btnSettings.setOnClickListener(v -> {
             showSettingsDialog();
@@ -1130,10 +1526,7 @@ private boolean debug=false;
             dialog.dismiss();
         });
 
-        btnReloadXbox.setOnClickListener(v -> {
-            dialog.dismiss();
-            exitGameToCatalog();
-        });
+        btnReloadXbox.setOnClickListener(v -> { dialog.dismiss(); exitGameToCatalog(); });
 
         btnNexus.setOnClickListener(v -> {
             if ("unreliableinput".equals(activeInputChannel) && gamepadListener != null) {
@@ -1147,36 +1540,66 @@ private boolean debug=false;
         btnClose.setOnClickListener(v -> dialog.dismiss());
 
         dialog.show();
+        Button traceButton = dialog.findViewById(R.id.btn_input_trace);
+        traceButton.setText(inputTrace.enabled(android.os.SystemClock.elapsedRealtime()) ? "Parar diagnóstico do controle" : "Diagnóstico do controle (10 min)");
+        traceButton.setOnClickListener(v -> {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (inputTrace.enabled(now)) inputTrace.disable(); else inputTrace.enable(now);
+            dialog.dismiss();
+        });
+        dialog.findViewById(R.id.btn_copy_report).setOnClickListener(v -> { dialog.dismiss(); showDiagnosticReport(); });
         btnExit.requestFocus();
     }
 
 
-    /** Exit is a new catalog navigation, never a restore of the old game page. */
-    private void exitGameToCatalog() {
-        acceptSessionCallbacks = false;
+    private void destroySessionPage() {
         if (webRtcBridge != null) webRtcBridge.dispose();
-        setStreamingState(false);
-        isPerformanceOverlayVisible = false;
-        if (performanceDialog != null) performanceDialog.dismiss();
-        if (legacyInputChannel != null) legacyInputChannel.shutdown();
-        if (streamingService != null) {
-            try { streamingService.closeSession(); }
-            catch (RemoteException e) { Log.w(TAG, "Session close failed; returning to catalog", e); }
-        }
-        surfaceView.setZOrderOnTop(false);
-        surfaceView.setVisibility(View.GONE);
         webViewState = null;
         if (webView != null) {
-            rootLayout.removeView(webView);
-            webView.removeJavascriptInterface("AndroidBridge");
-            webView.stopLoading();
-            webView.setWebViewClient(null);
-            webView.setWebChromeClient(null);
-            webView.destroy();
+            WebView old = webView;
             webView = null;
+            rootLayout.removeView(old);
+            old.removeJavascriptInterface("AndroidBridge");
+            old.setWebViewClient(null);
+            old.setWebChromeClient(null);
+            old.stopLoading();
+            old.destroy();
         }
-        // CookieManager is untouched, so the Xbox login is retained.
-        showWebview();
+    }
+
+    private void exitGameToCatalog() {
+        if (closingSession || activityDestroyed) return;
+        closingSession = true;
+        sessionStatus = "Encerrando";
+        onNativeSessionClosing();
+        long generation = ++sessionGeneration;
+        if (catalogTimeout != null) startupHandler.removeCallbacks(catalogTimeout);
+        if (performanceDialog != null) performanceDialog.dismiss();
+        surfaceView.setZOrderOnTop(false);
+        surfaceView.setVisibility(View.GONE);
+        destroySessionPage();
+        showStartupProgress("Encerrando sessão…");
+        Runnable deadline = () -> {
+            if (closingSession && generation == sessionGeneration && !activityDestroyed)
+                showStartupFailure("O serviço não terminou de encerrar. Abra Configurações Android para forçar a parada do CloudX.");
+        };
+        startupHandler.postDelayed(deadline, 15000);
+        IStreamingService service = streamingService;
+        runNativeOperation(() -> {
+            boolean closed = true;
+            try { if (service != null) service.closeSession(); }
+            catch (RemoteException | RuntimeException e) { closed = false; Log.w(TAG, "Close failed", e); }
+            final boolean success = closed;
+            startupHandler.post(() -> {
+                if (activityDestroyed || generation != sessionGeneration) return;
+                startupHandler.removeCallbacks(deadline);
+                closingSession = false;
+                if (!success) { showStartupFailure("Falha ao encerrar o serviço. Reabra o aplicativo nas configurações Android."); return; }
+                sessionStatus = "Catálogo";
+                catalogFailed = false;
+                showWebview();
+            });
+        });
     }
 
     private class PerformanceDialog extends Dialog {
@@ -1205,9 +1628,22 @@ private boolean debug=false;
             getWindow().setAttributes(lp);
         }
 
+        @Override public void dismiss() {
+            super.dismiss();
+            isPerformanceOverlayVisible = false;
+            IStreamingService service = streamingService;
+            if (service != null) {
+                try { service.setPerformanceStatsEnabled(false); }
+                catch (RemoteException e) { Log.w(TAG, "Cannot stop statistics", e); }
+            }
+        }
+
         public void updateStats(String stats) {
             if (tvStats != null) {
-                tvStats.setText(stats);
+                lastPerformanceReport = stats;
+                lastPerformanceAtMs = android.os.SystemClock.elapsedRealtime();
+                boolean compact = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt("stats_detail", 0) == 1;
+                tvStats.setText(compact ? compactStats(stats) : stats);
             }
         }
     }
@@ -1408,8 +1844,44 @@ private boolean debug=false;
         dialog.show();
     }
 
+    private int savedVideoProfile() {
+        SharedPreferences p = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        return Math.max(0, Math.min(3, p.getInt("video_profile_mode", p.getBoolean(KEY_HIGH_VIDEO_PROFILE, false) ? 1 : 0)));
+    }
     public boolean prefersHighVideoProfile() {
-        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_HIGH_VIDEO_PROFILE, false);
+        int mode = acceptInputCallbacks ? activeVideoProfile : savedVideoProfile();
+        return mode == 1 || mode == 3;
+    }
+
+    private void setupChoices(android.widget.Spinner spinner, String[] values, int selected) {
+        android.widget.ArrayAdapter<String> adapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, values);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter); spinner.setSelection(Math.max(0, Math.min(values.length - 1, selected)));
+    }
+    private static String compactStats(String stats) {
+        StringBuilder out = new StringBuilder();
+        for (String line : stats.split("\n")) {
+            if (line.startsWith("Vídeo recebido") || line.startsWith("FPS recebidos") || line.startsWith("Codec:")
+                    || line.startsWith("Último quadro") || line.startsWith("Saída de áudio") || line.startsWith("Controle:")
+                    || line.startsWith("Telemetria")) out.append(line).append('\n');
+        }
+        return out.toString();
+    }
+    private void showDiagnosticReport() {
+        String version = "n/d";
+        try { android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            version = info.versionName + " (" + info.getLongVersionCode() + ")";
+        } catch (PackageManager.NameNotFoundException ignored) {}
+        String report = "CloudX " + version + "\nTV: " + Build.MODEL
+                + " | Android " + Build.VERSION.RELEASE + "\nEstado: " + sessionStatus + "\n"
+                + "Última amostra: " + (lastPerformanceAtMs < 0 ? "não coletada" : ((android.os.SystemClock.elapsedRealtime() - lastPerformanceAtMs) / 1000) + " s atrás") + "\n"
+                + lastPerformanceReport + "\n\nControle (Menu moderno é contador de transições):\n" + inputTrace.report();
+        TextView text = new TextView(this); text.setText(report); text.setTextIsSelectable(true); text.setPadding(24,24,24,24);
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(text);
+        new androidx.appcompat.app.AlertDialog.Builder(this).setTitle("Diagnóstico local").setView(scroll)
+                .setPositiveButton("Copiar", (d,w) -> ((android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE))
+                        .setPrimaryClip(android.content.ClipData.newPlainText("CloudX diagnóstico", report)))
+                .setNegativeButton("Fechar", null).show();
     }
 
     private void showAppSettingsDialog() {
@@ -1425,11 +1897,20 @@ private boolean debug=false;
         androidx.appcompat.widget.SwitchCompat lowLatencySwitch = dialog.findViewById(R.id.switch_low_latency);
         lowLatencySwitch.setChecked(prefersMinimalPostProcessing());
         lowLatencySwitch.setEnabled(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R);
-        String[] profileLabels = {"Preferir Baseline (estável)", "Preferir High (experimental)"};
+        String[] profileLabels = {"Preferir Baseline (estável)", "Preferir High", "Automático", "Somente High (experimental)"};
         android.widget.ArrayAdapter<String> profileAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, profileLabels);
         profileAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerVideoProfile.setAdapter(profileAdapter);
-        spinnerVideoProfile.setSelection(prefersHighVideoProfile() ? 1 : 0);
+        spinnerVideoProfile.setSelection(savedVideoProfile());
+        SharedPreferences qualityPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        android.widget.Spinner outputScale = dialog.findViewById(R.id.spinner_output_scale);
+        android.widget.Spinner sharpness = dialog.findViewById(R.id.spinner_sharpness);
+        android.widget.Spinner statsDetail = dialog.findViewById(R.id.spinner_stats_detail);
+        setupChoices(outputScale, new String[]{"Original (padrão)", "Ampliar até 1080p", "Ampliar até a tela / 4K (maior custo)"}, qualityPrefs.getInt("video_output_scale", 0));
+        setupChoices(sharpness, new String[]{"Desligada", "Leve", "Moderada"}, qualityPrefs.getInt("video_sharpness", 0));
+        setupChoices(statsDetail, new String[]{"Detalhadas", "Compactas"}, qualityPrefs.getInt("stats_detail", 0));
+        androidx.appcompat.widget.SwitchCompat rumble = dialog.findViewById(R.id.switch_rumble);
+        rumble.setChecked(qualityPrefs.getBoolean("rumble_enabled", true));
         TextView tvScale = dialog.findViewById(R.id.tv_initial_scale);
         SeekBar sbScale = dialog.findViewById(R.id.sb_initial_scale);
         Button btnCancel = dialog.findViewById(R.id.btn_cancel);
@@ -1449,8 +1930,8 @@ private boolean debug=false;
         spinnerRes.setAdapter(resAdapter);
 
         // Bitrate options
-        Integer[] bitrateValues = {0, 8, 10, 12, 15, 18, 20};
-        String[] bitrateLabels = {"Automático (20 Mbps)", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (teto recomendado)"};
+        Integer[] bitrateValues = {0, 4, 6, 8, 10, 12, 15, 18, 20};
+        String[] bitrateLabels = {"Automático (20 Mbps)", "4 Mbps (menor qualidade)", "6 Mbps", "8 Mbps", "10 Mbps", "12 Mbps", "15 Mbps", "18 Mbps", "20 Mbps (teto recomendado)"};
         android.widget.ArrayAdapter<String> bitrateAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bitrateLabels);
         bitrateAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerBitrate.setAdapter(bitrateAdapter);
@@ -1495,6 +1976,23 @@ private boolean debug=false;
             }
         }
 
+        dialog.findViewById(R.id.btn_tl042_preset).setOnClickListener(v -> {
+            spinnerRes.setSelection(java.util.Arrays.asList(resolutions).indexOf(TvCompatibilityProfile.RESOLUTION));
+            spinnerBitrate.setSelection(java.util.Arrays.asList(bitrateValues).indexOf(TvCompatibilityProfile.BITRATE_MBPS));
+            spinnerVideoProfile.setSelection(0); outputScale.setSelection(0); sharpness.setSelection(0); lowLatencySwitch.setChecked(false);
+            showCustomToast("Perfil TL042: 720p, até 8 Mbps e modo Estável. Selecione Aplicar e reabra o jogo.");
+        });
+
+        dialog.findViewById(R.id.btn_tcl_quality).setOnClickListener(v -> {
+            spinnerRes.setSelection(java.util.Arrays.asList(resolutions).indexOf("1080HQ"));
+            spinnerBitrate.setSelection(java.util.Arrays.asList(bitrateValues).indexOf(20));
+            spinnerVideoProfile.setSelection(0); outputScale.setSelection(0); sharpness.setSelection(0); lowLatencySwitch.setChecked(false);
+        });
+        dialog.findViewById(R.id.btn_tcl_balanced).setOnClickListener(v -> {
+            spinnerRes.setSelection(java.util.Arrays.asList(resolutions).indexOf("1080"));
+            spinnerBitrate.setSelection(java.util.Arrays.asList(bitrateValues).indexOf(15));
+            spinnerVideoProfile.setSelection(0); outputScale.setSelection(0); sharpness.setSelection(0); lowLatencySwitch.setChecked(false);
+        });
         sbScale.setProgress(currentScale);
         tvScale.setText(currentScale == 0 ? "Escala inicial: automática" : "Escala inicial: " + currentScale + "%");
 
@@ -1502,7 +2000,7 @@ private boolean debug=false;
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 tvScale.setText(progress == 0 ? "Escala inicial: automática" : "Escala inicial: " + progress + "%");
-                webView.setInitialScale(progress);
+                // Preview is applied only after confirmation.
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
@@ -1523,25 +2021,32 @@ private boolean debug=false;
                     .putString(KEY_REGION, selectedRegion)
                     .putString(KEY_RESOLUTION, selectedRes)
                     .putInt(KEY_BITRATE, selectedBitrate)
-                    .putBoolean(KEY_HIGH_VIDEO_PROFILE, spinnerVideoProfile.getSelectedItemPosition() == 1)
+                    .putInt("video_profile_mode", spinnerVideoProfile.getSelectedItemPosition())
+                    .putInt("video_output_scale", outputScale.getSelectedItemPosition())
+                    .putInt("video_sharpness", sharpness.getSelectedItemPosition())
+                    .putInt("stats_detail", statsDetail.getSelectedItemPosition())
+                    .putBoolean("rumble_enabled", rumble.isChecked())
+                    .putBoolean(KEY_HIGH_VIDEO_PROFILE, spinnerVideoProfile.getSelectedItemPosition() == 1 || spinnerVideoProfile.getSelectedItemPosition() == 3)
                     .putBoolean(KEY_LOW_LATENCY, lowLatencySwitch.isChecked())
                     .putString(KEY_USER_AGENT, selectedUA)
                     .putInt(KEY_INITIAL_SCALE, selectedScale)
                     .apply();
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
                 getWindow().setPreferMinimalPostProcessing(isStreaming && lowLatencySwitch.isChecked());
-            }
+            new androidx.appcompat.app.AlertDialog.Builder(this).setTitle("Configurações salvas")
+                    .setMessage("Perfil, resolução, taxa, escala e nitidez serão aplicados na próxima sessão. Somente High pode ser recusado pelo serviço. A escala 4K aumenta o custo da GPU.")
+                    .setPositiveButton("OK", null).show();
+
             if (webView != null) {
                 @SuppressLint("DefaultLocale") String js = String.format("window.BX_TARGET_REGION = '%s'; window.BX_TARGET_RES = '%s'; window.BX_TARGET_BITRATE = %d;",
                         selectedRegion, selectedRes, selectedBitrate);
                 webView.evaluateJavascript(js, null);
 
-                if (scaleChanged) {
+                if (scaleChanged && !isStreaming) {
                     webView.setInitialScale(selectedScale);
                 }
                 
-                if (uaChanged || scaleChanged) {
+                if (!isStreaming && (uaChanged || scaleChanged)) {
                     if (uaChanged) {
                         String uaString = USER_AGENTS.get(selectedUA);
                         webView.getSettings().setUserAgentString(uaString);

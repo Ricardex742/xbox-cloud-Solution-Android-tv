@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: '22'
       - name: Test session and controller bridge
-        run: node --test tests/session-input.test.cjs
+        run: node --test tests/*.test.cjs
       - name: Test, lint and build
         run: ./gradlew --no-daemon --no-configuration-cache --max-workers=2 testDebugUnitTest lintDebug assembleDebug assembleRelease
       - name: Sign verified ARM artifacts

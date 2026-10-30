@@ -102,7 +102,7 @@ test('missing metadata polling is bounded and stops when session closes', () => 
 test('proxy is installed before load and reinjection does not wrap it a second time', () => {
     const {c, calls} = setup();
     assert.equal(c.document.readyState, 'loading');
-    assert.equal(c.__cloudxRtcInstalled, true);
+    assert.equal(c.__cloudxRtcPatched, true);
     const installed = c.RTCPeerConnection;
     vm.runInContext(source, c);
     assert.equal(c.RTCPeerConnection, installed);
@@ -116,7 +116,7 @@ test('configuration update preserves the peer, channels and session input', () =
     pc.setConfiguration({iceServers: [{urls: 'stun:example.test'}]});
     assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfig').length, 1);
     assert.equal(calls.filter(x => x[0] === 'onPeerConnectionClose').length, 0);
-    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfigurationUpdate').length, 1);
+    assert.equal(calls.filter(x => x[0] === 'onPeerConnectionConfigUpdated').length, 1);
     assert.equal(c.proxyDataChannels.unreliableinput, input);
     assert.equal(input.readyState, 'open');
 });

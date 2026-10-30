@@ -2,6 +2,10 @@ package com.world.cloudxsolution;
 
 /** Pure negotiation policy; advertised profiles and levels are never rewritten. */
 public final class VideoQualityPolicy {
+    public static boolean isHighProfile(String profile) {
+        return profile != null && profile.toLowerCase(java.util.Locale.ROOT).matches("64[0-9a-f]{4}");
+    }
+
     private VideoQualityPolicy() {}
 
     public static int maxKbps(int requested) {

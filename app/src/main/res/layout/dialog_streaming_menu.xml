@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="340dp" android:layout_height="wrap_content" android:fillViewport="true">
+<LinearLayout
     android:layout_width="340dp"
     android:layout_height="wrap_content"
     android:orientation="vertical"
@@ -146,6 +148,8 @@
         android:background="@color/xbox_border"
         android:layout_marginBottom="10dp"/>
 
+<androidx.appcompat.widget.AppCompatButton android:id="@+id/btn_input_trace" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Diagnóstico temporário do controle" android:textColor="@color/xbox_text_primary" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="8dp"/>
+<androidx.appcompat.widget.AppCompatButton android:id="@+id/btn_copy_report" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Ver / copiar diagnóstico" android:textColor="@color/xbox_text_primary" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="8dp"/>
     <androidx.appcompat.widget.AppCompatButton
         android:id="@+id/btn_close_dialog"
         android:layout_width="match_parent"
@@ -162,3 +166,4 @@
         android:focusable="true"/>
 
 </LinearLayout>
+</ScrollView>

@@ -18,6 +18,8 @@ interface IStreamingService {
     // --- lifecycle ---
     void initPeerConnectionFactory();
     void releaseSession();
+    oneway void requestInputChannelSnapshot();
+    oneway void setPerformanceStatsEnabled(boolean enabled);
 
     // --- video output: called once when the SurfaceView in MainActivity
     // is created/resized. The service renders into this Surface directly
@@ -30,6 +32,7 @@ interface IStreamingService {
     // process to here) ---
     void handleRemoteOffer(String sdp);
     void handleRemoteAnswer(String sdp);
+    void configureVideoOptions(int profileMode, int sharpness);
     void createOffer(int bitrateKbps, boolean preferHighProfile);
     void addIceCandidate(String sdpMid, int sdpMLineIndex, String candidate);
     void createDataChannel(String label);
@@ -42,8 +45,6 @@ interface IStreamingService {
     // parses out of onPeerConnectionConfigReceived and let WebRtcReceiver do
     // the org.json parsing itself (see WebRtcReceiver.createPeerConnection(String)).
     void createPeerConnection(String iceServersJson);
-    void updatePeerConfiguration(String iceServersJson);
-    oneway void requestInputChannelSnapshot();
 
     // --- gamepad input: forwarded from MainActivity's Window.Callback.
     // oneway = fire-and-forget, does not block the input-dispatch thread

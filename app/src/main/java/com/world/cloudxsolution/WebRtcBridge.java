@@ -69,6 +69,10 @@ public class WebRtcBridge {
         activity.runOnUiThread(() -> { if (active) action.run(); });
     }
 
+    private void runNativeIfActive(Runnable action) {
+        runIfActive(() -> activity.runNativeOperation(() -> { if (active) action.run(); }));
+    }
+
     public void dispose() {
         active = false;
         stopKeepAlive();
@@ -77,24 +81,24 @@ public class WebRtcBridge {
     private IStreamingService service() {
         if (!active) return null;
         IStreamingService s = activity.getStreamingService();
-        if (s == null) Log.w(TAG, "StreamingService not bound yet, dropping call");
+        if (s == null) activity.reportSignalingError("serviço-indisponível");
         return s;
     }
 
     @JavascriptInterface
     public void onOfferReceived(final String sdp) {
         if (!active) return;
-        runIfActive(() -> {
+        runNativeIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
-            try { s.handleRemoteOffer(sdp); } catch (Exception e) { Log.e(TAG, "onOfferReceived", e); }
+            try { s.handleRemoteOffer(sdp); } catch (Exception e) { Log.e(TAG, "onOfferReceived", e); activity.reportSignalingError("oferta-remota"); }
         });
     }
 
     @JavascriptInterface
     public void onIceCandidateReceived(String sdpMid, int sdpMLineIndex, String candidate) {
         if (!active) return;
-        runIfActive(() -> {
+        runNativeIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.addIceCandidate(sdpMid, sdpMLineIndex, candidate); } catch (Exception e) { Log.e(TAG, "iceCandidate", e); }
@@ -104,10 +108,10 @@ public class WebRtcBridge {
     @JavascriptInterface
     public void onOfferRequested(int bitrateMbps) {
         if (!active) return;
-        runIfActive(() -> {
+        runNativeIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
-            try { s.createOffer(Math.max(0, Math.min(20, bitrateMbps)) * 1000, activity.prefersHighVideoProfile()); } catch (Exception e) { Log.e(TAG, "createOffer", e); }
+            try { s.createOffer(Math.max(0, Math.min(20, bitrateMbps)) * 1000, activity.prefersHighVideoProfile()); } catch (Exception e) { Log.e(TAG, "createOffer", e); activity.reportSignalingError("oferta"); }
         });
     }
 
@@ -118,30 +122,24 @@ public class WebRtcBridge {
     }
 
     @JavascriptInterface
-    public void onPeerConnectionConfigurationUpdate(String configJson) {
-        if (!active) return;
-        runIfActive(() -> {
-            IStreamingService s = service();
-            if (s == null) return;
-            try { s.updatePeerConfiguration(configJson); }
-            catch (Exception e) { Log.e(TAG, "updatePeerConfiguration", e); }
-        });
+    public void onPeerConnectionConfigUpdated(String configJson) {
+        if (active) runIfActive(() -> activity.onPeerConnectionConfigUpdated(configJson));
     }
 
     @JavascriptInterface
     public void onAnswerReceived(String sdp) {
         if (!active) return;
-        runIfActive(() -> {
+        runNativeIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
-            try { s.handleRemoteAnswer(sdp); } catch (Exception e) { Log.e(TAG, "onAnswerReceived", e); }
+            try { s.handleRemoteAnswer(sdp); } catch (Exception e) { Log.e(TAG, "onAnswerReceived", e); activity.reportSignalingError("resposta-remota"); }
         });
     }
 
     @JavascriptInterface
     public void onDataChannelCreate(String label) {
         if (!active) return;
-        runIfActive(() -> {
+        runNativeIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.createDataChannel(label); } catch (Exception e) { Log.e(TAG, "createDataChannel", e); }
@@ -176,7 +174,7 @@ public class WebRtcBridge {
     @JavascriptInterface
     public void onAddTransceiver(String trackOrKind, String direction) {
         if (!active) return;
-        runIfActive(() -> {
+        runNativeIfActive(() -> {
             IStreamingService s = service();
             if (s == null) return;
             try { s.addTransceiver(trackOrKind, direction); } catch (Exception e) { Log.e(TAG, "addTransceiver", e); }
@@ -186,12 +184,7 @@ public class WebRtcBridge {
     @JavascriptInterface
     public void onPeerConnectionClose() {
         if (!active) return;
-        runIfActive(() -> {
-            IStreamingService s = service();
-            if (s == null) return;
-            activity.setStreamingState(false);
-            try { s.closeSession(); } catch (Exception e) { Log.e(TAG, "closeSession", e); }
-        });
+        runIfActive(() -> { stopKeepAlive(); activity.closeNativeSession(); });
     }
 
     @JavascriptInterface

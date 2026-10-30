@@ -3,4 +3,22 @@
     <string name="video_quality_label">Qualidade e desempenho</string>
     <string name="video_quality_help">High depende do suporte da TV e da negociação com o servidor. Pode causar travamentos. Encerre e reabra o jogo para aplicar; confira o perfil efetivo no painel.</string>
     <string name="low_latency_experimental">Solicitar baixa latência da TV (experimental)</string>
+<string name="tl042_preset">Usar perfil Multilaser TL042 (720p / 8 Mbps)</string>
+
+<string name="preparing_video_service">Preparando serviço de vídeo…</string>
+
+<string name="browser_stopped_title">Navegador da TV encerrado</string>
+
+<string name="browser_stopped_message">O processo do navegador foi encerrado pelo sistema ou apresentou uma falha. Você pode reabrir o catálogo para iniciar outra sessão.</string>
+
+<string name="reopen_catalog">Reabrir catálogo</string>
+
+<string name="startup_retry">Tentar novamente</string>
+
+<string name="startup_android_settings">Configurações do Android</string>
+
+<string name="startup_menu">Abrir menu</string>
+
+<string name="startup_exit">Sair do aplicativo</string>
+
 </resources>

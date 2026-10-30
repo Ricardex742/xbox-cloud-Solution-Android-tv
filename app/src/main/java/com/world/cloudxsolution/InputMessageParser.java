@@ -78,7 +78,8 @@ public final class InputMessageParser {
         }
 
         if ((reportType & REPORT_VIBRATION) != 0) {
-            if (data.length < offset + 10) return;
+            // type + index + four motors + duration + delay + repeat = 11 bytes.
+            if (data.length < offset + 11) return;
 
             // byte 0 of this section: rumbleType (0 = FourMotorRumble) -- read but unused, matches TS (value discarded there too)
             int cursor = offset + 1;
@@ -102,7 +103,7 @@ public final class InputMessageParser {
                         leftTriggerPercent, rightTriggerPercent,
                         durationMs, delayMs, repeat);
             }
-            offset += 10;
+            offset += 11;
         }
 
         if ((reportType & REPORT_ACK) != 0) {

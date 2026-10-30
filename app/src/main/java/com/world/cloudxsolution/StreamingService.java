@@ -6,10 +6,6 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -31,21 +27,9 @@ import org.webrtc.VideoTrack;
 import java.nio.ByteBuffer;
 
 /**
- * Runs in the :stream process. Declare in AndroidManifest.xml:
- *
- *   <service android:name=".StreamingService"
- *            android:process=":stream"
- *            android:foregroundServiceType="mediaProjection|connectedDevice" />
- *
- * (adjust foregroundServiceType to whatever's accurate for your target SDK --
- * you're already streaming media + reading a connected gamepad, so both
- * likely apply; check the exact allowed combination for your compileSdk.)
- *
- * Owns everything that used to be instantiated directly inside MainActivity:
- * WebRtcReceiver (PeerConnectionFactory, EglBase, DataChannels) and, via
- * WebRtcReceiver, the AndroidGamepadListener. MainActivity now only owns the
- * WebView, the visible SurfaceView, and raw input capture -- everything else
- * is forwarded here over IStreamingService.
+ * Bound service in :stream. Binding is sufficient while the game Activity is visible.
+ * Optional foreground promotion uses mediaPlayback only after a session becomes active;
+ * it never gates onCreate/onBind, native initialization or the catalog.
  */
 public class StreamingService extends Service implements StreamHost {
 
@@ -53,11 +37,17 @@ public class StreamingService extends Service implements StreamHost {
     private static final String CHANNEL_ID = "cloudx_streaming";
 
     private WebRtcReceiver webRtcReceiver;
+    private volatile boolean destroyed;
+    private int sharpness;
+    private volatile org.webrtc.QualityGlDrawer qualityDrawer;
     private EglBase serviceEglBase;
-    private org.webrtc.EglRenderer eglRenderer; // raw-Surface renderer -- see note below
+    private volatile org.webrtc.EglRenderer eglRenderer; // raw-Surface renderer -- see note below
 
     private final RemoteCallbackList<IStreamingCallback> callbacks = new RemoteCallbackList<>();
     private Handler callbackHandler;
+    private final java.util.concurrent.ExecutorService notificationWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(r, "CloudX-notification"));
+    private SessionForeground sessionForeground;
 
     // Local mirror -- deliberately NOT cross-process reads, because these
     // are checked on the hot input/data-channel path (see StreamHost javadoc).
@@ -68,50 +58,12 @@ public class StreamingService extends Service implements StreamHost {
     public void onCreate() {
         super.onCreate();
         callbackHandler = new Handler(Looper.getMainLooper());
-        startForegroundWithNotification();
-        webRtcReceiver = new WebRtcReceiver(this /* StreamHost */);
-        setupSignalingRelay();
-        setupNetworkBinding();
-    }
-
-    private void setupNetworkBinding() {
-        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (cm == null) return;
-
-        // 1. Immediate sync check for active connection at startup
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Network activeNetwork = cm.getActiveNetwork();
-            if (activeNetwork != null) {
-                NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);
-                if (caps != null && (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-                        || caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))) {
-                    cm.bindProcessToNetwork(activeNetwork);
-                    Log.i(TAG, "Immediately locked background process to active network: " + activeNetwork);
-                }
-            }
-        }
-
-        // 2. Reactive listener for preferred network changes
-        NetworkRequest request = new NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
-                .build();
-
-        cm.registerNetworkCallback(request, new ConnectivityManager.NetworkCallback() {
-            @Override
-            public void onAvailable(Network network) {
-                cm.bindProcessToNetwork(network);
-                Log.i(TAG, "Locked background process to Ethernet network: " + network);
-            }
-
-            @Override
-            public void onLost(Network network) {
-                if (network.equals(cm.getBoundNetworkForProcess())) {
-                    cm.bindProcessToNetwork(null);
-                    Log.w(TAG, "Bound background network lost, unbound process");
-                }
-            }
-        });
+        sessionForeground = new SessionForeground(notificationWorker, new SessionForeground.Notification() {
+            @Override public void start() { startForegroundWithNotification(); }
+            @Override public void stop() { stopForeground(STOP_FOREGROUND_REMOVE); }
+        }, e -> Log.w(TAG, "Playback notification unavailable; keeping bound service", e));
+        // No NotificationManager, foreground promotion or EGL work before onBind.
+        Log.i(TAG, "startup: service created; waiting for bind");
     }
 
     private void setupSignalingRelay() {
@@ -141,8 +93,16 @@ public class StreamingService extends Service implements StreamHost {
                 broadcast(cb -> safe(() -> cb.onTrackReceived(kind, id)));
             }
             @Override
+            public void onRemoteDescriptionSet() {
+                broadcast(cb -> safe(cb::onRemoteDescriptionSet));
+            }
+            @Override
+            public void onSignalingError(String operation) {
+                broadcast(cb -> safe(() -> cb.onSignalingError(operation)));
+            }
+            @Override
             public void onPerformanceStatsReceived(String stats) {
-                broadcast(cb -> safe(() -> cb.onPerformanceStatsReceived(stats)));
+                broadcast(cb -> safe(() -> cb.onPerformanceStatsReceived(stats + "\nNitidez no renderizador: " + (qualityDrawer != null && qualityDrawer.isFiltering() ? "ativa" : "desligada"))));
             }
         });
     }
@@ -162,18 +122,26 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void initPeerConnectionFactory() {
+        public synchronized void initPeerConnectionFactory() {
+            if (destroyed) throw new IllegalStateException("Streaming service destroyed");
+            if (webRtcReceiver == null) {
+                Log.i(TAG, "startup: creating native EGL receiver");
+                webRtcReceiver = new WebRtcReceiver(StreamingService.this);
+                setupSignalingRelay();
+            }
             webRtcReceiver.initPeerConnectionFactory();
         }
 
         @Override
-        public void releaseSession() {
+        public synchronized void releaseSession() {
             clearRenderSurface();
-            webRtcReceiver.closeSession();
+            if (webRtcReceiver != null) webRtcReceiver.closeSession();
+            StreamingService.this.setStreamingState(false);
         }
 
         @Override
-        public void setRenderSurface(Surface surface, int width, int height) {
+        public synchronized void setRenderSurface(Surface surface, int width, int height) {
+            if (destroyed || webRtcReceiver == null) throw new IllegalStateException("Video service not ready");
             if (surface == null || !surface.isValid()) {
                 if(width==41&&height==40){webRtcReceiver.enablePerfStats(true);}
                 else if(width==51&&height==50){
@@ -190,15 +158,18 @@ public class StreamingService extends Service implements StreamHost {
                 serviceEglBase = EglBase.create(webRtcReceiver.getEglBaseContext());
             }
             eglRenderer = new org.webrtc.EglRenderer("stream-renderer");
-            eglRenderer.init(serviceEglBase.getEglBaseContext(), EglBase.CONFIG_PLAIN,
-                    new org.webrtc.GlRectDrawer());
+            qualityDrawer = new org.webrtc.QualityGlDrawer(sharpness * 0.15f);
+            eglRenderer.init(serviceEglBase.getEglBaseContext(), EglBase.CONFIG_PLAIN, qualityDrawer);
             eglRenderer.createEglSurface(surface);
 
+            final org.webrtc.EglRenderer targetRenderer = eglRenderer;
             org.webrtc.VideoSink wrapperSink = new org.webrtc.VideoSink() {
                 private boolean firstFrameSeen = false;
                 private int lastWidth, lastHeight;
                 @Override
                 public void onFrame(org.webrtc.VideoFrame frame) {
+                    if (eglRenderer != targetRenderer) return;
+                    webRtcReceiver.noteDecodedFrame();
                     int w = frame.getRotatedWidth(), h = frame.getRotatedHeight();
                     if (w != lastWidth || h != lastHeight) {
                         lastWidth = w;
@@ -210,9 +181,8 @@ public class StreamingService extends Service implements StreamHost {
                         Log.i(TAG, "First frame detected in service! " + frame.getRotatedWidth() + "x" + frame.getRotatedHeight());
                         onFirstFrameRendered(frame.getRotatedWidth(), frame.getRotatedHeight());
                     }
-                    if (eglRenderer != null) {
-                        eglRenderer.onFrame(frame);
-                    }
+                    // A callback already in flight must never feed a replacement renderer.
+                    targetRenderer.onFrame(frame);
                 }
             };
 
@@ -224,7 +194,7 @@ public class StreamingService extends Service implements StreamHost {
         }
 
         @Override
-        public void clearRenderSurface() {
+        public synchronized void clearRenderSurface() {
             if (eglRenderer != null) {
                 VideoTrack remoteTrack = webRtcReceiver.getRemoteVideoTrack();
                 // Note: we can't easily remove the anonymous wrapperSink here
@@ -233,8 +203,10 @@ public class StreamingService extends Service implements StreamHost {
                 if (remoteTrack != null && webRtcReceiver.getPendingRenderTarget() != null) {
                     remoteTrack.removeSink(webRtcReceiver.getPendingRenderTarget());
                 }
+                webRtcReceiver.setPendingRenderTarget(null);
                 eglRenderer.release();
                 eglRenderer = null;
+                qualityDrawer = null;
             }
             if (serviceEglBase != null) {
                 serviceEglBase.release();
@@ -275,24 +247,30 @@ public class StreamingService extends Service implements StreamHost {
             webRtcReceiver.addTransceiver(trackOrKind, direction);
         }
 
+        @Override public void configureVideoOptions(int profileMode, int value) {
+            sharpness = Math.max(0, Math.min(2, value));
+            webRtcReceiver.configureVideoOptions(profileMode);
+        }
+
         @Override
         public void createPeerConnection(String iceServersJson) {
             webRtcReceiver.createPeerConnection(iceServersJson);
-            broadcast(cb -> safe(cb::onRenderSurfaceRequested));
+            if (eglRenderer == null) broadcast(cb -> safe(cb::onRenderSurfaceRequested));
         }
 
-        @Override public void updatePeerConfiguration(String iceServersJson) {
-            webRtcReceiver.updatePeerConfiguration(iceServersJson);
+        @Override public void setPerformanceStatsEnabled(boolean enabled) {
+            if (webRtcReceiver != null && !destroyed) webRtcReceiver.enablePerfStats(enabled);
         }
 
         @Override public void requestInputChannelSnapshot() {
-            webRtcReceiver.requestInputChannelSnapshot();
+            if (webRtcReceiver != null && !destroyed) webRtcReceiver.requestInputChannelSnapshot();
         }
 
         @Override
-        public void closeSession() {
+        public synchronized void closeSession() {
             clearRenderSurface();
-            webRtcReceiver.closeSession();
+            if (webRtcReceiver != null) webRtcReceiver.closeSession();
+            StreamingService.this.setStreamingState(false);
         }
 
         @Override
@@ -301,7 +279,7 @@ public class StreamingService extends Service implements StreamHost {
                // Log.i(TAG, "streamingService send data to: " + label + " (" + binary.length + " bytes)");
                 webRtcReceiver.sendDataChannelMessage(label, binary, isBinary);
             } else if (data != null) {
-
+                Log.i(TAG, "streamingService send data to: " + label + " (String length: " + data.length() + ")");
                 webRtcReceiver.sendDataChannelMessage(label, data, isBinary);
             }
         }
@@ -386,11 +364,13 @@ public class StreamingService extends Service implements StreamHost {
         @Override
         public void setStreamingState(boolean isStreaming) {
             isStreamingMirror = isStreaming;
+            sessionForeground.setActive(isStreaming);
         }
     };
 
     @Override
     public IBinder onBind(Intent intent) {
+        Log.i(TAG, "startup: returning service binder");
         return binder;
     }
 
@@ -423,6 +403,7 @@ public class StreamingService extends Service implements StreamHost {
     @Override
     public void setStreamingState(boolean isStreaming) {
         isStreamingMirror = isStreaming;
+        sessionForeground.setActive(isStreaming);
         broadcast(cb -> safe(() -> cb.onStreamingStateChanged(isStreaming)));
     }
 
@@ -467,17 +448,16 @@ public class StreamingService extends Service implements StreamHost {
     private interface CallbackAction { void run(IStreamingCallback cb) throws Exception; }
 
     private void broadcast(CallbackAction action) {
-        callbackHandler.post(() -> {
+        java.util.List<IStreamingCallback> recipients = new java.util.ArrayList<>();
+        synchronized (callbacks) {
             int n = callbacks.beginBroadcast();
-            //Log.v(TAG, "Broadcasting to " + n + " listeners");
-            for (int i = 0; i < n; i++) {
-                try {
-                    action.run(callbacks.getBroadcastItem(i));
-                } catch (Exception e) {
-                    Log.e(TAG, "callback broadcast failed", e);
-                }
+            try { for (int i = 0; i < n; i++) recipients.add(callbacks.getBroadcastItem(i)); }
+            finally { callbacks.finishBroadcast(); }
+        }
+        callbackHandler.post(() -> {
+            for (IStreamingCallback cb : recipients) {
+                try { action.run(cb); } catch (Exception e) { Log.w(TAG, "Callback unavailable", e); }
             }
-            callbacks.finishBroadcast();
         });
     }
 
@@ -494,17 +474,32 @@ public class StreamingService extends Service implements StreamHost {
             nm.createNotificationChannel(channel);
         }
         Notification notification = new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("Streaming active")
+                .setContentTitle("CloudX — sessão de jogo ativa")
+                .setCategory(Notification.CATEGORY_TRANSPORT)
+                .setOngoing(true)
                 .setSmallIcon(android.R.drawable.presence_video_online)
                 .build();
-        startForeground(1, notification);
+        startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
     }
 
     @Override
     public void onDestroy() {
-        try { binder.clearRenderSurface(); } catch (android.os.RemoteException ignored) {}
-        if (webRtcReceiver != null) webRtcReceiver.release();
+        destroyed = true;
+        if (sessionForeground != null) sessionForeground.close();
+        notificationWorker.shutdown();
         callbacks.kill();
+        // Exit must not wait for an in-flight native startup or EGL teardown.
+        // The same monitor prevents releasing a receiver during its initialization.
+        new Thread(() -> {
+            synchronized (binder) {
+                try {
+                    binder.clearRenderSurface();
+                    if (webRtcReceiver != null) webRtcReceiver.release();
+                } catch (android.os.RemoteException | RuntimeException e) {
+                    Log.w(TAG, "Native video teardown failed", e);
+                }
+            }
+        }, "CloudX-video-cleanup").start();
         super.onDestroy();
     }
 }

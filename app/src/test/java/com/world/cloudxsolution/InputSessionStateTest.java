@@ -4,19 +4,19 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class InputSessionStateTest {
-    @Test public void idleControllerIsReadyRegardlessOfChannelOpeningOrder() {
-        for (boolean controlFirst : new boolean[]{false, true}) {
+    @Test public void idleRegistrationNeedsBothChannelsAndAuthorizationInAnyOrder() {
+        int[][] orders = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+        for (int[] order : orders) {
             InputSessionState state = new InputSessionState();
-            state.channel(controlFirst ? "control" : "unreliableinput", "OPEN");
-            assertFalse(state.canAnnounce());
-            state.channel(controlFirst ? "unreliableinput" : "control", "OPEN");
-            // No physical key or axis event has occurred.
-            assertTrue(state.canAnnounce());
-            assertEquals("unreliableinput", state.activeChannel());
+            for (int n = 0; n < 3; n++) {
+                if (order[n] == 0) state.channel("control", "OPEN");
+                else if (order[n] == 1) state.channel("unreliableinput", "OPEN");
+                else state.authorizationSent();
+                assertEquals(n == 2, state.canAnnounce());
+            }
         }
     }
-
-    @Test public void preferenceCannotRouteInputIntoAClosedChannel() {
+    @Test public void preferenceNeverSelectsAClosedTransport() {
         InputSessionState state = new InputSessionState();
         state.channel("input", "OPEN");
         assertEquals("input", state.activeChannel());
@@ -24,34 +24,30 @@ public class InputSessionStateTest {
         assertEquals("unreliableinput", state.activeChannel());
         state.preferModern(false);
         assertEquals("input", state.activeChannel());
-        state.channel("input", "CLOSING");
+        state.channel("input", "CLOSED");
         assertEquals("unreliableinput", state.activeChannel());
         state.channel("unreliableinput", "CLOSED");
         assertEquals("", state.activeChannel());
     }
-
-    @Test public void secondSessionMustWaitForItsOwnChannels() {
+    @Test public void snapshotRecoversLostOpenEventWithoutPhysicalInput() {
         InputSessionState state = new InputSessionState();
-        state.channel("control", "OPEN");
-        state.channel("input", "OPEN");
-        assertTrue(state.canAnnounce());
-        state.reset();
-        assertFalse(state.canAnnounce());
-        state.channel("input", "OPEN");
-        assertFalse(state.canAnnounce());
-        state.channel("control", "OPEN");
-        assertTrue(state.canAnnounce());
-    }
-    @Test public void nativeSnapshotRecoversMissedOpenEventsWithoutPhysicalMovement() {
-        InputSessionState state = new InputSessionState();
-        assertEquals("", state.activeChannel());
+        state.authorizationSent();
         state.snapshot(false, true, true);
         assertEquals("unreliableinput", state.activeChannel());
         assertTrue(state.canAnnounce());
+    }
+    @Test public void secondSessionAndReopenedControlMustAuthorizeAgain() {
+        InputSessionState state = new InputSessionState();
         state.snapshot(true, false, true);
-        assertEquals("input", state.activeChannel());
-        state.snapshot(false, false, false);
-        assertEquals("", state.activeChannel());
+        state.authorizationSent();
+        assertTrue(state.canAnnounce());
+        state.channel("control", "CLOSED");
+        state.channel("control", "OPEN");
+        assertFalse(state.canAnnounce());
+        state.authorizationSent();
+        assertTrue(state.canAnnounce());
+        state.reset();
+        state.snapshot(true, false, true);
         assertFalse(state.canAnnounce());
     }
 }

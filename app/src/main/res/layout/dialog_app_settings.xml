@@ -32,6 +32,9 @@
             android:letterSpacing="0.05"/>
     </LinearLayout>
 
+<androidx.appcompat.widget.AppCompatButton android:id="@+id/btn_tcl_quality" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="TCL: qualidade — 1080HQ / 20 Mbps" android:textColor="@color/xbox_text_primary" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="8dp"/>
+<androidx.appcompat.widget.AppCompatButton android:id="@+id/btn_tcl_balanced" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="TCL: equilíbrio — 1080p / 15 Mbps" android:textColor="@color/xbox_text_primary" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="8dp"/>
+<androidx.appcompat.widget.AppCompatButton android:id="@+id/btn_tl042_preset" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Multilaser: compatibilidade — 720p / 8 Mbps" android:textColor="@color/xbox_text_primary" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="8dp"/>
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -129,6 +132,13 @@
         android:layout_marginBottom="16dp"
         android:focusable="true"/>
 
+<TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Escala do vídeo (experimental)" android:textColor="@color/xbox_text_primary"/>
+<androidx.appcompat.widget.AppCompatSpinner android:id="@+id/spinner_output_scale" android:layout_width="match_parent" android:layout_height="48dp" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="12dp"/>
+<TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Nitidez (experimental)" android:textColor="@color/xbox_text_primary"/>
+<androidx.appcompat.widget.AppCompatSpinner android:id="@+id/spinner_sharpness" android:layout_width="match_parent" android:layout_height="48dp" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="12dp"/>
+<TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Estatísticas" android:textColor="@color/xbox_text_primary"/>
+<androidx.appcompat.widget.AppCompatSpinner android:id="@+id/spinner_stats_detail" android:layout_width="match_parent" android:layout_height="48dp" android:background="@drawable/selector_button_xbox" android:focusable="true" android:layout_marginBottom="12dp"/>
+<androidx.appcompat.widget.SwitchCompat android:id="@+id/switch_rumble" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Vibração (depende do controle e do Android)" android:textColor="@color/xbox_text_primary"/>
     <TextView
         android:id="@+id/tv_initial_scale"
         android:layout_width="match_parent"

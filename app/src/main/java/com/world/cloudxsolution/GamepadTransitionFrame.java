@@ -45,6 +45,12 @@ public final class GamepadTransitionFrame {
         this.gamepadId = gamepadId;
     }
 
+    /** Only for a new remote session; ordinary button release preserves counters. */
+    public void resetSession() {
+        Arrays.fill(transitions, 0); Arrays.fill(held, false); Arrays.fill(axes, 0f);
+        physicalPhysicality = virtualPhysicality = 0;
+    }
+
     public void bumpButton(String button) {
         int index = getButtonIndex(button);
         if (index != -1) {

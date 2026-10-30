@@ -1,7 +1,7 @@
 (function cloudxDocument() {
-    if (window.__cloudxDocumentInstalled || window.top !== window) return;
-    if (!/\/play(?:\/|$)/i.test(window.location.pathname)) return;
-    window.__cloudxDocumentInstalled = true;
+if (window.__cloudxDocumentInstalled || window.top !== window) return;
+if (!/\/play(?:\/|$)/i.test(window.location.pathname)) return;
+window.__cloudxDocumentInstalled = true;
 (function forcePtBrLocale() {
     try {
         if (window.location && window.location.pathname && /^\/(fr-fr|en-us|es-es|fr)\b/i.test(window.location.pathname)) {
@@ -12,26 +12,43 @@
 })();
 "use strict";
 
-// Bridge for Native Android WebRTC
+// Pending native operations must settle even if SDP fails or a session closes.
+window.bxNativePending = Object.create(null);
+window.bxNativeOperation = function(name, action) {
+    if (window.bxNativePending[name]) return Promise.reject(new Error('Operation already pending: ' + name));
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => window.handleSignalingError('timeout-' + name), 30000);
+        window.bxNativePending[name] = { resolve, reject, timer };
+        try { if (action) action(); } catch (error) { window.handleSignalingError(name); }
+    });
+};
+window.bxSettleNative = function(name, value) {
+    const pending = window.bxNativePending[name];
+    if (!pending) return;
+    delete window.bxNativePending[name];
+    clearTimeout(pending.timer);
+    pending.resolve(value);
+};
+window.handleSignalingError = function(operation) {
+    window.bxEarlyAnswer = null;
+    for (const name of Object.keys(window.bxNativePending)) {
+        const pending = window.bxNativePending[name];
+        delete window.bxNativePending[name];
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Native signaling: ' + operation));
+    }
+    console.warn('[BxC] Native signaling:', operation);
+};
 window.handleAnswer = function(sdp) {
-    console.log("[BxC] handleAnswer from Java, sdp length: " + (sdp ? sdp.length : 0));
-    if (window.pendingAnswerResolver) {
-        window.pendingAnswerResolver({ type: 'answer', sdp: sdp });
-        window.pendingAnswerResolver = null;
-    } else {
-        console.warn("[BxC] No pendingAnswerResolver found");
-    }
+    if (!window.peer || window.peer.signalingState === 'closed') return;
+    const answer = { type: 'answer', sdp };
+    if (window.bxNativePending.answer) window.bxSettleNative('answer', answer);
+    else window.bxEarlyAnswer = answer;
 };
-
 window.handleOffer = function(sdp) {
-    console.log("[BxC] handleOffer from Java, sdp length: " + (sdp ? sdp.length : 0));
-    if (window.pendingOfferResolver) {
-        window.pendingOfferResolver({ type: 'offer', sdp: sdp });
-        window.pendingOfferResolver = null;
-    } else {
-        console.warn("[BxC] No pendingOfferResolver found");
-    }
+    window.bxSettleNative('offer', { type: 'offer', sdp });
 };
+window.handleRemoteDescriptionSet = function() { window.bxSettleNative('remote'); };
 
 window.bxKeepAliveTimer = null;
 window.bxKeepAliveStarted = false;
@@ -105,6 +122,12 @@ window.handleIceConnectionState = function(state) {
     console.log("[BxC] handleIceConnectionState: " + state);
     if (window.peer) {
         window.peer.iceConnectionState = state.toLowerCase();
+        const ice = window.peer.iceConnectionState;
+        const connectionState = ice === 'completed' ? 'connected' : ice === 'checking' ? 'connecting' : ice;
+        if (window.peer.connectionState !== connectionState) {
+            window.peer.connectionState = connectionState;
+            window.peer.dispatchEvent(new Event('connectionstatechange'));
+        }
         if (window.peer.oniceconnectionstatechange) window.peer.oniceconnectionstatechange();
         if (window.peer._listeners && window.peer._listeners['iceconnectionstatechange']) {
             window.peer._listeners['iceconnectionstatechange'].forEach(l => l());
@@ -200,6 +223,7 @@ function getOsNameFromResolution(resolution) {
 
 function generateMsDeviceInfo(osName, resolution) {
     const isQhd = (resolution === "1440");
+    const isHd = (resolution === "720" || resolution === "720p" || resolution === "720HQ");
     return {
         appInfo: {
             env: {
@@ -217,8 +241,8 @@ function generateMsDeviceInfo(osName, resolution) {
             browser: { browserName: "chrome", browserVersion: "140.0.3485.54" },
             displayInfo: {
                 dimensions: {
-                    widthInPixels: isQhd ? 2560 : 1920,
-                    heightInPixels: isQhd ? 1440 : 1080
+                    widthInPixels: isQhd ? 2560 : isHd ? 1280 : 1920,
+                    heightInPixels: isQhd ? 1440 : isHd ? 720 : 1080
                 },
                 pixelDensity: { dpiX: 1, dpiY: 1 }
             }
@@ -335,7 +359,7 @@ class XcloudInterceptor {
                 }
                 const url = typeof request === "string" ? request : request.url;
                 window.BX_EXPOSED.streamSession.domainName = new URL(url).origin;
-                BxLogger.info("streamSession", "Session metadata captured");
+                BxLogger.info("streamSession", "Captured session endpoint");
             }
         } catch (e) {
             BxLogger.error("XcloudInterceptor", "Session info capture failed", e);
@@ -508,16 +532,11 @@ class Patcher {
 }
 
 function patchRtcPeerConnection() {
-    if (window.__cloudxRtcInstalled) return;
-    window.__cloudxRtcInstalled = true;
-    // Keep catalog navigation working. Only a live native session owns game input.
+    if (window.__cloudxRtcPatched) return;
+    window.__cloudxRtcPatched = true;
     const browserGamepads = navigator.getGamepads && navigator.getGamepads.bind(navigator);
-    try {
-        navigator.getGamepads = function() {
-            return window.peer && window.peer.signalingState !== 'closed'
-                ? [] : (browserGamepads ? browserGamepads() : []);
-        };
-    } catch (e) {}
+    try { navigator.getGamepads = () => window.peer && window.peer.signalingState !== 'closed'
+        ? [] : (browserGamepads ? browserGamepads() : []); } catch (e) {}
     let OrgRTCPeerConnection = window.RTCPeerConnection;
 
     window.handleIceCandidate = function(sdpMid, sdpMLineIndex, candidateStr) {
@@ -547,14 +566,14 @@ function patchRtcPeerConnection() {
     };
 
     window.simulateOnTrack = function(kind, id) {
-        if (!window.peer || window.peer.signalingState === 'closed') return;
         console.log("[BxC] Simulating lightweight ontrack for " + kind);
 
+        if (!window.peer || window.peer.signalingState === 'closed') return;
         let stream;
         let track;
 
         if (kind === 'video') {
-            // Minimal placeholder track; the native surface renders the real video.
+            // A tiny placeholder keeps the browser player lifecycle alive; real video is rendered natively.
             const canvas = document.createElement('canvas');
             canvas.width = 2;
             canvas.height = 2;
@@ -614,15 +633,14 @@ function patchRtcPeerConnection() {
 
     window.RTCPeerConnection = function(config) {
         if (window.peer && window.peer.signalingState !== 'closed') window.peer.close();
-        console.log("[BxC] RTCPeerConnection constructor called");
+        window.bxEarlyAnswer = null;
+        window.bxKeepAliveStarted = false;
+        console.log("[BxC] Native RTCPeerConnection constructor");
 
         if (window.AndroidBridge) {
             window.AndroidBridge.onPeerConnectionConfig(JSON.stringify(config || {}));
         }
 
-        clearTimeout(window.bxKeepAliveTimer);
-        window.bxKeepAliveStarted = false;
-        window.proxyDataChannels = {};
         const pc = {
             config: config,
             localDescription: null,
@@ -636,6 +654,7 @@ function patchRtcPeerConnection() {
             _auxAudioContexts: [],
 
             createDataChannel: function(label, options) {
+                if (window.peer !== this || this.signalingState === 'closed') throw new Error('Peer connection closed');
                 console.log("[BxC] Proxy createDataChannel: " + label);
                 if (window.AndroidBridge) {
                     window.AndroidBridge.onDataChannelCreate(label);
@@ -653,20 +672,21 @@ function patchRtcPeerConnection() {
                     onclose: null,
 
                     send: function(data) {
-                        if (pc.signalingState === 'closed' || window.peer !== pc) return;
+                        if (window.peer !== pc || pc.signalingState === 'closed') return;
                         if (label === 'input' || label === 'unreliableinput') return;
                         if (window.AndroidBridge) {
                             let isBinary = typeof data !== 'string';
                             if (isBinary) {
-                                window.AndroidBridge.onDataChannelSend(label, (ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data)), null, true);
+                                const bytes = ArrayBuffer.isView(data)
+                                    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
+                                window.AndroidBridge.onDataChannelSend(label, Array.from(bytes), null, true);
                                 return;
                             } else {
                                 let authorizationSent = false;
                                 if (label === 'control') {
                                     try {
-                                        // Native code owns the virtual controller. The hidden browser
-                                        // sees no physical gamepads and must not remove that slot.
                                         const message = JSON.parse(data).message;
+                                        // Native owns the controller slot; the hidden page must not remove it.
                                         if (message === 'gamepadChanged') return;
                                         authorizationSent = message === 'authorizationRequest';
                                     } catch (e) {}
@@ -687,7 +707,6 @@ function patchRtcPeerConnection() {
                                 }
                                 let base64 = window.btoa(unescape(encodeURIComponent(data)));
                                 window.AndroidBridge.onDataChannelSend(label, null, base64, false);
-                                // control is ordered: enqueue native gamepad registration after authorization.
                                 if (authorizationSent && window.AndroidBridge.onControlAuthorizationSent) {
                                     window.AndroidBridge.onControlAuthorizationSent();
                                 }
@@ -709,9 +728,10 @@ function patchRtcPeerConnection() {
                     },
                     dispatchEvent: function(event) {
                         const handler = this['on' + event.type];
-                        if (handler) handler.call(this, event);
-                        if (this._listeners && this._listeners[event.type]) {
-                            this._listeners[event.type].slice().forEach(l => l.call(this, event));
+                        if (typeof handler === 'function') handler.call(this, event);
+                        for (const listener of (this._listeners && this._listeners[event.type] || []).slice()) {
+                            if (typeof listener === 'function') listener.call(this, event);
+                            else if (listener && listener.handleEvent) listener.handleEvent(event);
                         }
                         return true;
                     }
@@ -724,6 +744,7 @@ function patchRtcPeerConnection() {
             },
 
             addTransceiver: function(trackOrKind, init) {
+                if (window.peer !== this || this.signalingState === 'closed') throw new Error('Peer connection closed');
                 if (window.AndroidBridge) {
                     window.AndroidBridge.onAddTransceiver(trackOrKind, init ? (init.direction || "recvonly") : "recvonly");
                 }
@@ -748,39 +769,43 @@ function patchRtcPeerConnection() {
             getSenders: function() { return (this._transceivers || []).map(t => t.sender); },
 
             setRemoteDescription: function(description) {
-                this.remoteDescription = description;
-                if (description && window.AndroidBridge) {
-                    if (description.type === 'offer') {
-                        window.AndroidBridge.onOfferReceived(description.sdp);
-                    } else if (description.type === 'answer') {
-                        window.AndroidBridge.onAnswerReceived(description.sdp);
-                    }
+                if (window.peer !== this || this.signalingState === 'closed') return Promise.reject(new Error('Peer connection closed'));
+                if (!description || !['offer', 'answer'].includes(description.type)) {
+                    return Promise.reject(new Error('Unsupported remote description'));
                 }
-                return Promise.resolve();
-            },
-
-            createAnswer: function() {
-                return new Promise((resolve) => {
-                    window.pendingAnswerResolver = (answer) => {
-                        this.localDescription = answer;
-                        resolve(answer);
-                    };
+                if (description.type === 'offer') window.bxEarlyAnswer = null;
+                return window.bxNativeOperation('remote', () => {
+                    if (!window.AndroidBridge) throw new Error('Native bridge unavailable');
+                    if (description.type === 'offer') window.AndroidBridge.onOfferReceived(description.sdp);
+                    else window.AndroidBridge.onAnswerReceived(description.sdp);
+                }).then(() => {
+                    if (window.peer !== this || this.signalingState === 'closed') throw new Error('Peer connection closed');
+                    this.remoteDescription = description;
+                    this.signalingState = description.type === 'offer' ? 'have-remote-offer' : 'stable';
+                    this.dispatchEvent(new Event('signalingstatechange'));
                 });
             },
 
+            createAnswer: function() {
+                if (window.peer !== this || this.signalingState === 'closed') return Promise.reject(new Error('Peer connection closed'));
+                if (window.bxEarlyAnswer) {
+                    const answer = window.bxEarlyAnswer;
+                    window.bxEarlyAnswer = null;
+                    return Promise.resolve(answer);
+                }
+                return window.bxNativeOperation('answer');
+            },
+
             createOffer: function() {
-                return new Promise((resolve) => {
-                    window.pendingOfferResolver = (offer) => {
-                        this.localDescription = offer;
-                        resolve(offer);
-                    };
-                    if (window.AndroidBridge) {
-                        window.AndroidBridge.onOfferRequested(getTargetBitrate());
-                    }
+                if (window.peer !== this || this.signalingState === 'closed') return Promise.reject(new Error('Peer connection closed'));
+                return window.bxNativeOperation('offer', () => {
+                    if (!window.AndroidBridge) throw new Error('Native bridge unavailable');
+                    window.AndroidBridge.onOfferRequested(getTargetBitrate());
                 });
             },
 
             setLocalDescription: function(description) {
+                if (window.peer !== this || this.signalingState === 'closed') return Promise.reject(new Error('Peer connection closed'));
                 this.localDescription = description;
                 this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable';
 
@@ -794,14 +819,15 @@ function patchRtcPeerConnection() {
             },
 
             setConfiguration: function(config) {
+                if (window.peer !== this || this.signalingState === 'closed') throw new Error('Peer connection closed');
                 this.config = config;
-                if (this.signalingState === 'closed' || window.peer !== this) throw new Error('Peer connection closed');
                 if (window.AndroidBridge && config) {
-                    window.AndroidBridge.onPeerConnectionConfigurationUpdate(JSON.stringify(config));
+                    window.AndroidBridge.onPeerConnectionConfigUpdated(JSON.stringify(config || {}));
                 }
             },
 
             addIceCandidate: function(candidate) {
+                if (window.peer !== this || this.signalingState === 'closed') return Promise.reject(new Error('Peer connection closed'));
                 if (candidate && window.AndroidBridge) {
                     window.AndroidBridge.onIceCandidateReceived(candidate.sdpMid, candidate.sdpMLineIndex, candidate.candidate || candidate.sdp || "");
                 }
@@ -813,6 +839,20 @@ function patchRtcPeerConnection() {
                 if (!this._listeners[type].includes(listener)) this._listeners[type].push(listener);
             },
 
+            removeEventListener: function(type, listener) {
+                if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(l => l !== listener);
+            },
+
+            dispatchEvent: function(event) {
+                const handler = this['on' + event.type];
+                if (typeof handler === 'function') handler.call(this, event);
+                for (const listener of (this._listeners[event.type] || []).slice()) {
+                    if (typeof listener === 'function') listener.call(this, event);
+                    else if (listener && listener.handleEvent) listener.handleEvent(event);
+                }
+                return true;
+            },
+
             getStats: function() {
                 return Promise.resolve(new Map());
             },
@@ -820,16 +860,24 @@ function patchRtcPeerConnection() {
             close: function() {
                 if (this.signalingState === 'closed') return;
                 this.signalingState = 'closed';
-                for (const stream of this._auxStreams) stream.getTracks().forEach(track => track.stop());
-                for (const audio of this._auxAudioContexts) { try { audio.close(); } catch (e) {} }
-                this._auxStreams = []; this._auxAudioContexts = [];
+                this.connectionState = 'closed';
+                this.iceConnectionState = 'closed';
                 if (window.peer !== this) return;
-                window.proxyDataChannels = {};
+                window.handleSignalingError('session-closed');
                 clearTimeout(window.bxKeepAliveTimer);
+                window.bxKeepAliveTimer = null;
                 window.bxKeepAliveStarted = false;
-                if (window.AndroidBridge) {
-                    window.AndroidBridge.onPeerConnectionClose();
+                for (const stream of this._auxStreams) stream.getTracks().forEach(track => track.stop());
+                for (const context of this._auxAudioContexts) { try { Promise.resolve(context.close()).catch(() => {}); } catch (e) {} }
+                this._auxStreams = [];
+                this._auxAudioContexts = [];
+                for (const dc of Object.values(window.proxyDataChannels || {})) {
+                    dc.readyState = 'closed';
+                    dc.dispatchEvent(new Event('close'));
                 }
+                window.proxyDataChannels = {};
+                if (window.AndroidBridge) window.AndroidBridge.onPeerConnectionClose();
+                this.dispatchEvent(new Event('connectionstatechange'));
             }
         };
 
@@ -843,7 +891,6 @@ function patchRtcPeerConnection() {
     }
 }
 
-// Install synchronously at document start; waiting for load may miss the SDK's first peer.
 patchRtcPeerConnection();
 InitBc();
 

@@ -20,6 +20,7 @@ public final class AndroidGamepadListener {
     private final Consumer<ByteBuffer> unreliableSendRaw;
     private final AtomicLong unreliableToken = new AtomicLong(0);
     private long tickCounter = 0;
+    private volatile long inputEpoch;
     private float stickDeadzone = 0.12f;
     private float cameraSensitivity = 1.5f;
 
@@ -214,6 +215,18 @@ public final class AndroidGamepadListener {
     public void sendCurrentState() {
         synchronized (stateLock) {
             sendUnreliableIfChanged(TYPE_MOTION);
+        }
+    }
+
+    public void resetSession() {
+        synchronized (stateLock) {
+            inputEpoch++;
+            transitionFrame.resetSession();
+            unreliableToken.set(0); tickCounter = 0;
+            Arrays.fill(keyDown, false);
+            prevHatUp = prevHatDown = prevHatLeft = prevHatRight = false;
+            axesWereActive = false; testModeActive = false;
+            rawLeftX = rawLeftY = rawRightX = rawRightY = 0f;
         }
     }
 
@@ -494,9 +507,11 @@ private long Gms=0;
     }
 
     public void pressNexusOnce() {
+        final long epoch = inputEpoch;
         new Thread(() -> {
             try {
                 synchronized (stateLock) {
+                    if (epoch != inputEpoch) return;
                     transitionFrame.bumpButton(GamepadTransitionFrame.INDEX_NEXUS);
                     sendUnreliableIfChanged(TYPE_KEYDOWN);
                 }
@@ -504,6 +519,7 @@ private long Gms=0;
                 Thread.sleep(60); // Standard guide button press duration
 
                 synchronized (stateLock) {
+                    if (epoch != inputEpoch) return;
                     transitionFrame.setReleased(GamepadTransitionFrame.INDEX_NEXUS);
                     sendUnreliableIfChanged(TYPE_KEYUP);
                 }

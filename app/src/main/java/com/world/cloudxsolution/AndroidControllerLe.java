@@ -23,6 +23,7 @@ public final class AndroidControllerLe {
     // suppress redundant sends (held-button key-repeat events, and
     // analog stick events reporting an unchanged value).
     private GamepadFrame lastSent = null;
+    private volatile long inputEpoch;
 
     // Device IDs we've already run axis-layout detection for, so that
     // work only happens once per physical device instead of on every
@@ -227,6 +228,11 @@ public final class AndroidControllerLe {
         sendIfChanged();
     }
 
+    public synchronized void resetSession() {
+        inputEpoch++;
+        frame.buttons = 0; java.util.Arrays.fill(frame.axes, 0f); lastSent = null;
+    }
+
     public synchronized void releaseAll() {
         java.util.Arrays.fill(frame.axes, 0f);
         frame.buttons = 0;
@@ -267,9 +273,11 @@ public final class AndroidControllerLe {
     }
 
     public void pressNexusOnce() {
+        final long epoch = inputEpoch;
         new Thread(() -> {
             try {
                 synchronized (this) {
+                    if (epoch != inputEpoch) return;
                     frame.setButton("Nexus", true);
                     sendIfChanged();
                 }
@@ -277,6 +285,7 @@ public final class AndroidControllerLe {
                 Thread.sleep(60); // Standard guide button press duration
 
                 synchronized (this) {
+                    if (epoch != inputEpoch) return;
                     frame.setButton("Nexus", false);
                     sendIfChanged();
                 }
